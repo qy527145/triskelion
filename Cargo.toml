@@ -2,7 +2,82 @@
 name = "triskelion"
 version = "0.1.0"
 edition = "2024"
-description = "Carter — a Rust agent CLI with an interactive TUI, multi-provider LLM support, skills, and MCP integration."
+description = "Triskelion — unified resource gateway and open marketplace for LLM agent tools"
 license = "Apache-2.0"
+default-run = "tsk"
+
+[lib]
+name = "triskelion"
+path = "src/lib.rs"
+
+# tsk —— 客户端 CLI（client 侧）
+[[bin]]
+name = "tsk"
+path = "src/bin/tsk.rs"
+required-features = ["client"]
+
+# triskelion —— Hub Web Server（server 侧）
+[[bin]]
+name = "triskelion"
+path = "src/bin/triskelion.rs"
+required-features = ["server"]
+
+[features]
+default = ["client", "server"]
+# tsk 客户端 CLI 侧能力
+client = ["dep:clap", "dep:reqwest", "dep:dialoguer", "dep:rpassword", "dep:dirs"]
+# triskelion Hub 服务端侧能力
+server = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:rusqlite",
+    "dep:jsonwebtoken",
+    "dep:argon2",
+    "dep:aes-gcm",
+    "dep:rand",
+    "dep:base64",
+    "dep:rust-embed",
+    "dep:mime_guess",
+    # Hub 作为网关需连接 MCP（crate::mcp 用阻塞 reqwest）
+    "dep:reqwest",
+]
 
 [dependencies]
+# 共享层（始终构建）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# client 侧
+clap = { version = "4", features = ["derive"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+], optional = true }
+dialoguer = { version = "0.11", optional = true }
+rpassword = { version = "7", optional = true }
+dirs = { version = "5", optional = true }
+
+# server 侧
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+], optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+jsonwebtoken = { version = "9", optional = true }
+argon2 = { version = "0.5", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+# 内置 Web UI：把 web/dist 编译进二进制
+rust-embed = { version = "8", features = [
+    "debug-embed",
+    "mime-guess",
+], optional = true }
+mime_guess = { version = "2", optional = true }
+
+[dev-dependencies]
