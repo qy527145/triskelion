@@ -24,3 +24,13 @@ target
 # Added by cargo
 
 /target
+
+# Frontend build artifacts & deps (managed by bun)
+/web/node_modules
+/web/dist
+*.tsbuildinfo
+
+# Runtime data
+/.triskelion-data
+/triskelion-data
+

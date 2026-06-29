@@ -1,216 +1,136 @@
 ------------------------------
-## 🛸 Project Triskelion 1.0 Specification Manual
+## 🛸 Project Triskelion 1.0 System Architecture Specification
 
-System Architecture, Protocols, and Implementation Guide for Coding Agents
-
-------------------------------
-## 📋 1. 项目概述 (Project Vision)
-Triskelion 是一个面向 AI Agent 生态的分布式、多拓扑“工具网关、资源总线与开放市场平台”。项目名称致敬神盾局特工（Agent）总部大楼。
-它将 Skills（Markdown 说明书）、MCPs（Model Context Protocol 服务）、CLIs（原生或脚本工具）以及 KBs（领域知识文件夹） 进行统一编排与解耦分发。
-## 核心设计哲学
-
-   1. GUI 服务人类，CLI 服务 AI：统一客户端 tsk 是 AI 的核心交互界面。
-   2. 渐进式上下文加载：大模型平时只读取精简的 Skill 说明书，需要时才通过命令行（CLI）按需触发底层 MCP 或工具，从而将 Token 成本降低 90% 以上。
-   3. 去中心化与高兼容：数据可全量导入导出，平台不强绑定特定客户端，对外提供标准开放 API。
+For Senior Software Engineering Agents (LLMs). Follow this specification strictly to design and implement the system.
 
 ------------------------------
-## 🛠 2. 技术选型 (Technology Stack)
+## 📋 1. 项目背景与大一统世界观 (Project Vision & Philosophy)## 1.1 背景隐喻
+Triskelion（名称致敬《神盾局特工》总部大楼）是一个面向大模型（Agent）工具生态的去中心化、多拓扑“统一资源网关与开放市场平台”。
 
-* 开发语言：Rust (全栈)
-* 客户端 (CLI tsk) 核心库：
-   * clap (v4)：高性能命令行参数解析
-   * tokio：异步运行时
-   * reqwest：异步 HTTP & SSE 客户端
-   * keyring：跨平台调用系统原生凭据管理器（Mac Keychain / Windows Credential Manager）
-   * serde & serde_json：序列化与反序列化
-* 服务端 (Hub Server) 核心库：
-   * axum (或 actix-web)：高性能多租户 Web 框架
-   * tokio-stream：处理 SSE (Server-Sent Events) 流式路由
-   * sqlx：带编译期检查的异步数据库驱动（搭配 PostgreSQL 或 SQLite）
-   * jsonwebtoken：处理 tsk login 签发的 JWT
+* 在 AI 时代，“GUI 服务人类，CLI 服务 AI”。大模型通过阅读轻量化的工具说明书，像黑客一样自主在终端（Terminal）呼叫命令行（CLI）来改变世界。
+
+## 1.2 核心痛点与终极工程减法（局长关键纠正）
+
+   1. 干掉 Token 膨胀与认知过载：原生 MCP（Model Context Protocol）协议会把满载的 JSON Schema 强行塞满 Agent 的上下文。Triskelion 采用渐进式上下文加载：Agent 初始化时仅加载几百 Token 的极其精简的 SKILL.md（能力说明书）。当且仅当需要执行动作时，才通过 CLI 按需触发，降维打击 Token 消耗，成功率提升至 99%。
+   2. 大一统的数据实体模型（万物皆 Skill）：
+   * 在 Triskelion 的业务世界里，“知识库（Knowledge Base）”和“工具链（Toolchain）”不是独立的数据实体，它们仅仅是逻辑层面的分类标签。
+      * 本质上，平台里流转的一切基础资产，全都是 Skill。一个 Skill 包可以是一份“纯文本的裸说明书”（能力内置），也可以是一份“依赖了底层 MCP 工具的能力说明书”。
+   3. 无沙箱/无容器的极致性能：
+   * 彻底放弃 Docker、K8s 等沉重的容器隔离层。
+      * 系统完全基于 Rust 异步底层 重新设计。将复杂的环境运维隔离，转化为极其轻量、高频并发的 “本地进程管理” 与 “云端异步网络反向代理网关”。
+   
+------------------------------
+## 📐 2. 三种 MCP 运行时拓扑的推敲与设计 (Multi-Topology Runtime)
+统一客户端 tsk 拦截 Agent 的命令行呼叫后，会根据包中定义的 mcp_config，无缝调度以下三种拓扑之一：
+## 2.1 本地执行模式 (Local)
+
+* 适用场景：本地文件修改、本地私有数据库运维。
+* 执行逻辑：用户执行 tsk install 时将包的源码下载到本地。运行时，本地的 tsk 客户端（Rust 编写）直接调用操作系统的 std::process::Command，在用户本地系统拉起该 MCP 的 Stdio 进程（如 Node.js 或 Python 脚本），通过标准输入输出进行内存级 JSON-RPC 通信。
+
+## 2.2 云端托管模式 (Cloud)
+
+* 适用场景：公共高频工具（如天气、通用网络爬虫），开发者不想管服务器。
+* 执行逻辑（无沙箱 Serverless 玩法）：开发者上传源码到 Hub 后，Hub 服务器直接作为一个长期运行的常驻 FaaS 服务拉起该 MCP 脚本。当不同用户Phil调用该工具时，Hub 采用“无状态（Stateless）单例设计”，在内存请求中动态带入该用户的特定 Context，秒级响应（压入 5 毫秒以内）。
+
+## 2.3 远程代理模式 (Remote Proxy)
+
+* 适用场景：大型 SaaS 公司的商业 MCP 服务（如 GitHub、Linear 官方自带的 SSE/HTTP 远程集群），其源码对平台保密。
+* 执行逻辑：Hub 服务器不运行任何第三方代码，仅扮演一个“智能网络过滤器 / 反向代理”。Hub 接收到客户端请求 $\rightarrow$ 动态缝合该用户的真实凭据 $\rightarrow$ 转发给三方的 remote_url $\rightarrow$ 三方返回 SSE (Server-Sent Events) 数据流 $\rightarrow$ Hub 网关流式原样吐回给本地 tsk。Hub 彻底免除安全责任，100% 零修改吞下现有开源远程 MCP 生态。
 
 ------------------------------
-## 📐 3. 核心拓扑与执行逻辑 (Core Topology)
-Project Triskelion 必须支持三种不同的 MCP 工具执行拓扑，由统一客户端 tsk 拦截 Agent 命令后动态路由：
+## 🔒 3. 渐进式多租户凭据缝合机制 (Lazy Authentication)
+为了让不同用户在调用同一个云端或远程工具时，拿到的信息完全不同，系统引入声明式凭据缝合（Credential Stitching）：
 
-1. 本地执行 (Local)  : Local Agent ──> tsk (CLI) ──> [本地拉起 Stdio 进程] ──> 本地 OS
-2. 云端托管 (Cloud)  : Local Agent ──> tsk (CLI) ──(HTTP)──> Hub Server ──> [云端沙箱/容器执行]
-3. 远程代理 (Remote) : Local Agent ──> tsk (CLI) ──(HTTP)──> Hub Server (注入凭据) ──> 远程第三方服务器
-
-## 统一凭据缝合机制 (Credential Stitching)
-开源 MCP 服务（如 GitHub MCP）保持 100% 原生性。
-
-   1. 用户通过 tsk auth bind 将第三方凭据加密托管在 Hub 服务端。
-   2. 当走 Cloud 或 Remote 拓扑时，Hub 网关截获请求，在出站/拉起容器的一瞬间，动态将该用户的三方真实 Token 以环境变量或 Header 形式缝合进请求中，实现生态资产的零修改接入。
+   1. 默认无鉴权启动：系统初始状态下没有任何用户的私密 Key，极速运行。
+   2. 按需触发设置：Phil 的 Agent 在阅读说明书时，发现执行该技能必须提供鉴权信息。用户在本地敲击指令：
+   
+   tsk auth set <package-name> GITHUB_TOKEN "phil_secret_xyz123"
+   
+   3. 凭据托管：tsk 客户端通过 keyring 库固化在本地系统凭据库中，并安全同步到 Hub 平台的加密凭据池（使用 AES-256-GCM 算法加密）。
+   4. 运行时缝合（仅限 Cloud / Remote 拓扑）：当 Agent 呼叫工具时，Header 携带平台统一登录（tsk login）的 JWT。Hub 网关拦截请求 $\rightarrow$ 校验 JWT 锁定用户 Phil $\rightarrow$ 从云端保险箱捞出 Phil 的真实 GitHub Token $\rightarrow$ 在出站/转发网络请求的一瞬间，动态将其缝合进 HTTP Header 或容器环境变量中。
 
 ------------------------------
-## 📦 4. 核心资产配置文件规范 (tsk-package.json)
-平台上流通的“复合应用包”或“单原子资源包”必须包含以下规范文件：
+## 🗄 4. 数据实体与配置文件规范 (tsk-package.json)
+请 Agent 严格按照以下“多态统一”的数据结构来设计数据库 Schema 和包配置文件：
 
 {
-  "name": "shield-tactical-suite",
+  "name": "shield-development-pack",
   "version": "1.0.0",
-  "description": "神盾局多功能战术套装，包含 GitHub 工具、开发知识库与特工技能说明书",
-  "type": "composite", 
+  "category": "toolchain", // 逻辑分类：skill (技能) / kb (知识库) / toolchain (工具链)。底层全由 skill 数据结构统一承载
+  "visibility": "private", // 可见级别：默认为 private (仅自己可见/调试)，开发者点击发布后变为 public (对所有人可见)
   "resources": {
-    "skills": ["./skills/core.md", "./skills/advanced.md"],
-    "cli": ["./cli/graphify.py"],
-    "kb": ["./kb/intel_dir/"]
+    "skills": ["./skills/manual.md"] // Skill 资源。可以完全不依赖下面的 mcp_config，作为一个“裸说明书包”
   },
   "mcp_config": {
     "name": "github-inspector",
-    "topology": "remote", 
-    "remote_url": "https://github-mcp.io", 
+    "topology": "remote", // 核心拓扑声明：local | cloud | remote
+    "remote_url": "https://github-mcp.io", // 仅在 topology 为 remote 时生效
     "required_auths": [
       {
         "provider": "github",
-        "inject_as": "env.GITHUB_TOKEN" 
+        "inject_as": "env.GITHUB_TOKEN" // 声明需要绑定的鉴权信息和注入位置
       }
     ]
   }
 }
 
 ------------------------------
-## 💻 5. tsk 客户端 (CLI) 功能清单
-请 Agent 严格按照以下命令树（Command Tree）使用 clap 实现客户端：
-## 基础资源直接管理 (Primitive Resource Management)
+## 🔄 5. 全生命周期核心动作功能树 (The Master Command Tree)
+请 Agent 采用全栈 Rust 实现以下两端的功能体系，并支持全量资源的导入与导出 (import / export) 方便数据完美平移与去中心化私有部署。
+## 5.1 tsk 客户端 (CLI) 功能矩阵
 
-* tsk skill [add|remove|list]：直接管理单份纯文本的 Skill 说明书。
-* tsk mcp [add|remove|list]：直接添加、修改或查看单项 MCP 注册配置（支持 Stdio 路径或远程 URL）。
-* tsk cli [add|remove|list]：直接管理本地独立的战术脚本工具。
-* tsk kb [add|remove|list]：直接注册、解除挂载本地包含领域知识的文件夹。
+* 基础资源直接操控力：
+* tsk skill [add|remove|list]：直接直接增删改查单份纯文本的 Skill 说明书。
+   * tsk mcp [add|remove|list]：直接管理底层 MCP 注册信息。
+   * tsk cli [add|remove|list] / tsk kb [add|remove|list]
+* 开发测试与版本纠错（随时重新发布）：
+* tsk init：在本地当前目录生成配置文件模板。
+   * tsk run <package> <command> [args...]：核心入口。内置 mcp2cli 动态参数转译逻辑。开发者本地调通后，随时可以修改代码或说明书，重复执行 tsk publish 覆盖并热更新 Hub 资产。
+* 使用者消费链：
+* tsk login / tsk auth bind / tsk auth set：处理统一平台登录与渐进式凭据绑定。
+   * tsk search / tsk install：进行轻量级技能下载，保持本地操作系统绝对干净。
 
-## 包生命周期管理 (Package Manager)
+## 5.2 Triskelion Hub (Web Server) 功能矩阵
 
-* tsk init：在当前目录初始化一个标准的开发资产包目录与 tsk-package.json 模板。
-* tsk search <keyword>：调用 Hub 的开放 API 检索市场上的复合或单一资源包。
-* tsk install <package-name>：下载资产包并解压，将对应的 Skill 和配置注册进 ~/.tsk/ 统一管理目录。
-* tsk publish：将当前目录打包为 .tar.gz 并发布到 Hub 市场。
-
-## 身份认证与通用执行中心
-
-* tsk login：调用系统浏览器进行身份认证，获得平台 JWT，并通过 keyring 库安全固化到操作系统的 Keychain / 凭据管理器中。
-* tsk auth bind <provider>：引导用户在网页端绑定特定的三方鉴权（如 GitHub OAuth）。
-* tsk run <package/resource-name> <command> [args...]：核心执行入口。
-* 大模型 Agent 会频繁调用此指令。
-   * tsk 根据配置执行 mcp2cli 参数转译，动态选择本地 Stdio、云端托管或远程代理流式通信，并将最终结果以干净的 Markdown 打印在终端供 Agent 读取。
-
-------------------------------
-## ☁️ 6. Triskelion Hub 服务端功能清单
-请使用 Axum 作为 Web 框架，Tokio 作为异步底座，实现以下三大模块 API：
-## A. 多拓扑网关与凭据注入模块 (Gateway & Auth API)
-
-* /v1/auth/login & /v1/auth/callback：处理用户的登录、JWT 签发及刷新。
-* /v1/vault/bind：加密托管多租户的第三方 Token。
-* /v1/mcp/router (SSE Stream 接口)：
-* 接收来自客户端的统一工具调用请求（Header 携带平台 JWT）。
-   * 根据包的 mcp_config 进行多租户识别，从 Vault 捞出对应用户的真实三方 Token。
-   * 若为 cloud 拓扑：动态作为环境变量拉起临时 MCP Docker 容器。
-   * 若为 remote 拓扑：作为反向代理网关，将 Token 拼入 Header，转发给三方 URL，并以 SSE 流式将结果回传给客户端。
-
-## B. 市场开放 API 模块 (Open Market API)
-
-* /v1/packages/search?q=xxx：支持任何第三方客户端接入、搜索技能。
-* /v1/packages/download/:name：返回包的元数据与下载流。
-* /v1/registry/publish：处理开发者提交的资产包。服务端接收后自动解压，利用内部集成的轻量 LLM Pipeline 提取 JSON Schema 并为其自动润色、生成前置的 SKILL.md 指引。
-
-## C. 全量资产导入与导出模块 (Data Migration API)
-
-* /v1/system/export：管理员/用户一键调用，将名下所有注册的 Skill、MCP、CLI 元数据及非敏感配置文件完整导出为单个 backup.tar.gz 加密压缩包。
-* /v1/system/import：支持在全新的 Hub 实例上无缝上传该包，一键平移恢复全部工具生态。
+* 多拓扑异步反向代理网关：基于 Axum + Tokio-stream。负责处理 mcp/router SSE 流式路由请求，高效执行凭据缝合与数据异步吐回。
+* 去中心化数据平移：
+* POST /v1/system/export：一键导出名下全量 Skill 文本、MCP 拓扑配置及非敏感文件为单个 backup.tar.gz。
+   * POST /v1/system/import：支持在全新部署的 Hub 上无缝恢复。
+* 开放 API 矩阵：提供完全开放的 RESTful / SSE 标准 API，将 Hub 作为底层纯净的市场与路由总线，以便 Cursor、Claude Code、Dify 等市面上任何现有的第三方客户端轻松接入调用。
 
 ------------------------------
-## 💻 7. 核心架构 Rust 代码骨架参考
-请 Coding Agent 参考以下核心数据结构和执行网关的设计伪代码开始编码：
-## 客户端：核心转译与路由核心 (src/runtime/mod.rs)
+## 🤖 6. 给 Coding Agent 的开发启动指令 (Implementation Orders)
 
-use serde::{Deserialize, Serialize};use std::process::{Command, Stdio};
+🚀 Maximum Priority Directive to Agent:
 
-#[derive(Serialize, Deserialize, Debug, Clone)]pub enum Topology {
-    Local,
-    Cloud,
-    Remote,
-}
+   1. You understand that this project uses NO containers (NO Docker). Everything is based on native local sub-process execution (for local topology) and async HTTP/SSE reverse proxying (for cloud/remote topologies).
+   2. You understand that "Knowledge Base" and "Toolchain" are just tags; under the hood, everything is a unified Skill model.
 
-#[derive(Serialize, Deserialize, Debug)]pub struct McpConfig {
-    pub name: String,
-    pub topology: Topology,
-    pub remote_url: Option<String>,
-}
-pub struct TriskelionRuntime;
-impl TriskelionRuntime {
-    pub async fn execute_tool(config: McpConfig, command: &str, args: Vec<&str>) -> Result<String, Box<dyn std::error::Error>> {
-        match config.topology {
-            Topology.Local => {
-                // 拓扑 1：在本地作为 Stdio 进程拉起原生 MCP 
-                // 此处请 Coding Agent 实现具体的 JSON-RPC 读写管道逻辑
-                let output = Command::new("node")
-                    .arg("./mcp_server.js") // 示例路径
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .output()?;
-                Ok(String::from_utf8(output.stdout)?)
-            },
-            Topology.Cloud | Topology.Remote => {
-                // 拓扑 2 & 3：转译参数，通过 reqwest 异步网络流向 Hub 网关发起请求
-                let client = reqwest::Client::new();
-                let platform_jwt = "从本地keyring获取的JWT"; 
-                
-                let response = client.post("https://triskelion.ai")
-                    .header("Authorization", format!("Bearer {}", platform_jwt))
-                    .json(&serde_json::json!({
-                        "mcp_name": config.name,
-                        "command": command,
-                        "arguments": args
-                    }))
-                    .send()
-                    .await?
-                    .text()
-                    .await?;
-                Ok(response)
-            }
-        }
-    }
-}
+Your Next Steps:
 
-## 服务端：网关凭据缝合与代理转发 (src/gateway/router.rs)
+* Step 1: Design the SQLite/PostgreSQL database migration schema for the Hub Server that perfectly aligns with the tsk-package.json specification (including visibility, categories, topologies, and package binary storage).
+* Step 2: Provide the implementation layout for the Client CLI's tsk run argument interceptor using clap v4, showing how you plan to dynamically parse parameters before converting them into MCP JSON-RPC payloads.
 
-use axum::{Extension, Json, response::IntoResponse};use serde_json::Value;
-pub async fn handle_mcp_routing(
-    Extension(user_id): Extension<String>, // 从 JWT 中解出的用户身份
-    Json(payload): Json<Value>
-) -> impl IntoResponse {
-    let mcp_name = payload["mcp_name"].as_str().unwrap();
-    
-    // 1. 从数据库/Vault 中查询当前用户针对该 MCP 绑定的第三方真实凭据
-    let third_party_token = fetch_user_secret_from_vault(&user_id, mcp_name).await;
-    
-    // 2. 根据资产包声明的拓扑类型进行处理
-    // 如果是 Remote 拓扑，作为反向代理，缝合凭据后转发给真实的第三方服务器
-    let remote_target_url = "https://thirdparty-mcp.com"; 
-    
-    let client = reqwest::Client::new();
-    let sse_stream = client.post(remote_target_url)
-        .header("X-ThirdParty-Authorization", format!("Bearer {}", third_party_token)) // 核心：凭据注入
-        .json(&payload)
-        .send()
-        .await;
-
-    // 3. 将网络流转换为 Axum 的 Streamable SSE 响应，实时吐回给本地 tsk 客户端
-    // (请 Coding Agent 补全具体的 Async Stream 转换逻辑)
-    "SSE Stream Output"
-}
-async fn fetch_user_secret_from_vault(user_id: &str, mcp_name: &str) -> String {
-    // 实际应查询加密数据库，此处返回模拟 Token
-    "real_github_token_xyz123".to_string()
-}
+Start by generating the DB schema and layout now.
 
 ------------------------------
-## 🚀 8. Agent 启动指令 (Instructions for Agent)
-
-💡 给 Coding Agent 的提示：
-"请通读上述规范文档。我们将采用渐进式开发。
-第一步：请先在客户端项目中，使用 clap 完成基础资源直接管理命令树（Skill、MCP、CLI、KB 的 add/remove/list）的骨架搭建，并定义好 ~/.tsk/ 目录的本地初始化和元数据存储逻辑。
-做好准备后，请输出你设计的客户端基础数据结构，并引导我开始进行代码审查。"
-
-
+## 🌀 Triskelion 全生命周期大一统动作图谱 (The Grand Lifecycle)
+【1. 筹备期】 Tony 获取 tsk ──> 登录/绑定 Hub ──> 本地编写原生 MCP 
+                                                        │
+                                                        ▼
+【2. 本地测试】 运行 mcp2cli ──> 动态生成本地 CLI ──> 配合本地 Skill ──> Agent 测试成功
+                                                        │
+                                                        ▼
+【3. 打包发布】 tsk init ──> 声明配置(可见性/依赖/鉴权) ──> 声明逻辑分类 ──> tsk publish
+                                                        │
+                                                        ▼
+【4. Hub 托管】 平台解析 ──> 更新/多拓扑布署 ──> 建立逻辑索引(技能/知识库/工具链)
+                                                        │
+                                                        ▼
+【5. 发现安装】 Phil 的 Agent 触发任务 ──> tsk search ──> tsk install 
+                                                        │
+                                                        ▼
+【6. 渐进鉴权】 读说明书提示 ──> 触发鉴权需求 ──> tsk auth set ──> 固化凭据
+                                                        │
+                                                        ▼
+【7. 运行时】   Agent 执行命令 ──> 本地 mcp2cli 转译 ──> Hub 网关动态注入 Token ──> 路由执行
