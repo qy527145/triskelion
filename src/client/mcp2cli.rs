@@ -59,20 +59,62 @@ fn coerce(ptype: &str, raw: &str) -> Value {
             .unwrap_or_else(|_| Value::String(raw.to_string())),
         "boolean" => Value::Bool(matches!(raw, "true" | "1" | "yes")),
         // 结构化类型：按 JSON 解析，解析失败再退回字符串。
-        "array" | "object" => {
-            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
-        }
+        "array" | "object" => parse_jsonish(raw),
         "string" => Value::String(raw.to_string()),
         // 未声明类型：值看起来像 JSON（[ 或 {）时尝试解析，否则当字符串。
         _ => {
             let t = raw.trim_start();
             if t.starts_with('[') || t.starts_with('{') {
-                serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+                parse_jsonish(raw)
             } else {
                 Value::String(raw.to_string())
             }
         }
     }
+}
+
+/// 解析结构化值：先按严格 JSON 解析；失败则把单引号当作字符串定界符再试一次
+/// （兼容 `['a','b']` / `{'k':'v'}` 这类在某些 shell 下更好写的形式），仍失败
+/// 才退回原始字符串。
+fn parse_jsonish(raw: &str) -> Value {
+    serde_json::from_str(raw)
+        .or_else(|_| serde_json::from_str(&single_to_double_quotes(raw)))
+        .unwrap_or_else(|_: serde_json::Error| Value::String(raw.to_string()))
+}
+
+/// 把以单引号作定界符的「类 JSON」转成合法 JSON：定界单引号换成双引号，单引号
+/// 串内的双引号转义为 `\"`。已处于双引号串内的单引号、以及反斜杠转义序列原样保留。
+fn single_to_double_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut in_single = false; // 处于单引号字符串内
+    let mut in_double = false; // 处于双引号字符串内
+    let mut escaped = false; // 上一个字符是字符串内的反斜杠
+    for c in s.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_single || in_double => {
+                out.push('\\');
+                escaped = true;
+            }
+            // 单引号作定界符（不在双引号串内时）→ 输出双引号
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push('"');
+            }
+            // 单引号串内的双引号要转义，否则会提前结束 JSON 字符串
+            '"' if in_single => out.push_str("\\\""),
+            '"' => {
+                in_double = !in_double;
+                out.push('"');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn overview(pkg: &str, name: &str, tools: &[Tool]) {
@@ -131,4 +173,46 @@ pub fn print_result(result: &Value) -> bool {
         println!("{}", serde_json::to_string_pretty(result).unwrap_or_default());
     }
     !result.get("isError").and_then(|e| e.as_bool()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn array_accepts_strict_json() {
+        assert_eq!(coerce("array", r#"["a@x.com","b@x.com"]"#), json!(["a@x.com", "b@x.com"]));
+    }
+
+    #[test]
+    fn array_accepts_single_quotes() {
+        // 用户在 Windows cmd 下最自然的写法：单引号数组
+        assert_eq!(coerce("array", "['qi.jiaxuan@kotei.com.cn']"), json!(["qi.jiaxuan@kotei.com.cn"]));
+        assert_eq!(coerce("array", "['a@x.com', 'b@x.com']"), json!(["a@x.com", "b@x.com"]));
+    }
+
+    #[test]
+    fn object_accepts_single_quotes() {
+        assert_eq!(coerce("object", "{'k': 'v'}"), json!({"k": "v"}));
+    }
+
+    #[test]
+    fn untyped_jsonish_value_uses_single_quote_fallback() {
+        // 未声明类型但形似 JSON 数组的值同样走兼容解析
+        assert_eq!(coerce("", "['a','b']"), json!(["a", "b"]));
+        // 非 JSON 形态保持字符串
+        assert_eq!(coerce("", "plain"), json!("plain"));
+    }
+
+    #[test]
+    fn invalid_array_falls_back_to_string() {
+        // 既不是合法 JSON、单引号兼容后也无法解析 → 原样字符串
+        assert_eq!(coerce("array", "not-an-array"), json!("not-an-array"));
+    }
+
+    #[test]
+    fn double_quotes_inside_single_quoted_string_are_escaped() {
+        assert_eq!(coerce("array", r#"['say "hi"']"#), json!([r#"say "hi""#]));
+    }
 }
