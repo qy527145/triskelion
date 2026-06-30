@@ -10,12 +10,13 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::archive::{self, Format, ZSTD_LEVEL};
-use crate::shared::{SkillInfo, SkillManifest, SKILL_CATEGORIES};
+use crate::shared::{doc_filename, SkillInfo, SkillManifest, SKILL_CATEGORIES};
 
 use super::api::HubClient;
 use super::config::Config;
 
-/// 技能根目录里必须存在的能力说明书。
+/// 默认（skill/kb/toolchain）分类的能力说明书文件名。agent 分类用 `AGENT.md`，
+/// 由 `crate::shared::doc_filename` 按分类决定。
 const SKILL_MD: &str = "SKILL.md";
 /// 技能元数据清单文件。
 const MANIFEST: &str = "tsk-skill.json";
@@ -33,7 +34,7 @@ fn client(cfg: &Config) -> Result<HubClient> {
 // init：脚手架
 // ---------------------------------------------------------------------------
 
-pub fn init(dir: Option<PathBuf>) -> Result<()> {
+pub fn init(dir: Option<PathBuf>, category: Option<String>) -> Result<()> {
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&dir).with_context(|| format!("创建目录 {}", dir.display()))?;
     let name = dir
@@ -43,6 +44,16 @@ pub fn init(dir: Option<PathBuf>) -> Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "my-skill".into());
 
+    let category = category
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "skill".into());
+    if !SKILL_CATEGORIES.contains(&category.as_str()) {
+        bail!("category `{}` 非法，只能是 {}", category, SKILL_CATEGORIES.join(" / "));
+    }
+    // 说明书文件名随分类而定：agent → AGENT.md，其余 → SKILL.md。
+    let doc = doc_filename(&category);
+
     let manifest_path = dir.join(MANIFEST);
     if manifest_path.exists() {
         println!("• 已存在 {MANIFEST}，跳过");
@@ -50,7 +61,7 @@ pub fn init(dir: Option<PathBuf>) -> Result<()> {
         let m = SkillManifest {
             name: name.clone(),
             version: "0.1.0".into(),
-            category: "skill".into(),
+            category: category.clone(),
             description: "一句话描述这个技能能干什么".into(),
             tags: vec![],
             mcp_dependencies: vec![],
@@ -61,26 +72,26 @@ pub fn init(dir: Option<PathBuf>) -> Result<()> {
         println!("✓ 生成 {}", manifest_path.display());
     }
 
-    let skill_path = dir.join(SKILL_MD);
+    let skill_path = dir.join(doc);
     if skill_path.exists() {
-        println!("• 已存在 {SKILL_MD}，跳过");
+        println!("• 已存在 {doc}，跳过");
     } else {
-        std::fs::write(&skill_path, skill_md_template(&name))
+        std::fs::write(&skill_path, skill_md_template(&name, doc))
             .with_context(|| format!("写入 {}", skill_path.display()))?;
         println!("✓ 生成 {}", skill_path.display());
     }
 
     println!("\n下一步：");
-    println!("  1) 编辑 {SKILL_MD} 与 {MANIFEST}");
+    println!("  1) 编辑 {doc} 与 {MANIFEST}");
     println!("  2) tsk build           # 本地打包校验");
     println!("  3) tsk skill publish   # 发布到技能市场");
     Ok(())
 }
 
-fn skill_md_template(name: &str) -> String {
+fn skill_md_template(name: &str, doc: &str) -> String {
     format!(
         "# {name}\n\n\
-> 一份「能力说明书」。Agent 初始化时只读这几百 Token 的 SKILL.md，按需才触发 CLI。\n\n\
+> 一份「能力说明书」。Agent 初始化时只读这几百 Token 的 {doc}，按需才触发 CLI。\n\n\
 ## 能力概述\n\n\
 描述这个技能解决什么问题、适用场景。\n\n\
 ## 使用方式\n\n\
@@ -95,6 +106,7 @@ tsk run alice/github-inspector create_issue --title \"...\" --body \"...\"\n\
 ```\n\n\
 在 {MANIFEST} 的 `mcp_dependencies` 里登记依赖，在 `preferred_tools` 里写明倾向使用的工具。\n",
         name = name,
+        doc = doc,
         MANIFEST = MANIFEST,
     )
 }
@@ -121,28 +133,33 @@ pub fn build(dir: &Path) -> Result<Build> {
     } else {
         dir.to_path_buf()
     };
-    let skill_md_path = dir.join(SKILL_MD);
+
+    // 先确定分类，再据此决定必须包含的说明书文件（agent → AGENT.md，其余 → SKILL.md）。
+    let mut manifest = load_manifest(&dir)?;
+    validate_manifest(&manifest)?;
+    let doc = doc_filename(&manifest.category);
+
+    let skill_md_path = dir.join(doc);
     if !skill_md_path.exists() {
         bail!(
-            "技能根目录缺少 {SKILL_MD}（{}）。先运行 tsk skill init",
+            "{} 分类的技能根目录缺少 {doc}（{}）。先运行 tsk skill init",
+            manifest.category,
             dir.display()
         );
     }
     let skill_md = std::fs::read_to_string(&skill_md_path)
         .with_context(|| format!("读取 {}", skill_md_path.display()))?;
 
-    let mut manifest = load_manifest(&dir)?;
     if manifest.description.trim().is_empty() {
         manifest.description = extract_description(&skill_md);
     }
-    validate_manifest(&manifest)?;
 
     // 收集要打包的文件（相对路径）。
     let mut files = Vec::new();
     collect_files(&dir, &dir, &mut files)?;
     files.sort();
-    if !files.iter().any(|p| p == Path::new(SKILL_MD)) {
-        bail!("打包后未包含 {SKILL_MD}（被忽略规则排除了？）");
+    if !files.iter().any(|p| p == Path::new(doc)) {
+        bail!("打包后未包含 {doc}（被忽略规则排除了？）");
     }
 
     // tar -> zstd（高压缩比、解压快；大包用多线程编码摊薄耗时）。
@@ -253,23 +270,23 @@ pub fn import(
         .unwrap_or_else(|| "社区资源".into());
     let visibility = visibility.unwrap_or_else(|| "public".into());
 
-    // 收集直接子目录里含 SKILL.md 的技能文件夹（按名称排序，结果稳定）。
+    // 收集直接子目录里含说明书（SKILL.md 或 AGENT.md）的技能文件夹（按名称排序，结果稳定）。
     let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&root).with_context(|| format!("读取目录 {}", root.display()))? {
         let path = entry?.path();
-        if path.is_dir() && path.join(SKILL_MD).is_file() {
+        if path.is_dir() && has_doc(&path) {
             candidates.push(path);
         }
     }
     candidates.sort();
 
     if candidates.is_empty() {
-        // 兜底：目录本身就是一个技能（直接含 SKILL.md）。
-        if root.join(SKILL_MD).is_file() {
+        // 兜底：目录本身就是一个技能（直接含说明书）。
+        if has_doc(&root) {
             candidates.push(root.clone());
         } else {
             bail!(
-                "{} 下未发现任何含 {SKILL_MD} 的技能子文件夹",
+                "{} 下未发现任何含 SKILL.md / AGENT.md 的技能子文件夹",
                 root.display()
             );
         }
@@ -412,7 +429,8 @@ pub fn show(package: &str) -> Result<()> {
     if s.archive_size > 0 {
         println!("压缩体: {} (sha256 {})", human_size(s.archive_size), &s.archive_sha256[..s.archive_sha256.len().min(12)]);
     }
-    println!("\n----- SKILL.md -----\n{}", s.skill_md);
+    let doc = doc_filename(&s.category);
+    println!("\n----- {doc} -----\n{}", s.skill_md);
     Ok(())
 }
 
@@ -458,9 +476,10 @@ pub fn pull(package: &str, dir: Option<PathBuf>) -> Result<()> {
         unpack_archive(&bytes, &target)
             .with_context(|| format!("解压到 {}", target.display()))?;
     } else {
-        // 纯文本裸说明书包：服务端只有 SKILL.md。
-        std::fs::write(target.join(SKILL_MD), &s.skill_md)
-            .with_context(|| format!("写入 {}", target.join(SKILL_MD).display()))?;
+        // 纯文本裸说明书包：服务端只有说明书文本，按分类写回 SKILL.md / AGENT.md。
+        let doc = doc_filename(&s.category);
+        std::fs::write(target.join(doc), &s.skill_md)
+            .with_context(|| format!("写入 {}", target.join(doc).display()))?;
     }
 
     println!("✓ 已拉取 {}/{} → {}", owner, name, target.display());
@@ -515,9 +534,22 @@ fn load_manifest(dir: &Path) -> Result<SkillManifest> {
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "skill".into());
-        println!("• 未找到 {MANIFEST}，使用目录名 `{name}` 作为技能名");
-        Ok(SkillManifest::minimal(name))
+        let mut m = SkillManifest::minimal(name.clone());
+        // 无清单时按实际存在的说明书推断分类：仅有 AGENT.md（无 SKILL.md）则归为 agent。
+        if !dir.join(SKILL_MD).is_file() && dir.join(doc_filename("agent")).is_file() {
+            m.category = "agent".into();
+        }
+        println!(
+            "• 未找到 {MANIFEST}，使用目录名 `{name}` 作为技能名（分类 {}）",
+            m.category
+        );
+        Ok(m)
     }
+}
+
+/// 判断目录是否含可发布的说明书（SKILL.md 或 AGENT.md）。
+fn has_doc(dir: &Path) -> bool {
+    dir.join(SKILL_MD).is_file() || dir.join(doc_filename("agent")).is_file()
 }
 
 fn validate_manifest(m: &SkillManifest) -> Result<()> {

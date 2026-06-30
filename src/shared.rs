@@ -362,14 +362,25 @@ pub struct ErrorResp {
 // ---------------------------------------------------------------------------
 // 技能市场（Skill marketplace）wire 类型
 //
-// 万物皆 Skill：`category` 仅是逻辑分类标签（skill / kb / toolchain），底层共用
-// 同一数据结构。技能包可能是一个很大的文件夹（必须含 SKILL.md），由 `tsk build`
-// 打包成 tar.zst 压缩体（zstd）；服务端只接收元数据 + SKILL.md 文本，庞大的数据体以压缩包
-// 形式按 sha256 内容寻址承载。
+// 万物皆 Skill：`category` 仅是逻辑分类标签（skill / kb / toolchain / agent），底层共用
+// 同一数据结构。技能包可能是一个很大的文件夹（必须含说明书：skill/kb/toolchain 为
+// SKILL.md，agent 为 AGENT.md），由 `tsk build` 打包成 tar.zst 压缩体（zstd）；服务端只
+// 接收元数据 + 说明书文本（统一以 skill_md 字段承载），庞大的数据体以压缩包形式按 sha256
+// 内容寻址承载。
 // ---------------------------------------------------------------------------
 
 /// 已知的逻辑分类。仅用于校验/默认，存储与检索均按字符串处理（保持可扩展）。
-pub const SKILL_CATEGORIES: [&str; 3] = ["skill", "kb", "toolchain"];
+pub const SKILL_CATEGORIES: [&str; 4] = ["skill", "kb", "toolchain", "agent"];
+
+/// 不同分类的「能力说明书」文件名：agent 分类用 `AGENT.md`，其余一律用 `SKILL.md`。
+/// 服务端始终以 `skill_md` 字段承载其全文，文件名仅用于本地打包/解包与市场展示。
+pub fn doc_filename(category: &str) -> &'static str {
+    if category == "agent" {
+        "AGENT.md"
+    } else {
+        "SKILL.md"
+    }
+}
 
 /// 技能包清单，对应本地 `tsk-skill.json`。SKILL.md 不在此处，单独承载。
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -377,7 +388,7 @@ pub struct SkillManifest {
     pub name: String,
     #[serde(default = "default_version")]
     pub version: String,
-    /// 逻辑分类：skill（技能）/ kb（知识库）/ toolchain（工具链）。
+    /// 逻辑分类：skill（技能）/ kb（知识库）/ toolchain（工具链）/ agent（智能体）。
     #[serde(default = "default_category")]
     pub category: String,
     #[serde(default)]

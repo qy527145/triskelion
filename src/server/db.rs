@@ -60,9 +60,9 @@ pub fn init(conn: &Connection) -> Result<()> {
             UNIQUE(owner_id, key)
         );
 
-        -- 技能市场：万物皆 Skill。category 为逻辑分类标签（skill/kb/toolchain）。
-        -- 服务端只持元数据与 SKILL.md 文本；庞大的数据体以压缩包形式承载，
-        -- 按 sha256 内容寻址落盘于 blobs/，此处仅存 sha256 与字节数。
+        -- 技能市场：万物皆 Skill。category 为逻辑分类标签（skill/kb/toolchain/agent）。
+        -- 服务端只持元数据与说明书文本（skill_md 列，agent 分类对应 AGENT.md，其余 SKILL.md）；
+        -- 庞大的数据体以压缩包形式承载，按 sha256 内容寻址落盘于 blobs/，此处仅存 sha256 与字节数。
         CREATE TABLE IF NOT EXISTS skills (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

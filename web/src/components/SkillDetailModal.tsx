@@ -1,7 +1,7 @@
 import Modal from "./Modal";
 import Markdown from "./Markdown";
 import { api } from "../lib/api";
-import { categoryLabel, humanSize, type SkillInfo } from "../lib/types";
+import { categoryLabel, docFilename, humanSize, type SkillInfo } from "../lib/types";
 import { DownloadIcon } from "./icons";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -15,6 +15,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 
 export default function SkillDetailModal({ s, onClose }: { s: SkillInfo; onClose: () => void }) {
   const pullCmd = `tsk pull ${s.owner}/${s.name}`;
+  const doc = docFilename(s.category);
   return (
     <Modal
       title={s.name}
@@ -79,14 +80,14 @@ export default function SkillDetailModal({ s, onClose }: { s: SkillInfo; onClose
       )}
 
       <div className="mt-5">
-        <div className="mb-2 text-sm font-semibold text-slate-700">SKILL.md</div>
+        <div className="mb-2 text-sm font-semibold text-slate-700">{doc}</div>
         {s.skill_md.trim() ? (
           <div className="max-h-[46vh] overflow-auto rounded-xl border border-slate-200 bg-white px-5 py-3">
             <Markdown text={s.skill_md} />
           </div>
         ) : (
           <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-400">
-            该技能未提供 SKILL.md 文本。
+            该技能未提供 {doc} 文本。
           </p>
         )}
       </div>

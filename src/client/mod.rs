@@ -46,7 +46,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: McpCmd,
     },
-    /// 技能市场：打包 / 发布 / 检索 / 拉取技能包（含 SKILL.md 的文件夹）
+    /// 技能市场：打包 / 发布 / 检索 / 拉取技能包（含 SKILL.md 或 AGENT.md 的文件夹）
     Skill {
         #[command(subcommand)]
         cmd: SkillCmd,
@@ -64,7 +64,7 @@ enum Cmd {
         /// 技能根目录（默认当前目录）
         dir: Option<PathBuf>,
     },
-    /// 批量导入第三方技能生态：把一个目录下的每个子文件夹（含 SKILL.md）作为技能发布到市场
+    /// 批量导入第三方技能生态：把一个目录下的每个子文件夹（含 SKILL.md 或 AGENT.md）作为技能发布到市场
     Import {
         /// 包含多个技能子文件夹的根目录
         dir: PathBuf,
@@ -131,10 +131,13 @@ enum SecretCmd {
 
 #[derive(Subcommand)]
 enum SkillCmd {
-    /// 在目录里生成技能脚手架（SKILL.md + tsk-skill.json）
+    /// 在目录里生成技能脚手架（说明书 + tsk-skill.json；agent 分类生成 AGENT.md，其余 SKILL.md）
     Init {
         /// 目标目录（默认当前目录）
         dir: Option<PathBuf>,
+        /// 逻辑分类：skill（默认）/ kb / toolchain / agent
+        #[arg(long)]
+        category: Option<String>,
     },
     /// 本地打包技能包为 tar.zst（不联网）
     Build {
@@ -154,7 +157,7 @@ enum SkillCmd {
     /// 搜索公开技能（可按 --category / --tag 过滤）
     Search {
         query: Option<String>,
-        /// 逻辑分类：skill / kb / toolchain
+        /// 逻辑分类：skill / kb / toolchain / agent
         #[arg(long)]
         category: Option<String>,
         /// 标签
@@ -187,7 +190,7 @@ pub fn run() -> Result<()> {
             McpCmd::Remove { name } => cmd_mcp_remove(&name),
         },
         Cmd::Skill { cmd } => match cmd {
-            SkillCmd::Init { dir } => skill::init(dir),
+            SkillCmd::Init { dir, category } => skill::init(dir, category),
             SkillCmd::Build { dir } => skill::cmd_build(dir),
             SkillCmd::Publish { dir, visibility } => skill::publish(dir, visibility),
             SkillCmd::List => skill::list(),

@@ -1,11 +1,12 @@
 import type { SkillInfo } from "../lib/types";
 import { categoryLabel, humanSize, labelBadgeClass } from "../lib/types";
 import { colorFor, initials } from "../lib/color";
-import { ArrowIcon, BookIcon, SparkIcon, TrashIcon, WrenchIcon } from "./icons";
+import { ArrowIcon, BookIcon, BotIcon, SparkIcon, TrashIcon, WrenchIcon } from "./icons";
 
 function CategoryIcon({ category, ...p }: { category: string } & React.SVGProps<SVGSVGElement>) {
   if (category === "kb") return <BookIcon {...p} />;
   if (category === "toolchain") return <WrenchIcon {...p} />;
+  if (category === "agent") return <BotIcon {...p} />;
   return <SparkIcon {...p} />;
 }
 
@@ -13,6 +14,7 @@ const catBadge: Record<string, string> = {
   skill: "border-indigo-200 bg-indigo-50 text-indigo-600",
   kb: "border-sky-200 bg-sky-50 text-sky-600",
   toolchain: "border-amber-200 bg-amber-50 text-amber-600",
+  agent: "border-emerald-200 bg-emerald-50 text-emerald-600",
 };
 
 export default function SkillCard({
