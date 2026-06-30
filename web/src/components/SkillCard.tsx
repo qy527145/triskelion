@@ -31,7 +31,7 @@ export default function SkillCard({
   const color = colorFor(s.name + s.owner);
   const isPublic = s.visibility === "public";
   return (
-    <div className="group flex min-h-[210px] flex-col rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm transition hover:-translate-y-0.5 hover:shadow-lg">
+    <div className="group flex min-h-[210px] flex-col rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm transition hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-500/10">
       <div className="flex items-start gap-4">
         <div
           className="grid size-12 flex-none place-items-center rounded-xl text-base font-extrabold text-white"

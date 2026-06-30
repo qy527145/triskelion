@@ -5,6 +5,7 @@
     "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  color-scheme: light;
 }
 
 html,
@@ -15,5 +16,51 @@ body,
 
 body {
   margin: 0;
-  background-color: #f4f5f7;
+  color: #1e293b; /* slate-800 */
+  /* 现代化柔和渐变底：浅灰打底，叠加靛蓝 / 紫 / 天蓝三处低饱和光晕，固定不随滚动。 */
+  background-color: #f5f6fa;
+  background-image:
+    radial-gradient(48rem 48rem at 100% -8%, rgba(99, 102, 241, 0.10), transparent 60%),
+    radial-gradient(42rem 42rem at -6% 4%, rgba(139, 92, 246, 0.08), transparent 58%),
+    radial-gradient(40rem 40rem at 52% 116%, rgba(56, 189, 248, 0.07), transparent 60%);
+  background-attachment: fixed;
+}
+
+/* 细条现代滚动条，整站统一观感。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+  background-clip: content-box;
+}
+
+::selection {
+  background: rgba(99, 102, 241, 0.18);
+}
+
+/* 卡片浮入动画：网格首次渲染时轻微上浮淡入，统一各列表的进场观感。 */
+@keyframes tsk-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.tsk-rise {
+  animation: tsk-rise 0.36s ease both;
 }

@@ -9,8 +9,8 @@ use axum::{Json, Router};
 use rusqlite::OptionalExtension;
 
 use crate::shared::{
-    AuthReq, AuthResp, CallReq, McpInfo, McpManifest, McpRenameReq, McpUpsertReq, ResolveResp,
-    SecretInfo, SecretSetReq, SetToolsReq, ToolMeta, stitch,
+    AuthReq, AuthResp, CallReq, McpInfo, McpManifest, McpRenameReq, McpUpsertReq, ReportCallReq,
+    ResolveResp, SecretInfo, SecretSetReq, SetToolsReq, ToolMeta, stitch,
 };
 
 use super::auth;
@@ -53,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/secret/:key", delete(secret_delete))
         .route("/v1/run/:owner/:name/resolve", post(run_resolve))
         .route("/v1/run/:owner/:name/call", post(run_call))
+        .route("/v1/run/:owner/:name/report", post(run_report))
         // 管理后台（需 ADMIN_TOKEN）
         .route("/v1/admin/stats", get(admin::stats))
         .route("/v1/admin/users", get(admin::users).post(admin::user_create))
@@ -703,6 +704,34 @@ async fn run_call(
             Err(ApiError::new(StatusCode::BAD_GATEWAY, msg))
         }
     }
+}
+
+/// CLI 调用回传：`tsk run` 在本地直连 MCP 完成 `tools/call` 后，把调用结果上报 Hub
+/// 作审计统计（尽力而为）。仅记录元信息（工具名、成败、耗时），不经手任何凭据或参数。
+async fn run_report(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<ReportCallReq>,
+) -> Result<StatusCode, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    if req.tool.is_empty() {
+        return Err(ApiError::bad_request("缺少 tool 字段"));
+    }
+    // 校验该 MCP 确实存在且调用者可见，避免被用来伪造任意审计行。
+    let (info, group_vis) = load_mcp(&state, &owner, &name)?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
+    log_tool_call(
+        &state,
+        &claims.username,
+        &owner,
+        &name,
+        &req.tool,
+        req.ok,
+        &req.error,
+        req.ms.max(0),
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 取用户名下凭据并缝合进清单，返回 (resolved, required, missing)。

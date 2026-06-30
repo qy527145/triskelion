@@ -64,6 +64,20 @@ enum Cmd {
         /// 技能根目录（默认当前目录）
         dir: Option<PathBuf>,
     },
+    /// 批量导入第三方技能生态：把一个目录下的每个子文件夹（含 SKILL.md）作为技能发布到市场
+    Import {
+        /// 包含多个技能子文件夹的根目录
+        dir: PathBuf,
+        /// 归类标签：作为 tag 写入每个导入的技能，便于市场筛选（默认「社区资源」）
+        #[arg(long)]
+        category: Option<String>,
+        /// 可见性：public（默认，直接上架市场）或 private
+        #[arg(long)]
+        visibility: Option<String>,
+        /// 跳过逐个确认，直接导入全部
+        #[arg(long)]
+        yes: bool,
+    },
     /// 变量（凭据）管理
     Secret {
         #[command(subcommand)]
@@ -188,6 +202,9 @@ pub fn run() -> Result<()> {
         },
         Cmd::Pull { package, dir } => skill::pull(&package, dir),
         Cmd::Build { dir } => skill::cmd_build(dir),
+        Cmd::Import { dir, category, visibility, yes } => {
+            skill::import(dir, category, visibility, yes)
+        }
         Cmd::Secret { cmd } => match cmd {
             SecretCmd::Set { key, value } => cmd_secret_set(&key, &value),
             SecretCmd::List => cmd_secret_list(),
@@ -666,7 +683,18 @@ fn cmd_run(package: &str, args: &[String]) -> Result<()> {
     }
 
     let arguments = mcp2cli::build_arguments(&tool.input_schema, rest)?;
-    let result = mcp.call_tool(tool_name, arguments)?;
+    let started = std::time::Instant::now();
+    let outcome = mcp.call_tool(tool_name, arguments);
+    let ms = started.elapsed().as_millis() as i64;
+    // 把调用结果回传 Hub 作审计统计（尽力而为；仅已登录时上报，匿名跑公开 MCP 不记账）。
+    if cfg.logged_in() {
+        let (ok, err) = match &outcome {
+            Ok(_) => (true, String::new()),
+            Err(e) => (false, format!("{e:#}")),
+        };
+        let _ = api.report_call(&owner, &name, tool_name, ok, &err, ms);
+    }
+    let result = outcome?;
     if !mcp2cli::print_result(&result) {
         std::process::exit(1);
     }
