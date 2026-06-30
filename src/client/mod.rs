@@ -58,7 +58,7 @@ enum Cmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// 在当前目录打包技能包（tar.gz），等价于 tsk skill build
+    /// 在当前目录打包技能包（tar.zst），等价于 tsk skill build
     Build {
         /// 技能根目录（默认当前目录）
         dir: Option<PathBuf>,
@@ -121,7 +121,7 @@ enum SkillCmd {
         /// 目标目录（默认当前目录）
         dir: Option<PathBuf>,
     },
-    /// 本地打包技能包为 tar.gz（不联网）
+    /// 本地打包技能包为 tar.zst（不联网）
     Build {
         /// 技能根目录（默认当前目录）
         dir: Option<PathBuf>,

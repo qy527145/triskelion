@@ -2,7 +2,7 @@
 //!
 //! 万物皆 Skill：`category` 仅是逻辑分类标签（skill / kb / toolchain）。服务端只
 //! 持有元数据 + SKILL.md 文本（「基础信息」），庞大的数据体由 `tsk build` 打包成
-//! tar.gz 压缩体，按 sha256 内容寻址落盘于 `blobs/`，记录里仅存 sha256 与字节数。
+//! tar.zst 压缩体（zstd，向后兼容旧版 gzip），按 sha256 内容寻址落盘于 `blobs/`，记录里仅存 sha256 与字节数。
 
 use std::sync::Arc;
 
@@ -256,7 +256,9 @@ pub async fn delete(
             .map_err(db_err)?
             .unwrap_or(false);
         if !still {
-            let _ = std::fs::remove_file(blob_path(&state, &sha));
+            if let Some(p) = find_blob(&state, &sha) {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -305,7 +307,7 @@ pub async fn rename(
     Ok(Json(load_skill(&state, &owner, &new_name)?))
 }
 
-/// 上传技能压缩体（tar.gz 原始字节）。仅 owner。服务端计算 sha256 落盘并写回记录。
+/// 上传技能压缩体（tar.zst 原始字节，亦兼容旧版 gzip）。仅 owner。服务端计算 sha256 落盘并写回记录。
 pub async fn archive_put(
     State(state): S,
     headers: HeaderMap,
@@ -321,9 +323,9 @@ pub async fn archive_put(
     }
     let sha = sha256_hex(&body);
     let size = body.len() as i64;
-    // 内容寻址落盘（若已存在同内容则复用）。
-    let path = blob_path(&state, &sha);
-    if !path.exists() {
+    // 内容寻址落盘（若已存在同内容则复用）。扩展名随压缩格式（zstd/gzip）而定。
+    if find_blob(&state, &sha).is_none() {
+        let path = blob_write_path(&state, &sha, &body);
         std::fs::write(&path, &body)
             .map_err(|e| ApiError::internal(format!("写入压缩体失败: {e}")))?;
     }
@@ -361,13 +363,19 @@ pub async fn archive_get(
     if info.archive_sha256.is_empty() {
         return Err(ApiError::not_found("该技能没有压缩体（纯文本裸说明书包）"));
     }
-    let path = blob_path(&state, &info.archive_sha256);
+    let path = find_blob(&state, &info.archive_sha256)
+        .ok_or_else(|| ApiError::not_found("压缩体文件缺失"))?;
     let bytes = std::fs::read(&path)
         .map_err(|e| ApiError::internal(format!("读取压缩体失败: {e}")))?;
-    let filename = format!("{}-{}.tar.gz", name, info.version);
+    // 依据实际压缩格式给出正确的扩展名与 MIME（升级后为 zstd，历史包仍为 gzip）。
+    let (ext, mime) = match crate::archive::detect(&bytes) {
+        crate::archive::Format::Gzip => ("tar.gz", "application/gzip"),
+        _ => ("tar.zst", "application/zstd"),
+    };
+    let filename = format!("{}-{}.{ext}", name, info.version);
     Ok((
         [
-            (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (header::CONTENT_TYPE, mime.to_string()),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
@@ -400,11 +408,25 @@ fn lower_tags(tags: &[String]) -> Vec<String> {
     out
 }
 
-fn blob_path(state: &AppState, sha: &str) -> std::path::PathBuf {
-    state.blobs_dir.join(format!("{sha}.tar.gz"))
+/// 写入路径：按内容魔数选择扩展名（zstd → `.tar.zst`，历史 gzip → `.tar.gz`）。
+pub(super) fn blob_write_path(state: &AppState, sha: &str, bytes: &[u8]) -> std::path::PathBuf {
+    state
+        .blobs_dir
+        .join(format!("{sha}.{}", crate::archive::blob_extension(bytes)))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// 读取路径：内容寻址按 sha 定位，兼容新旧扩展名（升级前的 `.tar.gz` 仍可读）。
+pub(super) fn find_blob(state: &AppState, sha: &str) -> Option<std::path::PathBuf> {
+    for ext in ["tar.zst", "tar.gz", "bin"] {
+        let p = state.blobs_dir.join(format!("{sha}.{ext}"));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut s = String::with_capacity(64);
     for b in digest {

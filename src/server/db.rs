@@ -60,6 +60,22 @@ pub fn init(conn: &Connection) -> Result<()> {
             updated_at     TEXT NOT NULL,
             UNIQUE(owner_id, name)
         );
+
+        -- 工具调用审计：每次经 Hub 网关代调用 MCP 工具时记录一行，供管理后台统计
+        -- 24h/累计调用量、热门工具与最近错误。caller 为发起者用户名快照。
+        CREATE TABLE IF NOT EXISTS tool_calls (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            caller     TEXT NOT NULL DEFAULT '',
+            owner      TEXT NOT NULL DEFAULT '',
+            mcp_name   TEXT NOT NULL DEFAULT '',
+            tool       TEXT NOT NULL DEFAULT '',
+            ok         INTEGER NOT NULL DEFAULT 1,
+            error      TEXT NOT NULL DEFAULT '',
+            ms         INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            created_ts INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls(created_ts);
         "#,
     )
     .context("初始化数据库 schema")?;

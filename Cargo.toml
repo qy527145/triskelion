@@ -31,8 +31,10 @@ client = [
     "dep:dialoguer",
     "dep:rpassword",
     "dep:dirs",
-    # 技能包 build/pull：gzip + tar 打包与校验
+    # 技能包 build/pull：tar 归档 + zstd 压缩
     "dep:tar",
+    "dep:zstd",
+    # 向后兼容：旧版 .tar.gz 压缩体仍可解压
     "dep:flate2",
     "dep:sha2",
 ]
@@ -52,6 +54,9 @@ server = [
     "dep:reqwest",
     # 校验上传技能包压缩体的 sha256
     "dep:sha2",
+    # 管理后台「全量资源包」导入/导出：tar 归档 + zstd 压缩
+    "dep:tar",
+    "dep:zstd",
 ]
 
 [dependencies]
@@ -70,8 +75,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 dialoguer = { version = "0.11", optional = true }
 rpassword = { version = "7", optional = true }
 dirs = { version = "5", optional = true }
-# 技能包打包：gzip 流 + tar 归档（纯 Rust，无系统依赖）
+# 技能包打包：tar 归档 + zstd 流式压缩（高压缩比，兼顾性能；zstdmt 启用多线程编码）
 tar = { version = "0.4", optional = true }
+zstd = { version = "0.13", features = ["zstdmt"], optional = true }
+# 向后兼容：解压旧版 gzip 压缩体（仅解码路径使用）
 flate2 = { version = "1", optional = true }
 # 压缩体内容寻址与完整性校验（client 打包 / server 校验）
 sha2 = { version = "0.10", optional = true }

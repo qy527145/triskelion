@@ -1,4 +1,16 @@
-import type { McpInfo, McpManifest, SecretInfo, SkillInfo, SkillManifest } from "./types";
+import type {
+  AdminMcp,
+  AdminSkill,
+  AdminStats,
+  AdminUser,
+  CallLog,
+  ImportSummary,
+  McpInfo,
+  McpManifest,
+  SecretInfo,
+  SkillInfo,
+  SkillManifest,
+} from "./types";
 
 const TOKEN_KEY = "tsk_token";
 const USER_KEY = "tsk_user";
@@ -32,6 +44,15 @@ interface ReqOpts {
   auth?: boolean;
 }
 
+/**
+ * 去掉开头的 `/`，把绝对路径转成相对路径，使前端可整体部署在 nginx 子路径下（如 `/triskelion/`）。
+ * 浏览器以 `document.baseURI`（当前页面地址）为基准解析相对地址，
+ * 因此请通过带末尾斜杠的地址访问（nginx 子路径通常会自动 301 补全斜杠）。
+ */
+function rel(path: string): string {
+  return path.replace(/^\/+/, "");
+}
+
 async function req<T>(path: string, opts: ReqOpts = {}): Promise<T> {
   const { method = "GET", body, auth = false } = opts;
   const headers: Record<string, string> = {};
@@ -41,7 +62,7 @@ async function req<T>(path: string, opts: ReqOpts = {}): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(path, {
+    res = await fetch(rel(path), {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -131,5 +152,97 @@ export const api = {
       auth: true,
     }),
   skillArchiveUrl: (owner: string, name: string) =>
-    "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/archive",
+    rel("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/archive"),
+};
+
+// ---------------------------------------------------------------------------
+// 管理后台（ADMIN_TOKEN 鉴权，请求头 X-Admin-Token）
+// ---------------------------------------------------------------------------
+
+async function adminReq<T>(path: string, token: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(rel(path), { headers: { "X-Admin-Token": token } });
+  } catch (e) {
+    throw new ApiError(0, "无法连接 Hub：" + (e as Error).message);
+  }
+  const text = await res.text();
+  let data: unknown = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { error: text };
+  }
+  if (!res.ok) {
+    const msg =
+      (data && typeof data === "object" && "error" in data
+        ? (data as { error: string }).error
+        : null) ?? res.statusText;
+    throw new ApiError(res.status, msg);
+  }
+  return data as T;
+}
+
+export const admin = {
+  stats: (token: string) => adminReq<AdminStats>("/v1/admin/stats", token),
+  users: (token: string) => adminReq<AdminUser[]>("/v1/admin/users", token),
+  skills: (token: string) => adminReq<AdminSkill[]>("/v1/admin/skills", token),
+  mcps: (token: string) => adminReq<AdminMcp[]>("/v1/admin/mcps", token),
+  calls: (token: string) => adminReq<CallLog[]>("/v1/admin/calls", token),
+
+  /** 导出全量资源包，触发浏览器下载 .tskpack。 */
+  exportPack: async (token: string): Promise<void> => {
+    const res = await fetch(rel("/v1/admin/export"), { headers: { "X-Admin-Token": token } });
+    if (!res.ok) {
+      const text = await res.text();
+      let msg = res.statusText;
+      try {
+        msg = (JSON.parse(text) as { error?: string }).error ?? msg;
+      } catch {
+        /* keep statusText */
+      }
+      throw new ApiError(res.status, msg);
+    }
+    const disposition = res.headers.get("Content-Disposition") ?? "";
+    const match = /filename="?([^"]+)"?/.exec(disposition);
+    const filename = match?.[1] ?? "triskelion-export.tskpack";
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  /** 导入全量资源包（上传 .tskpack 原始字节）。 */
+  importPack: async (token: string, file: File): Promise<ImportSummary> => {
+    let res: Response;
+    try {
+      res = await fetch(rel("/v1/admin/import"), {
+        method: "POST",
+        headers: { "X-Admin-Token": token, "Content-Type": "application/zstd" },
+        body: file,
+      });
+    } catch (e) {
+      throw new ApiError(0, "无法连接 Hub：" + (e as Error).message);
+    }
+    const text = await res.text();
+    let data: unknown = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = { error: text };
+    }
+    if (!res.ok) {
+      const msg =
+        (data && typeof data === "object" && "error" in data
+          ? (data as { error: string }).error
+          : null) ?? res.statusText;
+      throw new ApiError(res.status, msg);
+    }
+    return data as ImportSummary;
+  },
 };

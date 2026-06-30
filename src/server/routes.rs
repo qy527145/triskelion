@@ -14,6 +14,7 @@ use crate::shared::{
 };
 
 use super::auth;
+use super::admin;
 use super::crypto;
 use super::error::ApiError;
 use super::skills;
@@ -51,6 +52,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/secret/:key", delete(secret_delete))
         .route("/v1/run/:owner/:name/resolve", post(run_resolve))
         .route("/v1/run/:owner/:name/call", post(run_call))
+        // 管理后台（需 ADMIN_TOKEN）
+        .route("/v1/admin/stats", get(admin::stats))
+        .route("/v1/admin/users", get(admin::users))
+        .route("/v1/admin/skills", get(admin::skills_all))
+        .route("/v1/admin/mcps", get(admin::mcps_all))
+        .route("/v1/admin/calls", get(admin::calls))
+        .route("/v1/admin/export", get(admin::export))
+        .route("/v1/admin/import", post(admin::import))
         // 技能压缩体可能较大，放宽请求体上限至 512 MiB
         .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
         // 内置 Web UI 静态资源 + SPA 回退
@@ -546,20 +555,32 @@ async fn run_call(
         )));
     }
     let tool = req.tool.clone();
+    let call_tool = tool.clone();
     let arguments = if req.arguments.is_null() {
         serde_json::json!({})
     } else {
         req.arguments
     };
     // MCP 连接是阻塞 IO（子进程 / 阻塞 HTTP），放到 blocking 线程。
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+    let started = std::time::Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let mut mcp = crate::mcp::McpClient::connect(&resolved)?;
-        mcp.call_tool(&tool, arguments)
+        mcp.call_tool(&call_tool, arguments)
     })
     .await
-    .map_err(|e| ApiError::internal(format!("任务执行失败: {e}")))?
-    .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("MCP 调用失败: {e}")))?;
-    Ok(Json(result))
+    .map_err(|e| ApiError::internal(format!("任务执行失败: {e}")))?;
+    let ms = started.elapsed().as_millis() as i64;
+    match outcome {
+        Ok(result) => {
+            log_tool_call(&state, &claims.username, &owner, &name, &tool, true, "", ms);
+            Ok(Json(result))
+        }
+        Err(e) => {
+            let msg = format!("MCP 调用失败: {e}");
+            log_tool_call(&state, &claims.username, &owner, &name, &tool, false, &msg, ms);
+            Err(ApiError::new(StatusCode::BAD_GATEWAY, msg))
+        }
+    }
 }
 
 /// 取用户名下凭据并缝合进清单，返回 (resolved, required, missing)。
@@ -634,6 +655,43 @@ fn parse_tools(s: &str) -> Vec<ToolMeta> {
 pub(super) fn db_err(e: rusqlite::Error) -> ApiError {
     eprintln!("db error: {e}");
     ApiError::internal(format!("数据库错误: {e}"))
+}
+
+/// 当前 Unix 时间戳（秒）。用于审计表的时间窗过滤（24h 等）。
+pub(super) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 记录一次工具调用审计（尽力而为，落库失败不影响调用结果）。
+pub(super) fn log_tool_call(
+    state: &AppState,
+    caller: &str,
+    owner: &str,
+    mcp_name: &str,
+    tool: &str,
+    ok: bool,
+    error: &str,
+    ms: i64,
+) {
+    let conn = state.db.lock().unwrap();
+    let _ = conn.execute(
+        "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, ms, created_at, created_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            caller,
+            owner,
+            mcp_name,
+            tool,
+            ok as i64,
+            error,
+            ms,
+            now_string(),
+            now_unix()
+        ],
+    );
 }
 
 /// 当前时间 `YYYY-MM-DD HH:MM:SS UTC`（不引入 chrono）。
