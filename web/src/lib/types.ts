@@ -43,6 +43,61 @@ export interface SecretInfo {
   updated_at: string;
 }
 
+// --------------------------------------------------------------------------
+// 技能市场（Skill marketplace）
+// --------------------------------------------------------------------------
+
+/** 逻辑分类：万物皆 Skill，category 仅是分类标签。 */
+export type SkillCategory = "skill" | "kb" | "toolchain";
+
+export const SKILL_CATEGORIES: { id: SkillCategory; label: string }[] = [
+  { id: "skill", label: "技能" },
+  { id: "kb", label: "知识库" },
+  { id: "toolchain", label: "工具链" },
+];
+
+export function categoryLabel(c: string): string {
+  return SKILL_CATEGORIES.find((x) => x.id === c)?.label ?? c;
+}
+
+export interface SkillManifest {
+  name: string;
+  version: string;
+  category: string;
+  description: string;
+  tags: string[];
+  mcp_dependencies: string[];
+  preferred_tools: string[];
+}
+
+export interface SkillInfo {
+  owner: string;
+  name: string;
+  category: string;
+  visibility: string;
+  version: string;
+  description: string;
+  tags: string[];
+  mcp_dependencies: string[];
+  preferred_tools: string[];
+  skill_md: string;
+  archive_sha256: string;
+  archive_size: number;
+  updated_at: string;
+}
+
+export function humanSize(n: number): string {
+  if (!n) return "—";
+  const u = ["B", "KB", "MB", "GB"];
+  let f = n;
+  let i = 0;
+  while (f >= 1024 && i < u.length - 1) {
+    f /= 1024;
+    i++;
+  }
+  return i === 0 ? `${n} B` : `${f.toFixed(1)} ${u[i]}`;
+}
+
 /** 扫描清单里的 {VAR} 占位符（与服务端 required_vars 等价）。 */
 export function requiredVars(m: McpManifest): string[] {
   const found: string[] = [];

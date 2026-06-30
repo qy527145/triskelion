@@ -1,28 +1,40 @@
 import { useCallback, useEffect, useState } from "react";
 import Header, { type Tab } from "./components/Header";
 import McpCard from "./components/McpCard";
+import SkillCard from "./components/SkillCard";
 import LoginModal from "./components/LoginModal";
 import CreateMcpModal from "./components/CreateMcpModal";
+import CreateSkillModal from "./components/CreateSkillModal";
 import DetailModal from "./components/DetailModal";
+import SkillDetailModal from "./components/SkillDetailModal";
 import SecretModal from "./components/SecretModal";
 import { SearchIcon, PlusIcon, KeyIcon, TrashIcon } from "./components/icons";
 import { api, clearAuth, getUser } from "./lib/api";
-import type { McpInfo, SecretInfo } from "./lib/types";
+import type { McpInfo, SecretInfo, SkillInfo } from "./lib/types";
+import { SKILL_CATEGORIES } from "./lib/types";
+
+const isSkillTab = (t: Tab) => t === "skill-market" || t === "skill-mine";
+const isMcpTab = (t: Tab) => t === "mcp-market" || t === "mcp-mine";
+const isMarket = (t: Tab) => t === "skill-market" || t === "mcp-market";
 
 export default function App() {
   const [user, setUser] = useState<string | null>(getUser());
-  const [tab, setTab] = useState<Tab>("market");
+  const [tab, setTab] = useState<Tab>("skill-market");
 
   const [items, setItems] = useState<McpInfo[]>([]);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [secrets, setSecrets] = useState<SecretInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState("");
+  const [category, setCategory] = useState(""); // 技能市场分类过滤
 
   const [showLogin, setShowLogin] = useState(false);
   const [mcpModal, setMcpModal] = useState<{ edit: McpInfo | null } | null>(null);
+  const [skillModal, setSkillModal] = useState(false);
   const [detail, setDetail] = useState<McpInfo | null>(null);
+  const [skillDetail, setSkillDetail] = useState<SkillInfo | null>(null);
   const [secretEdit, setSecretEdit] = useState<{ key: string | null } | null>(null);
   const [toast, setToast] = useState("");
 
@@ -37,7 +49,11 @@ export default function App() {
     try {
       if (tab === "secrets") {
         setSecrets(await api.listSecrets());
-      } else if (tab === "mine") {
+      } else if (tab === "skill-market") {
+        setSkills(await api.skillExplore(search, category));
+      } else if (tab === "skill-mine") {
+        setSkills(await api.listMySkills());
+      } else if (tab === "mcp-mine") {
         setItems(await api.listMine());
       } else {
         setItems(await api.explore(search));
@@ -47,17 +63,20 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [tab, search]);
+  }, [tab, search, category]);
 
   useEffect(() => {
     load();
   }, [load]);
 
   function switchTab(t: Tab) {
-    if ((t === "mine" || t === "secrets") && !user) {
+    if ((t === "skill-mine" || t === "mcp-mine" || t === "secrets") && !user) {
       setShowLogin(true);
       return;
     }
+    setQuery("");
+    setSearch("");
+    setCategory("");
     setTab(t);
   }
 
@@ -70,13 +89,23 @@ export default function App() {
     clearAuth();
     setUser(null);
     notify("已退出登录");
-    setTab("market");
+    setTab("skill-market");
   }
 
   async function deleteMcp(m: McpInfo) {
     if (!confirm(`删除 MCP「${m.name}」？`)) return;
     try {
       await api.deleteMcp(m.name);
+      notify("已删除");
+      load();
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+  async function deleteSkill(s: SkillInfo) {
+    if (!confirm(`删除技能「${s.name}」？`)) return;
+    try {
+      await api.deleteSkill(s.owner, s.name);
       notify("已删除");
       load();
     } catch (e) {
@@ -94,32 +123,41 @@ export default function App() {
     }
   }
 
-  const title = tab === "market" ? "应用市场" : tab === "mine" ? "我的 MCP" : "我的变量";
-  const subtitle =
-    tab === "market"
-      ? "浏览所有公开的 MCP：每个声明运行拓扑与所需变量，可一键转 CLI 使用。"
-      : tab === "mine"
-        ? "你注册的全部 MCP（含私有）。设为 public 即上架市场。"
-        : "渐进式凭据池（AES-256-GCM 加密）。MCP 清单里的 {VAR} 运行时按需缝合。";
+  const meta: Record<Tab, { title: string; subtitle: string }> = {
+    "skill-market": {
+      title: "技能市场",
+      subtitle: "万物皆 Skill：技能 / 知识库 / 工具链。Agent 只读精简 SKILL.md，按需用 tsk 触发底层 MCP。",
+    },
+    "mcp-market": {
+      title: "MCP 市场",
+      subtitle: "浏览所有公开 MCP：每个声明运行拓扑与所需变量，可一键转 CLI 使用。",
+    },
+    "skill-mine": {
+      title: "我的技能",
+      subtitle: "你发布的全部技能（含私有）。大文件夹技能用 tsk skill publish 上传，纯文本可在此直接新建。",
+    },
+    "mcp-mine": {
+      title: "我的 MCP",
+      subtitle: "你注册的全部 MCP（含私有）。设为 public 即上架市场。",
+    },
+    secrets: {
+      title: "我的变量",
+      subtitle: "渐进式凭据池（AES-256-GCM 加密）。MCP 清单里的 {VAR} 运行时按需缝合。",
+    },
+  };
 
   return (
     <div className="min-h-full">
-      <Header
-        tab={tab}
-        onTab={switchTab}
-        user={user}
-        onLogin={() => setShowLogin(true)}
-        onLogout={logout}
-      />
+      <Header tab={tab} onTab={switchTab} user={user} onLogin={() => setShowLogin(true)} onLogout={logout} />
 
       <main className="mx-auto max-w-6xl px-6 py-9 pb-16">
         <div className="flex flex-wrap items-end justify-between gap-6">
           <div>
-            <h1 className="text-[28px] font-bold tracking-wide text-slate-800">{title}</h1>
-            <p className="mt-2 max-w-2xl text-slate-400">{subtitle}</p>
+            <h1 className="text-[28px] font-bold tracking-wide text-slate-800">{meta[tab].title}</h1>
+            <p className="mt-2 max-w-2xl text-slate-400">{meta[tab].subtitle}</p>
           </div>
 
-          {tab === "market" && (
+          {isMarket(tab) && (
             <div className="flex gap-2.5">
               <div className="relative">
                 <SearchIcon className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -127,7 +165,7 @@ export default function App() {
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && setSearch(query)}
-                  placeholder="搜索名称 / 描述"
+                  placeholder={tab === "skill-market" ? "搜索名称 / 描述 / 标签" : "搜索名称 / 描述"}
                   className="w-72 max-w-[60vw] rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-500/10"
                 />
               </div>
@@ -139,7 +177,15 @@ export default function App() {
               </button>
             </div>
           )}
-          {tab === "mine" && (
+          {tab === "skill-mine" && (
+            <button
+              onClick={() => setSkillModal(true)}
+              className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-600"
+            >
+              <PlusIcon /> 新建技能
+            </button>
+          )}
+          {tab === "mcp-mine" && (
             <button
               onClick={() => setMcpModal({ edit: null })}
               className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-600"
@@ -156,6 +202,19 @@ export default function App() {
             </button>
           )}
         </div>
+
+        {tab === "skill-market" && (
+          <div className="mt-6 flex flex-wrap gap-2">
+            <Chip active={category === ""} onClick={() => setCategory("")}>
+              全部
+            </Chip>
+            {SKILL_CATEGORIES.map((c) => (
+              <Chip key={c.id} active={category === c.id} onClick={() => setCategory(c.id)}>
+                {c.label}
+              </Chip>
+            ))}
+          </div>
+        )}
 
         <div className="mt-8">
           {loading ? (
@@ -206,8 +265,28 @@ export default function App() {
                 ))}
               </div>
             )
-          ) : items.length === 0 ? (
-            tab === "market" ? (
+          ) : isSkillTab(tab) ? (
+            skills.length === 0 ? (
+              tab === "skill-market" ? (
+                <Empty big="技能市场暂无公开技能">登录后在 “我的技能” 创建，或用 tsk skill publish 发布并设为 public。</Empty>
+              ) : (
+                <Empty big="你还没有发布任何技能">点击 “新建技能”，或在本地 tsk skill init && tsk skill publish。</Empty>
+              )
+            ) : (
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5">
+                {skills.map((s) => (
+                  <SkillCard
+                    key={s.owner + "/" + s.name}
+                    s={s}
+                    mine={tab === "skill-mine"}
+                    onDetail={() => setSkillDetail(s)}
+                    onDelete={() => deleteSkill(s)}
+                  />
+                ))}
+              </div>
+            )
+          ) : isMcpTab(tab) && items.length === 0 ? (
+            tab === "mcp-market" ? (
               <Empty big="市场暂无公开的 MCP">登录后在 “我的 MCP” 创建并设为 public 即可上架。</Empty>
             ) : (
               <Empty big="你还没有注册任何 MCP">点击 “新建 MCP” 开始。</Empty>
@@ -218,7 +297,7 @@ export default function App() {
                 <McpCard
                   key={m.owner + "/" + m.name}
                   m={m}
-                  mine={tab === "mine"}
+                  mine={tab === "mcp-mine"}
                   onDetail={() => setDetail(m)}
                   onEdit={() => setMcpModal({ edit: m })}
                   onDelete={() => deleteMcp(m)}
@@ -242,6 +321,16 @@ export default function App() {
           }}
         />
       )}
+      {skillModal && (
+        <CreateSkillModal
+          onClose={() => setSkillModal(false)}
+          onSaved={(name) => {
+            setSkillModal(false);
+            notify("已创建 " + name);
+            load();
+          }}
+        />
+      )}
       {detail && (
         <DetailModal
           m={detail}
@@ -253,6 +342,7 @@ export default function App() {
           }}
         />
       )}
+      {skillDetail && <SkillDetailModal s={skillDetail} onClose={() => setSkillDetail(null)} />}
       {secretEdit && (
         <SecretModal
           editKey={secretEdit.key}
@@ -271,6 +361,21 @@ export default function App() {
         </div>
       )}
     </div>
+  );
+}
+
+function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-full px-4 py-1.5 text-sm font-medium transition ${
+        active
+          ? "bg-indigo-500 text-white shadow-sm"
+          : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 

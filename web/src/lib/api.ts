@@ -1,4 +1,4 @@
-import type { McpInfo, McpManifest, SecretInfo } from "./types";
+import type { McpInfo, McpManifest, SecretInfo, SkillInfo, SkillManifest } from "./types";
 
 const TOKEN_KEY = "tsk_token";
 const USER_KEY = "tsk_user";
@@ -104,4 +104,32 @@ export const api = {
     req<SecretInfo>("/v1/secret", { method: "PUT", auth: true, body: { key, value } }),
   deleteSecret: (key: string) =>
     req<null>("/v1/secret/" + encodeURIComponent(key), { method: "DELETE", auth: true }),
+
+  // 技能市场
+  skillExplore: (q: string, category?: string, tag?: string) => {
+    const p = new URLSearchParams();
+    if (q) p.set("q", q);
+    if (category) p.set("category", category);
+    if (tag) p.set("tag", tag);
+    const qs = p.toString();
+    return req<SkillInfo[]>("/v1/skill/explore" + (qs ? "?" + qs : ""));
+  },
+  listMySkills: () => req<SkillInfo[]>("/v1/skill", { auth: true }),
+  getSkill: (owner: string, name: string) =>
+    req<SkillInfo>("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name), {
+      auth: true,
+    }),
+  upsertSkill: (manifest: SkillManifest, visibility: string, skill_md: string) =>
+    req<SkillInfo>("/v1/skill", {
+      method: "POST",
+      auth: true,
+      body: { manifest, visibility, skill_md, archive_sha256: "", archive_size: 0 },
+    }),
+  deleteSkill: (owner: string, name: string) =>
+    req<null>("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name), {
+      method: "DELETE",
+      auth: true,
+    }),
+  skillArchiveUrl: (owner: string, name: string) =>
+    "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/archive",
 };

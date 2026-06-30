@@ -338,3 +338,100 @@ pub struct ResolveResp {
 pub struct ErrorResp {
     pub error: String,
 }
+
+// ---------------------------------------------------------------------------
+// 技能市场（Skill marketplace）wire 类型
+//
+// 万物皆 Skill：`category` 仅是逻辑分类标签（skill / kb / toolchain），底层共用
+// 同一数据结构。技能包可能是一个很大的文件夹（必须含 SKILL.md），由 `tsk build`
+// 打包成 tar.gz 压缩体；服务端只接收元数据 + SKILL.md 文本，庞大的数据体以压缩包
+// 形式按 sha256 内容寻址承载。
+// ---------------------------------------------------------------------------
+
+/// 已知的逻辑分类。仅用于校验/默认，存储与检索均按字符串处理（保持可扩展）。
+pub const SKILL_CATEGORIES: [&str; 3] = ["skill", "kb", "toolchain"];
+
+/// 技能包清单，对应本地 `tsk-skill.json`。SKILL.md 不在此处，单独承载。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SkillManifest {
+    pub name: String,
+    #[serde(default = "default_version")]
+    pub version: String,
+    /// 逻辑分类：skill（技能）/ kb（知识库）/ toolchain（工具链）。
+    #[serde(default = "default_category")]
+    pub category: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 该技能依赖的底层 MCP（`owner/name`），运行时用 `tsk run` 包装调用。
+    #[serde(default)]
+    pub mcp_dependencies: Vec<String>,
+    /// 倾向优先使用的工具（自由文本提示，如 `github/create_issue`）。
+    #[serde(default)]
+    pub preferred_tools: Vec<String>,
+}
+
+fn default_category() -> String {
+    "skill".into()
+}
+
+impl SkillManifest {
+    /// 用目录名兜底生成一个最小清单。
+    pub fn minimal(name: impl Into<String>) -> Self {
+        SkillManifest {
+            name: name.into(),
+            version: default_version(),
+            category: default_category(),
+            description: String::new(),
+            tags: Vec::new(),
+            mcp_dependencies: Vec::new(),
+            preferred_tools: Vec::new(),
+        }
+    }
+}
+
+/// 发布/更新一个技能的元数据（不含压缩体本身，压缩体走 archive 上传接口）。
+#[derive(Serialize, Deserialize)]
+pub struct SkillUpsertReq {
+    pub manifest: SkillManifest,
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+    /// SKILL.md 全文（服务端持有的「基础信息」）。
+    #[serde(default)]
+    pub skill_md: String,
+    /// 压缩体 sha256（十六进制，空表示纯文本裸说明书包，无数据体）。
+    #[serde(default)]
+    pub archive_sha256: String,
+    #[serde(default)]
+    pub archive_size: u64,
+}
+
+/// 技能元信息（市场/详情返回）。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SkillInfo {
+    pub owner: String,
+    pub name: String,
+    pub category: String,
+    pub visibility: String,
+    pub version: String,
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub mcp_dependencies: Vec<String>,
+    #[serde(default)]
+    pub preferred_tools: Vec<String>,
+    #[serde(default)]
+    pub skill_md: String,
+    #[serde(default)]
+    pub archive_sha256: String,
+    #[serde(default)]
+    pub archive_size: u64,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SkillRenameReq {
+    pub new_name: String,
+}

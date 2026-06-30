@@ -1,11 +1,13 @@
 import { initials } from "../lib/color";
 import { LogoutIcon } from "./icons";
 
-export type Tab = "market" | "mine" | "secrets";
+export type Tab = "skill-market" | "mcp-market" | "skill-mine" | "mcp-mine" | "secrets";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "market", label: "应用市场" },
-  { id: "mine", label: "我的 MCP" },
+  { id: "skill-market", label: "技能市场" },
+  { id: "mcp-market", label: "MCP 市场" },
+  { id: "skill-mine", label: "我的技能" },
+  { id: "mcp-mine", label: "我的 MCP" },
   { id: "secrets", label: "我的变量" },
 ];
 
@@ -31,12 +33,12 @@ export default function Header({
         triskelion
       </div>
 
-      <nav className="flex gap-1.5">
+      <nav className="flex gap-1">
         {TABS.map((t) => (
           <button
             key={t.id}
             onClick={() => onTab(t.id)}
-            className={`rounded-[10px] px-3.5 py-2 text-[15px] font-medium transition ${
+            className={`rounded-[10px] px-3 py-2 text-[15px] font-medium transition ${
               tab === t.id
                 ? "bg-indigo-50 font-semibold text-indigo-500"
                 : "text-slate-600 hover:bg-slate-100"
