@@ -619,14 +619,40 @@ async fn run_resolve(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<ResolveResp>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    // 鉴权可选：未登录也能解析公开 MCP（返回原始 manifest，线上变量为空）。
+    let viewer = auth::authenticate_opt(&state.jwt_secret, &headers);
     let (info, group_vis) = load_mcp(&state, &owner, &name)?;
-    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
-    let (resolved, required, missing) = stitch_for_user(&state, claims.sub, &info.manifest)?;
+    let is_owner = viewer.as_ref().map(|c| c.username == owner).unwrap_or(false);
+    if !is_owner {
+        if info.visibility != "public" {
+            return Err(ApiError::not_found("未找到该 MCP（或为私有）"));
+        }
+        let viewer_groups = viewer
+            .as_ref()
+            .map(|c| {
+                let conn = state.db.lock().unwrap();
+                groups_of_user(&conn, c.sub)
+            })
+            .unwrap_or_default();
+        if !group_can_see(&group_vis, &viewer_groups, false) {
+            return Err(ApiError::not_found("未找到该 MCP（或所属分组不可见）"));
+        }
+    }
+    let required = info.manifest.required_vars();
+    // 仅返回调用者本人线上已设置、且被该 manifest 引用的变量值。
+    let vars = if let Some(claims) = &viewer {
+        let all = decrypt_user_secrets(&state, claims.sub)?;
+        required
+            .iter()
+            .filter_map(|k| all.get(k).map(|v| (k.clone(), v.clone())))
+            .collect()
+    } else {
+        std::collections::BTreeMap::new()
+    };
     Ok(Json(ResolveResp {
-        manifest: resolved,
+        manifest: info.manifest,
         required,
-        missing,
+        vars,
     }))
 }
 
@@ -680,11 +706,11 @@ async fn run_call(
 }
 
 /// 取用户名下凭据并缝合进清单，返回 (resolved, required, missing)。
-fn stitch_for_user(
+/// 解密某用户名下全部线上变量为明文 map（变量名→值）。
+fn decrypt_user_secrets(
     state: &AppState,
     user_id: i64,
-    manifest: &McpManifest,
-) -> Result<(McpManifest, Vec<String>, Vec<String>), ApiError> {
+) -> Result<std::collections::BTreeMap<String, String>, ApiError> {
     let conn = state.db.lock().unwrap();
     let mut stmt = conn
         .prepare("SELECT key, nonce, ciphertext FROM secrets WHERE owner_id = ?1")
@@ -704,8 +730,15 @@ fn stitch_for_user(
         let val = crypto::decrypt(&state.master_key, &nonce, &ct)?;
         vars.insert(key, val);
     }
-    drop(stmt);
-    drop(conn);
+    Ok(vars)
+}
+
+fn stitch_for_user(
+    state: &AppState,
+    user_id: i64,
+    manifest: &McpManifest,
+) -> Result<(McpManifest, Vec<String>, Vec<String>), ApiError> {
+    let vars = decrypt_user_secrets(state, user_id)?;
     let required = manifest.required_vars();
     let (resolved, missing) = stitch(manifest, &vars);
     Ok((resolved, required, missing))

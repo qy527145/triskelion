@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod mcp2cli;
+mod secrets;
 mod skill;
 
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use dialoguer::{Confirm, Input, Select};
 use api::HubClient;
 use config::Config;
 
-use crate::shared::{McpManifest, Protocol, Runtime, ToolMeta, strip_jsonc};
+use crate::shared::{McpManifest, Protocol, Runtime, ToolMeta, stitch, strip_jsonc};
 
 #[derive(Parser)]
 #[command(name = "tsk", version, about = "Triskelion 客户端 — skill/mcp 托管平台 CLI")]
@@ -299,13 +300,28 @@ fn cmd_mcp_add(file: Option<PathBuf>, visibility: Option<String>, yes: bool) -> 
     Ok(())
 }
 
+/// 解析运行所需 manifest：从 Hub 取原始 manifest 与调用者线上变量，
+/// 叠加本地变量（**本地优先**）后在客户端完成凭据缝合。
+/// 返回 (已缝合 manifest, 全部所需变量, 仍缺失变量)。
+fn resolve_run(api: &HubClient, owner: &str, name: &str) -> Result<(McpManifest, Vec<String>, Vec<String>)> {
+    let resolved = api.run_resolve(owner, name)?;
+    let local = secrets::LocalSecrets::load();
+    // 线上变量打底，本地变量覆盖（本地优先级更高）。
+    let mut vars = resolved.vars.clone();
+    for (k, v) in local.values_map() {
+        vars.insert(k, v);
+    }
+    let (stitched, missing) = stitch(&resolved.manifest, &vars);
+    Ok((stitched, resolved.required, missing))
+}
+
 /// 连接指定 MCP，列出工具并上报 Hub 检索索引，返回已索引数量。
 fn index_mcp_tools(api: &HubClient, owner: &str, name: &str) -> Result<usize> {
-    let resolved = api.run_resolve(owner, name)?;
-    if !resolved.missing.is_empty() {
-        bail!("缺少变量 {}", resolved.missing.join(", "));
+    let (manifest, _required, missing) = resolve_run(api, owner, name)?;
+    if !missing.is_empty() {
+        bail!("缺少变量 {}", missing.join(", "));
     }
-    let mut mcp = mcp2cli::McpClient::connect(&resolved.manifest)?;
+    let mut mcp = mcp2cli::McpClient::connect(&manifest)?;
     let tools = mcp.list_tools()?;
     let metas = tool_metas(&tools);
     let n = api.set_tools(name, &metas)?;
@@ -508,31 +524,82 @@ fn cmd_mcp_remove(name: &str) -> Result<()> {
 
 fn cmd_secret_set(key: &str, value: &str) -> Result<()> {
     let cfg = Config::load();
-    let api = client(&cfg)?;
-    api.secret_set(key, value)?;
-    println!("✓ 已设置变量 {key}");
+    // 总是写本地。
+    let mut local = secrets::LocalSecrets::load();
+    local.set(key, value);
+    local.save()?;
+    // 已登录则在本地之外再写线上（尽力而为，失败不影响本地）。
+    if cfg.logged_in() {
+        match client(&cfg).and_then(|api| api.secret_set(key, value).map_err(Into::into)) {
+            Ok(_) => println!("✓ 已设置变量 {key}（本地 + 线上）"),
+            Err(e) => println!("✓ 已写入本地变量 {key}；线上写入失败：{e}"),
+        }
+    } else {
+        println!("✓ 已设置本地变量 {key}（未登录，仅本地）");
+    }
     Ok(())
 }
 
 fn cmd_secret_list() -> Result<()> {
     let cfg = Config::load();
-    let api = client(&cfg)?;
-    let list = api.secret_list()?;
-    if list.is_empty() {
+    let local = secrets::LocalSecrets::load();
+    // 线上变量（仅已登录时；获取失败降级为仅本地）。
+    let online: Vec<String> = if cfg.logged_in() {
+        match client(&cfg).and_then(|api| api.secret_list().map_err(Into::into)) {
+            Ok(list) => list.into_iter().map(|s| s.key).collect(),
+            Err(e) => {
+                eprintln!("（线上变量获取失败，仅显示本地：{e}）");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    use std::collections::BTreeSet;
+    let online_set: BTreeSet<&String> = online.iter().collect();
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    keys.extend(local.keys().cloned());
+    keys.extend(online.iter().cloned());
+    if keys.is_empty() {
         println!("(无变量)");
         return Ok(());
     }
-    for s in list {
-        println!("{}  ({})", s.key, s.updated_at);
+    for k in &keys {
+        let in_local = local.get(k).is_some();
+        let in_online = online_set.contains(k);
+        let src = match (in_local, in_online) {
+            (true, true) => "本地(覆盖线上)",
+            (true, false) => "本地",
+            _ => "线上",
+        };
+        println!("{k}  [{src}]");
     }
     Ok(())
 }
 
 fn cmd_secret_rm(key: &str) -> Result<()> {
     let cfg = Config::load();
-    let api = client(&cfg)?;
-    api.secret_delete(key)?;
-    println!("✓ 已删除变量 {key}");
+    let mut local = secrets::LocalSecrets::load();
+    let removed_local = local.remove(key);
+    if removed_local {
+        local.save()?;
+    }
+    let mut removed_online = false;
+    if cfg.logged_in() {
+        if let Ok(api) = client(&cfg) {
+            match api.secret_delete(key) {
+                Ok(_) => removed_online = true,
+                Err(e) if e.status == 404 => {}
+                Err(e) => println!("（线上删除失败：{e}）"),
+            }
+        }
+    }
+    if removed_local || removed_online {
+        println!("✓ 已删除变量 {key}");
+    } else {
+        println!("变量 {key} 不存在");
+    }
     Ok(())
 }
 
@@ -542,36 +609,42 @@ fn cmd_secret_rm(key: &str) -> Result<()> {
 
 fn cmd_run(package: &str, args: &[String]) -> Result<()> {
     let cfg = Config::load();
-    let api = client(&cfg)?;
+    let hub = cfg.hub().ok_or_else(|| {
+        anyhow::anyhow!("尚未配置 Hub：请 tsk login --hub <url>，或设置 TRISKELION_HUB 环境变量")
+    })?;
+    // 登录非必需：带上 token（若有）即可访问私有/线上变量，无 token 也能跑公开 MCP。
+    let api = HubClient::new(hub, cfg.token.clone());
     let (owner, name) = match package.split_once('/') {
         Some((o, n)) => (o.to_string(), n.to_string()),
         None => {
-            let me = cfg.username.clone().context("未登录，无法推断 owner")?;
+            let me = cfg.username.clone().ok_or_else(|| {
+                anyhow::anyhow!("未登录时请用 owner/name 形式指定，如 tsk run alice/foo")
+            })?;
             (me, package.to_string())
         }
     };
 
-    let resolved = api.run_resolve(&owner, &name)?;
-    if !resolved.missing.is_empty() {
+    let (manifest, required, missing) = resolve_run(&api, &owner, &name)?;
+    if !missing.is_empty() {
         let pkg = format!("{owner}/{name}");
         eprintln!("`{pkg}` 依赖以下变量：");
-        for v in &resolved.required {
-            let ok = !resolved.missing.contains(v);
+        for v in &required {
+            let ok = !missing.contains(v);
             eprintln!("  {} {v}", if ok { "✓ 已设置" } else { "✗ 未设置" });
         }
-        eprintln!("\n缺少 {} 个变量，请先设置后重试：", resolved.missing.len());
-        for v in &resolved.missing {
+        eprintln!("\n缺少 {} 个变量，请先设置后重试：", missing.len());
+        for v in &missing {
             eprintln!("  tsk secret set {v} <value>");
         }
         bail!("{pkg} 运行所需变量未配置完整");
     }
 
-    let mut mcp = mcp2cli::McpClient::connect(&resolved.manifest)?;
+    let mut mcp = mcp2cli::McpClient::connect(&manifest)?;
     let tools = mcp.list_tools()?;
     let pkg = format!("{owner}/{name}");
 
-    // 自己的 MCP：顺带把实时工具清单回传 Hub 作检索索引（尽力而为，失败不影响运行）。
-    if cfg.username.as_deref() == Some(owner.as_str()) {
+    // 自己的 MCP（且已登录）：顺带把实时工具清单回传 Hub 作检索索引（尽力而为）。
+    if cfg.logged_in() && cfg.username.as_deref() == Some(owner.as_str()) {
         let _ = api.set_tools(&name, &tool_metas(&tools));
     }
 
