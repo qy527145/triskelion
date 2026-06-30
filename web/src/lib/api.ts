@@ -155,6 +155,11 @@ export const api = {
       auth: true,
       body: { manifest, visibility, skill_md, archive_sha256: "", archive_size: 0 },
     }),
+  renameSkill: (owner: string, name: string, newName: string) =>
+    req<SkillInfo>(
+      "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/rename",
+      { method: "POST", auth: true, body: { new_name: newName } },
+    ),
   deleteSkill: (owner: string, name: string) =>
     req<null>("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name), {
       method: "DELETE",
@@ -249,12 +254,23 @@ export const admin = {
   deleteUser: (token: string, id: number) =>
     adminReq<null>("/v1/admin/users/" + id, token, { method: "DELETE" }),
 
-  // 市场资源（技能 / MCP）可见性配置 + 删除
+  // 市场资源（技能 / MCP）可见性配置 + 内容编辑 + 删除
   updateSkill: (
     token: string,
     owner: string,
     name: string,
-    body: { visibility?: string; group_visibility?: GroupVisibility; label_ids?: number[] },
+    body: {
+      visibility?: string;
+      group_visibility?: GroupVisibility;
+      label_ids?: number[];
+      version?: string;
+      category?: string;
+      description?: string;
+      tags?: string[];
+      skill_md?: string;
+      mcp_dependencies?: string[];
+      preferred_tools?: string[];
+    },
   ) =>
     adminReq<null>(
       "/v1/admin/skills/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),
@@ -271,7 +287,12 @@ export const admin = {
     token: string,
     owner: string,
     name: string,
-    body: { visibility?: string; group_visibility?: GroupVisibility; label_ids?: number[] },
+    body: {
+      visibility?: string;
+      group_visibility?: GroupVisibility;
+      label_ids?: number[];
+      manifest?: McpManifest;
+    },
   ) =>
     adminReq<null>(
       "/v1/admin/mcps/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),

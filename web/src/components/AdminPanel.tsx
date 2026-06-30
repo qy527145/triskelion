@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, ApiError } from "../lib/api";
-import { humanSize, parseGroupVisibility } from "../lib/types";
+import { humanSize, parseGroupVisibility, SKILL_CATEGORIES } from "../lib/types";
 import type {
   AdminGroup,
   AdminLabel,
@@ -11,6 +11,10 @@ import type {
   CallLog,
   GroupVisibility,
   ImportSummary,
+  McpManifest,
+  Protocol,
+  Runtime,
+  SkillCategory,
 } from "../lib/types";
 import Modal from "./Modal";
 import { DownloadIcon, LogoutIcon, PlusIcon, TrashIcon } from "./icons";
@@ -412,6 +416,66 @@ function MiniButton({
 const inputCls =
   "w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-500/10";
 
+const adminLabelCls = "mb-1.5 block text-xs font-semibold text-slate-600";
+
+/** 编辑弹窗通用底部：取消 + 保存。 */
+function ModalFooter({
+  busy,
+  onClose,
+  onSave,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <>
+      <button
+        onClick={onClose}
+        className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+      >
+        取消
+      </button>
+      <button
+        onClick={onSave}
+        disabled={busy}
+        className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
+      >
+        {busy ? "保存中…" : "保存"}
+      </button>
+    </>
+  );
+}
+
+/** 逗号 / 换行分隔的列表解析（去空白、去空项）。 */
+function parseCsv(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** 每行 KEY=VALUE 文本 → 映射。 */
+function parseKv(text: string): Record<string, string> {
+  const o: Record<string, string> = {};
+  text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .forEach((l) => {
+      const i = l.indexOf("=");
+      if (i > 0) o[l.slice(0, i).trim()] = l.slice(i + 1).trim();
+    });
+  return o;
+}
+
+/** 映射 → 每行 KEY=VALUE 文本。 */
+function kvToText(kv?: Record<string, string>): string {
+  return Object.entries(kv ?? {})
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+}
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
@@ -535,6 +599,7 @@ function SkillsTable({ token, notify }: { token: string; notify: (m: string) => 
   const groups = useGroups(token);
   const labels = useLabels(token);
   const [edit, setEdit] = useState<AdminSkill | null>(null);
+  const [content, setContent] = useState<AdminSkill | null>(null);
   if (loading || error) return <StateLine loading={loading} error={error} />;
   const rows = data!;
 
@@ -577,6 +642,7 @@ function SkillsTable({ token, notify }: { token: string; notify: (m: string) => 
               <td className="px-5 py-3 text-xs text-slate-400">{s.updated_at}</td>
               <td className="px-5 py-3">
                 <RowActions>
+                  <MiniButton onClick={() => setContent(s)}>编辑</MiniButton>
                   <MiniButton onClick={() => setEdit(s)}>配置</MiniButton>
                   <MiniButton tone="rose" onClick={() => del(s)}>
                     <TrashIcon width={13} height={13} />
@@ -606,6 +672,18 @@ function SkillsTable({ token, notify }: { token: string; notify: (m: string) => 
           }}
         />
       )}
+      {content && (
+        <AdminSkillEditModal
+          token={token}
+          skill={content}
+          onClose={() => setContent(null)}
+          onSaved={() => {
+            setContent(null);
+            notify("已更新");
+            reload();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -618,6 +696,7 @@ function McpsTable({ token, notify }: { token: string; notify: (m: string) => vo
   const groups = useGroups(token);
   const labels = useLabels(token);
   const [edit, setEdit] = useState<AdminMcp | null>(null);
+  const [content, setContent] = useState<AdminMcp | null>(null);
   if (loading || error) return <StateLine loading={loading} error={error} />;
   const rows = data!;
 
@@ -658,6 +737,7 @@ function McpsTable({ token, notify }: { token: string; notify: (m: string) => vo
               <td className="px-5 py-3 text-xs text-slate-400">{m.updated_at}</td>
               <td className="px-5 py-3">
                 <RowActions>
+                  <MiniButton onClick={() => setContent(m)}>编辑</MiniButton>
                   <MiniButton onClick={() => setEdit(m)}>配置</MiniButton>
                   <MiniButton tone="rose" onClick={() => del(m)}>
                     <TrashIcon width={13} height={13} />
@@ -682,6 +762,18 @@ function McpsTable({ token, notify }: { token: string; notify: (m: string) => vo
           onClose={() => setEdit(null)}
           onSaved={() => {
             setEdit(null);
+            notify("已更新");
+            reload();
+          }}
+        />
+      )}
+      {content && (
+        <AdminMcpEditModal
+          token={token}
+          mcp={content}
+          onClose={() => setContent(null)}
+          onSaved={() => {
+            setContent(null);
             notify("已更新");
             reload();
           }}
@@ -815,6 +907,274 @@ function VisibilityModal({
             </div>
           )}
         </Field>
+        <ModalError error={error} />
+      </div>
+    </Modal>
+  );
+}
+
+/** 管理员：编辑技能内容（分类 / 版本 / 描述 / 标签 / 依赖 / SKILL.md）。 */
+function AdminSkillEditModal({
+  token,
+  skill,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  skill: AdminSkill;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [version, setVersion] = useState(skill.version);
+  const [category, setCategory] = useState<SkillCategory>(skill.category as SkillCategory);
+  const [description, setDescription] = useState(skill.description);
+  const [tags, setTags] = useState(skill.tags.join(", "));
+  const [mcpDeps, setMcpDeps] = useState(skill.mcp_dependencies.join(", "));
+  const [preferred, setPreferred] = useState(skill.preferred_tools.join(", "));
+  const [skillMd, setSkillMd] = useState(skill.skill_md);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function save() {
+    if (!skillMd.trim()) {
+      setError("SKILL.md 不能为空");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await admin.updateSkill(token, skill.owner, skill.name, {
+        version: version.trim() || "0.1.0",
+        category,
+        description: description.trim(),
+        tags: parseCsv(tags),
+        mcp_dependencies: parseCsv(mcpDeps),
+        preferred_tools: parseCsv(preferred),
+        skill_md: skillMd,
+      });
+      onSaved();
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title="编辑技能内容"
+      subtitle={`${skill.owner}/${skill.name}`}
+      onClose={onClose}
+      wide
+      footer={<ModalFooter busy={busy} onClose={onClose} onSave={save} />}
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className={adminLabelCls}>版本</label>
+            <input className={inputCls} value={version} onChange={(e) => setVersion(e.target.value)} />
+          </div>
+          <div>
+            <label className={adminLabelCls}>分类</label>
+            <select
+              className={inputCls}
+              value={category}
+              onChange={(e) => setCategory(e.target.value as SkillCategory)}
+            >
+              {SKILL_CATEGORIES.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}（{c.id}）
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={adminLabelCls}>压缩体</label>
+            <div className="px-1 py-2.5 text-sm text-slate-500">
+              {skill.has_archive ? `📦 ${humanSize(skill.archive_size)}` : "纯文本"}
+            </div>
+          </div>
+        </div>
+        <div>
+          <label className={adminLabelCls}>描述</label>
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={adminLabelCls}>标签（逗号/换行分隔）</label>
+            <input className={inputCls} value={tags} onChange={(e) => setTags(e.target.value)} />
+          </div>
+          <div>
+            <label className={adminLabelCls}>依赖 MCP（owner/name）</label>
+            <input className={inputCls} value={mcpDeps} onChange={(e) => setMcpDeps(e.target.value)} />
+          </div>
+        </div>
+        <div>
+          <label className={adminLabelCls}>倾向工具（可选）</label>
+          <input className={inputCls} value={preferred} onChange={(e) => setPreferred(e.target.value)} />
+        </div>
+        <div>
+          <label className={adminLabelCls}>SKILL.md</label>
+          <textarea
+            className={`${inputCls} min-h-[180px] resize-y font-mono text-xs leading-relaxed`}
+            value={skillMd}
+            onChange={(e) => setSkillMd(e.target.value)}
+          />
+        </div>
+        {skill.has_archive && (
+          <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+            该技能含压缩体：此处仅改写元数据与展示用的 SKILL.md，压缩包内文件不变。
+          </p>
+        )}
+        <ModalError error={error} />
+      </div>
+    </Modal>
+  );
+}
+
+/** 管理员：编辑 MCP 运行清单（描述 / 版本 / 运行拓扑 / URL 或命令 / 变量）。名称锁定不变。 */
+function AdminMcpEditModal({
+  token,
+  mcp,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  mcp: AdminMcp;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const m = mcp.manifest;
+  const [version, setVersion] = useState(m.version);
+  const [description, setDescription] = useState(m.description);
+  const [runtime, setRuntime] = useState<Runtime>(m.runtime);
+  const [protocol, setProtocol] = useState<Protocol>(m.protocol);
+  const [target, setTarget] = useState(m.runtime === "local" ? (m.command ?? "") : (m.url ?? ""));
+  const [kvText, setKvText] = useState(kvToText(m.runtime === "local" ? m.env : m.headers));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const local = runtime === "local";
+
+  function onRuntimeChange(r: Runtime) {
+    setRuntime(r);
+    setProtocol(r === "local" ? "stdio" : "streamable");
+  }
+
+  async function save() {
+    if (!target.trim()) {
+      setError(local ? "请填写启动命令" : "请填写 URL");
+      return;
+    }
+    const kv = parseKv(kvText);
+    const manifest: McpManifest = {
+      resource_type: "mcp",
+      name: mcp.name,
+      description: description.trim(),
+      version: version.trim() || "0.1.0",
+      runtime,
+      protocol,
+    };
+    if (local) {
+      manifest.command = target.trim();
+      manifest.env = kv;
+    } else {
+      manifest.url = target.trim();
+      manifest.headers = kv;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await admin.updateMcp(token, mcp.owner, mcp.name, { manifest });
+      onSaved();
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title="编辑 MCP 清单"
+      subtitle={`${mcp.owner}/${mcp.name}`}
+      onClose={onClose}
+      wide
+      footer={<ModalFooter busy={busy} onClose={onClose} onSave={save} />}
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={adminLabelCls}>名称（不可改）</label>
+            <input className={`${inputCls} bg-slate-50 text-slate-400`} value={mcp.name} disabled />
+          </div>
+          <div>
+            <label className={adminLabelCls}>版本</label>
+            <input className={inputCls} value={version} onChange={(e) => setVersion(e.target.value)} />
+          </div>
+        </div>
+        <div>
+          <label className={adminLabelCls}>描述</label>
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={adminLabelCls}>运行时</label>
+            <select
+              className={inputCls}
+              value={runtime}
+              onChange={(e) => onRuntimeChange(e.target.value as Runtime)}
+            >
+              <option value="remote">remote</option>
+              <option value="local">local</option>
+            </select>
+          </div>
+          <div>
+            <label className={adminLabelCls}>协议</label>
+            <select
+              className={inputCls}
+              value={protocol}
+              onChange={(e) => setProtocol(e.target.value as Protocol)}
+            >
+              {local ? (
+                <option value="stdio">stdio</option>
+              ) : (
+                <>
+                  <option value="streamable">streamable</option>
+                  <option value="sse">sse</option>
+                </>
+              )}
+            </select>
+          </div>
+        </div>
+        <div>
+          <label className={adminLabelCls}>{local ? "启动命令" : "URL"}</label>
+          <input
+            className={inputCls}
+            value={target}
+            placeholder={local ? "uvx acemcp --port 8888" : "http://host/mcp/{AIKO_HUB_KEY}"}
+            onChange={(e) => setTarget(e.target.value)}
+          />
+          <p className="mt-1.5 text-xs text-slate-400">
+            {local ? "本地 stdio 进程启动命令。" : "远程地址，可内嵌 {VAR} 占位符。"}
+          </p>
+        </div>
+        <div>
+          <label className={adminLabelCls}>
+            {local ? "环境变量（每行 KEY=VALUE，可选）" : "Headers（每行 KEY=VALUE，可选）"}
+          </label>
+          <textarea
+            className={`${inputCls} min-h-[64px] resize-y font-mono text-xs`}
+            value={kvText}
+            placeholder={local ? "TOKEN={ACEMCP_TOKEN}" : "Authorization=Bearer {AIKO_HUB_KEY}"}
+            onChange={(e) => setKvText(e.target.value)}
+          />
+        </div>
         <ModalError error={error} />
       </div>
     </Modal>

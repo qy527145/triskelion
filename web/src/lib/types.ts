@@ -168,6 +168,10 @@ export interface AdminSkill {
   group_visibility: string;
   version: string;
   description: string;
+  tags: string[];
+  skill_md: string;
+  mcp_dependencies: string[];
+  preferred_tools: string[];
   archive_size: number;
   has_archive: boolean;
   labels: GroupBrief[];
@@ -182,6 +186,7 @@ export interface AdminMcp {
   version: string;
   runtime: string;
   protocol: string;
+  manifest: McpManifest;
   labels: GroupBrief[];
   updated_at: string;
 }

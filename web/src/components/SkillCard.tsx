@@ -19,11 +19,13 @@ export default function SkillCard({
   s,
   mine,
   onDetail,
+  onEdit,
   onDelete,
 }: {
   s: SkillInfo;
   mine?: boolean;
   onDetail: () => void;
+  onEdit?: () => void;
   onDelete?: () => void;
 }) {
   const color = colorFor(s.name + s.owner);
@@ -105,6 +107,12 @@ export default function SkillCard({
               className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-50"
             >
               详情
+            </button>
+            <button
+              onClick={onEdit}
+              className="rounded-lg border border-indigo-200 px-3 py-1.5 text-xs font-semibold text-indigo-500 transition hover:bg-indigo-50"
+            >
+              编辑
             </button>
             <button
               onClick={onDelete}
