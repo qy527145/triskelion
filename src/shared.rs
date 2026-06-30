@@ -307,6 +307,9 @@ pub struct McpInfo {
     pub manifest: McpManifest,
     #[serde(default)]
     pub tools: Vec<ToolMeta>,
+    /// 受管标签名（管理后台分配，如「官方」「社区」），用于市场标注与筛选。
+    #[serde(default)]
+    pub labels: Vec<String>,
     pub updated_at: String,
 }
 
@@ -428,6 +431,9 @@ pub struct SkillInfo {
     pub archive_sha256: String,
     #[serde(default)]
     pub archive_size: u64,
+    /// 受管标签名（管理后台分配，如「官方」「社区」），用于市场标注与筛选。
+    #[serde(default)]
+    pub labels: Vec<String>,
     pub updated_at: String,
 }
 

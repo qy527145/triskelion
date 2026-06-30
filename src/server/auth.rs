@@ -74,3 +74,9 @@ pub fn authenticate(secret: &[u8], headers: &HeaderMap) -> Result<Claims, ApiErr
     .map_err(|_| ApiError::unauthorized("token 无效或已过期，请重新 tsk login"))?;
     Ok(data.claims)
 }
+
+/// 可选鉴权：有合法 token 返回声明，否则返回 None（不报错）。
+/// 用于公开市场接口——匿名访客只看「所有分组可见」资源，登录用户额外看到其分组可见的。
+pub fn authenticate_opt(secret: &[u8], headers: &HeaderMap) -> Option<Claims> {
+    authenticate(secret, headers).ok()
+}

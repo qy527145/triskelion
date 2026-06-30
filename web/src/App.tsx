@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import Header, { type Tab } from "./components/Header";
+import Header, { type Tab, isPersonal } from "./components/Header";
 import McpCard from "./components/McpCard";
 import SkillCard from "./components/SkillCard";
 import LoginModal from "./components/LoginModal";
@@ -17,6 +17,12 @@ const isSkillTab = (t: Tab) => t === "skill-market" || t === "skill-mine";
 const isMcpTab = (t: Tab) => t === "mcp-market" || t === "mcp-mine";
 const isMarket = (t: Tab) => t === "skill-market" || t === "mcp-market";
 
+const PERSONAL: { id: Tab; label: string }[] = [
+  { id: "skill-mine", label: "我的技能" },
+  { id: "mcp-mine", label: "我的 MCP" },
+  { id: "secrets", label: "我的变量" },
+];
+
 export default function App() {
   const [user, setUser] = useState<string | null>(getUser());
   const [tab, setTab] = useState<Tab>("skill-market");
@@ -29,6 +35,8 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState(""); // 技能市场分类过滤
+  const [label, setLabel] = useState(""); // 市场受管标签过滤（官方/社区等）
+  const [labelOptions, setLabelOptions] = useState<string[]>([]);
 
   const [showLogin, setShowLogin] = useState(false);
   const [mcpModal, setMcpModal] = useState<{ edit: McpInfo | null } | null>(null);
@@ -50,24 +58,29 @@ export default function App() {
       if (tab === "secrets") {
         setSecrets(await api.listSecrets());
       } else if (tab === "skill-market") {
-        setSkills(await api.skillExplore(search, category));
+        setSkills(await api.skillExplore(search, category, undefined, label));
       } else if (tab === "skill-mine") {
         setSkills(await api.listMySkills());
       } else if (tab === "mcp-mine") {
         setItems(await api.listMine());
       } else {
-        setItems(await api.explore(search));
+        setItems(await api.explore(search, label));
       }
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [tab, search, category]);
+  }, [tab, search, category, label]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // 受管标签清单（供市场筛选）。
+  useEffect(() => {
+    api.listLabels().then(setLabelOptions).catch(() => setLabelOptions([]));
+  }, []);
 
   function switchTab(t: Tab) {
     if ((t === "skill-mine" || t === "mcp-mine" || t === "secrets") && !user) {
@@ -77,6 +90,7 @@ export default function App() {
     setQuery("");
     setSearch("");
     setCategory("");
+    setLabel("");
     setTab(t);
   }
 
@@ -153,6 +167,11 @@ export default function App() {
       <main className="mx-auto max-w-6xl px-6 py-9 pb-16">
         <div className="flex flex-wrap items-end justify-between gap-6">
           <div>
+            {isPersonal(tab) && (
+              <div className="mb-1 text-xs font-semibold uppercase tracking-wider text-indigo-400">
+                个人中心
+              </div>
+            )}
             <h1 className="text-[28px] font-bold tracking-wide text-slate-800">{meta[tab].title}</h1>
             <p className="mt-2 max-w-2xl text-slate-400">{meta[tab].subtitle}</p>
           </div>
@@ -203,6 +222,16 @@ export default function App() {
           )}
         </div>
 
+        {isPersonal(tab) && (
+          <div className="mt-6 flex flex-wrap gap-2">
+            {PERSONAL.map((p) => (
+              <Chip key={p.id} active={tab === p.id} onClick={() => switchTab(p.id)}>
+                {p.label}
+              </Chip>
+            ))}
+          </div>
+        )}
+
         {tab === "skill-market" && (
           <div className="mt-6 flex flex-wrap gap-2">
             <Chip active={category === ""} onClick={() => setCategory("")}>
@@ -211,6 +240,20 @@ export default function App() {
             {SKILL_CATEGORIES.map((c) => (
               <Chip key={c.id} active={category === c.id} onClick={() => setCategory(c.id)}>
                 {c.label}
+              </Chip>
+            ))}
+          </div>
+        )}
+
+        {isMarket(tab) && labelOptions.length > 0 && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="mr-1 text-xs font-medium uppercase tracking-wider text-slate-400">标签</span>
+            <Chip active={label === ""} onClick={() => setLabel("")}>
+              全部
+            </Chip>
+            {labelOptions.map((l) => (
+              <Chip key={l} active={label === l} onClick={() => setLabel(l)}>
+                {l}
               </Chip>
             ))}
           </div>

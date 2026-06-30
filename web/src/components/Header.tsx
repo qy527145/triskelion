@@ -3,12 +3,13 @@ import { LogoutIcon } from "./icons";
 
 export type Tab = "skill-market" | "mcp-market" | "skill-mine" | "mcp-mine" | "secrets";
 
-const TABS: { id: Tab; label: string }[] = [
+/** 个人中心下的子页签。 */
+export const PERSONAL_TABS: Tab[] = ["skill-mine", "mcp-mine", "secrets"];
+export const isPersonal = (t: Tab) => PERSONAL_TABS.includes(t);
+
+const MARKET_TABS: { id: Tab; label: string }[] = [
   { id: "skill-market", label: "技能市场" },
   { id: "mcp-market", label: "MCP 市场" },
-  { id: "skill-mine", label: "我的技能" },
-  { id: "mcp-mine", label: "我的 MCP" },
-  { id: "secrets", label: "我的变量" },
 ];
 
 export default function Header({
@@ -24,6 +25,7 @@ export default function Header({
   onLogin: () => void;
   onLogout: () => void;
 }) {
+  const personalActive = isPersonal(tab);
   return (
     <header className="sticky top-0 z-40 flex items-center gap-7 border-b border-slate-200 bg-white/90 px-6 py-3.5 backdrop-blur">
       <div className="flex items-center gap-2.5 text-lg font-bold text-slate-800">
@@ -34,7 +36,7 @@ export default function Header({
       </div>
 
       <nav className="flex gap-1">
-        {TABS.map((t) => (
+        {MARKET_TABS.map((t) => (
           <button
             key={t.id}
             onClick={() => onTab(t.id)}
@@ -47,16 +49,34 @@ export default function Header({
             {t.label}
           </button>
         ))}
+        {user && (
+          <button
+            onClick={() => onTab("skill-mine")}
+            className={`rounded-[10px] px-3 py-2 text-[15px] font-medium transition ${
+              personalActive
+                ? "bg-indigo-50 font-semibold text-indigo-500"
+                : "text-slate-600 hover:bg-slate-100"
+            }`}
+          >
+            个人中心
+          </button>
+        )}
       </nav>
 
       <div className="flex-1" />
 
       {user ? (
         <div className="flex items-center gap-3">
-          <div className="grid size-8 place-items-center rounded-full border border-indigo-200 bg-indigo-50 text-xs font-bold text-indigo-500">
-            {initials(user)}
-          </div>
-          <span className="text-sm font-medium text-slate-700">{user}</span>
+          <button
+            onClick={() => onTab("skill-mine")}
+            className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50/50 py-1 pl-1 pr-3 transition hover:border-indigo-200 hover:bg-indigo-50"
+            title="进入个人中心"
+          >
+            <span className="grid size-8 place-items-center rounded-full border border-indigo-200 bg-indigo-50 text-xs font-bold text-indigo-500">
+              {initials(user)}
+            </span>
+            <span className="text-sm font-medium text-slate-700">{user}</span>
+          </button>
           <button
             onClick={onLogout}
             className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100 hover:text-rose-500"
