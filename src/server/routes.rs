@@ -695,12 +695,13 @@ async fn run_call(
     let ms = started.elapsed().as_millis() as i64;
     match outcome {
         Ok(result) => {
-            log_tool_call(&state, &claims.username, &owner, &name, &tool, true, "", ms);
+            let summary = summarize_result(&result);
+            log_tool_call(&state, &claims.username, &owner, &name, &tool, true, "", &summary, ms);
             Ok(Json(result))
         }
         Err(e) => {
             let msg = format!("MCP 调用失败: {e}");
-            log_tool_call(&state, &claims.username, &owner, &name, &tool, false, &msg, ms);
+            log_tool_call(&state, &claims.username, &owner, &name, &tool, false, &msg, "", ms);
             Err(ApiError::new(StatusCode::BAD_GATEWAY, msg))
         }
     }
@@ -729,6 +730,7 @@ async fn run_report(
         &req.tool,
         req.ok,
         &req.error,
+        &req.summary,
         req.ms.max(0),
     );
     Ok(StatusCode::NO_CONTENT)
@@ -925,12 +927,13 @@ pub(super) fn log_tool_call(
     tool: &str,
     ok: bool,
     error: &str,
+    result: &str,
     ms: i64,
 ) {
     let conn = state.db.lock().unwrap();
     let _ = conn.execute(
-        "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, ms, created_at, created_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, result, ms, created_at, created_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             caller,
             owner,
@@ -938,11 +941,40 @@ pub(super) fn log_tool_call(
             tool,
             ok as i64,
             error,
+            result,
             ms,
             now_string(),
             now_unix()
         ],
     );
+}
+
+/// 把一次 MCP 工具调用结果压缩成一行可读摘要，供审计面板「结果摘要」列展示。
+/// 优先拼接 `content[].text`，否则回退到紧凑 JSON；统一截断到 240 字符。
+pub(super) fn summarize_result(result: &serde_json::Value) -> String {
+    let mut s = String::new();
+    if let Some(items) = result.get("content").and_then(|c| c.as_array()) {
+        for item in items {
+            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                if !s.is_empty() {
+                    s.push(' ');
+                }
+                s.push_str(t);
+            }
+        }
+    }
+    if s.trim().is_empty() {
+        s = result.to_string();
+    }
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= 240 {
+        trimmed.to_string()
+    } else {
+        let mut out: String = trimmed.chars().take(240).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// 当前时间 `YYYY-MM-DD HH:MM:SS UTC`（不引入 chrono）。

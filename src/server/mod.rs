@@ -79,7 +79,7 @@ pub fn run() -> Result<()> {
         admin_token,
     });
 
-    let bind = std::env::var("TRISKELION_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let bind = resolve_bind()?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -125,6 +125,65 @@ fn server_data_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".triskelion")
+}
+
+/// 解析监听地址。优先级：命令行参数 > 环境变量 `TRISKELION_BIND` > 默认 `127.0.0.1:8787`。
+///
+/// 支持的命令行参数（不传则用上一级默认值）：
+///   --host <HOST> / -H <HOST>   监听主机（默认 127.0.0.1）
+///   --port <PORT> / -p <PORT>   监听端口（默认 8787）
+///   -h / --help                 打印帮助并退出
+///
+/// 服务端 bin 仅启用 `server` feature，不引入 clap，这里做最小手写解析。
+fn resolve_bind() -> Result<String> {
+    // 基准取自环境变量（兼容历史用法），否则用默认 host:port。
+    let base = std::env::var("TRISKELION_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let (mut host, mut port) = split_host_port(&base);
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--host" | "-H" => {
+                host = args.next().context("--host 需要一个值")?;
+            }
+            "--port" | "-p" => {
+                let v = args.next().context("--port 需要一个值")?;
+                port = v
+                    .parse()
+                    .with_context(|| format!("--port 不是合法端口: {v}"))?;
+            }
+            s if s.starts_with("--host=") => host = s["--host=".len()..].to_string(),
+            s if s.starts_with("--port=") => {
+                let v = &s["--port=".len()..];
+                port = v
+                    .parse()
+                    .with_context(|| format!("--port 不是合法端口: {v}"))?;
+            }
+            "-h" | "--help" => {
+                println!(
+                    "triskelion — Triskelion Hub Web Server\n\n\
+                     用法: triskelion [选项]\n\n\
+                     选项:\n  \
+                     -H, --host <HOST>   监听主机 (默认 127.0.0.1，亦可用 TRISKELION_BIND)\n  \
+                     -p, --port <PORT>   监听端口 (默认 8787)\n  \
+                     -h, --help          打印本帮助"
+                );
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("未知参数: {other}（用 --help 查看用法）"),
+        }
+    }
+
+    Ok(format!("{host}:{port}"))
+}
+
+/// 把 `host:port` 拆为 `(host, port)`。无端口或端口非法时回退到默认 8787。
+/// 以最后一个 `:` 切分，兼容形如 `[::1]:8787` 的 IPv6 写法。
+fn split_host_port(s: &str) -> (String, u16) {
+    match s.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => (h.to_string(), p.parse().unwrap_or(8787)),
+        _ => (s.to_string(), 8787),
+    }
 }
 
 /// 读取密钥文件，不存在则生成随机字节并写入（0600 权限）。

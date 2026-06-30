@@ -299,6 +299,9 @@ pub struct ReportCallReq {
     pub error: String,
     #[serde(default)]
     pub ms: i64,
+    /// 结果摘要（成功时的结果概要，便于审计面板展示；可空）。
+    #[serde(default)]
+    pub summary: String,
 }
 
 #[derive(Serialize, Deserialize)]

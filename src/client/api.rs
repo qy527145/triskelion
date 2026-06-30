@@ -197,7 +197,7 @@ impl HubClient {
         Self::parse(resp)
     }
 
-    /// 回传一次本地 `tsk run` 工具调用的审计元信息（尽力而为，仅记录成败/耗时）。
+    /// 回传一次本地 `tsk run` 工具调用的审计元信息（尽力而为，仅记录成败/耗时/结果摘要）。
     pub fn report_call(
         &self,
         owner: &str,
@@ -206,6 +206,7 @@ impl HubClient {
         ok: bool,
         error: &str,
         ms: i64,
+        summary: &str,
     ) -> Result<(), HubError> {
         let resp = self
             .auth(
@@ -217,6 +218,7 @@ impl HubClient {
                 ok,
                 error: error.to_string(),
                 ms,
+                summary: summary.to_string(),
             })
             .send()
             .map_err(HubError::transport)?;
