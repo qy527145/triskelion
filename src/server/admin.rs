@@ -16,16 +16,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::ZSTD_LEVEL;
 
+use super::auth;
 use super::error::ApiError;
 use super::routes::{db_err, now_string, now_unix};
 use super::skills;
@@ -227,9 +229,17 @@ fn blob_stats(state: &AppState) -> (i64, i64) {
 // 资源清单
 // ---------------------------------------------------------------------------
 
+#[derive(Serialize, Clone)]
+pub struct GroupBrief {
+    id: i64,
+    name: String,
+}
+
 #[derive(Serialize)]
 pub struct AdminUser {
+    id: i64,
     username: String,
+    groups: Vec<GroupBrief>,
     created_at: String,
     skills: i64,
     mcps: i64,
@@ -239,9 +249,30 @@ pub struct AdminUser {
 pub async fn users(State(state): S, headers: HeaderMap) -> Result<Json<Vec<AdminUser>>, ApiError> {
     require_admin(&state, &headers)?;
     let conn = state.db.lock().unwrap();
+
+    // 先聚合每个用户的分组（多对多），再装配用户行。
+    let mut by_user: HashMap<i64, Vec<GroupBrief>> = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ug.user_id, g.id, g.name FROM user_groups ug
+                 JOIN groups g ON g.id = ug.group_id ORDER BY g.name",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(db_err)?;
+        for row in rows {
+            let (uid, gid, name) = row.map_err(db_err)?;
+            by_user.entry(uid).or_default().push(GroupBrief { id: gid, name });
+        }
+    }
+
     let mut stmt = conn
         .prepare(
-            "SELECT u.username, u.created_at,
+            "SELECT u.id, u.username, u.created_at,
                     (SELECT COUNT(*) FROM skills s WHERE s.owner_id = u.id),
                     (SELECT COUNT(*) FROM mcps m WHERE m.owner_id = u.id),
                     (SELECT COUNT(*) FROM secrets x WHERE x.owner_id = u.id)
@@ -250,16 +281,29 @@ pub async fn users(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Admin
         .map_err(db_err)?;
     let rows = stmt
         .query_map([], |r| {
-            Ok(AdminUser {
-                username: r.get(0)?,
-                created_at: r.get(1)?,
-                skills: r.get(2)?,
-                mcps: r.get(3)?,
-                secrets: r.get(4)?,
-            })
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
         })
         .map_err(db_err)?;
-    let out = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, username, created_at, skills, mcps, secrets) = row.map_err(db_err)?;
+        out.push(AdminUser {
+            groups: by_user.remove(&id).unwrap_or_default(),
+            id,
+            username,
+            created_at,
+            skills,
+            mcps,
+            secrets,
+        });
+    }
     Ok(Json(out))
 }
 
@@ -269,11 +313,42 @@ pub struct AdminSkill {
     name: String,
     category: String,
     visibility: String,
+    group_visibility: String,
     version: String,
     description: String,
     archive_size: i64,
     has_archive: bool,
+    labels: Vec<LabelBrief>,
     updated_at: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct LabelBrief {
+    id: i64,
+    name: String,
+}
+
+/// 全量映射：资源 id → 已分配标签（id+name）。供管理列表/详情一次性装配。
+fn all_label_briefs(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+) -> HashMap<i64, Vec<LabelBrief>> {
+    let mut map: HashMap<i64, Vec<LabelBrief>> = HashMap::new();
+    let sql = format!(
+        "SELECT j.{fk}, l.id, l.name FROM {junction} j JOIN labels l ON l.id = j.label_id
+         ORDER BY l.name"
+    );
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        }) {
+            for (rid, lid, name) in rows.flatten() {
+                map.entry(rid).or_default().push(LabelBrief { id: lid, name });
+            }
+        }
+    }
+    map
 }
 
 pub async fn skills_all(
@@ -282,10 +357,11 @@ pub async fn skills_all(
 ) -> Result<Json<Vec<AdminSkill>>, ApiError> {
     require_admin(&state, &headers)?;
     let conn = state.db.lock().unwrap();
+    let mut label_map = all_label_briefs(&conn, "skill_labels", "skill_id");
     let mut stmt = conn
         .prepare(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
-                    s.archive_size, s.archive_sha256, s.updated_at
+                    s.archive_size, s.archive_sha256, s.updated_at, s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
              ORDER BY s.updated_at DESC, s.name",
         )
@@ -293,20 +369,30 @@ pub async fn skills_all(
     let rows = stmt
         .query_map([], |r| {
             let sha: String = r.get(7)?;
-            Ok(AdminSkill {
-                owner: r.get(0)?,
-                name: r.get(1)?,
-                category: r.get(2)?,
-                visibility: r.get(3)?,
-                version: r.get(4)?,
-                description: r.get(5)?,
-                archive_size: r.get(6)?,
-                has_archive: !sha.is_empty(),
-                updated_at: r.get(8)?,
-            })
+            Ok((
+                AdminSkill {
+                    owner: r.get(0)?,
+                    name: r.get(1)?,
+                    category: r.get(2)?,
+                    visibility: r.get(3)?,
+                    version: r.get(4)?,
+                    description: r.get(5)?,
+                    archive_size: r.get(6)?,
+                    has_archive: !sha.is_empty(),
+                    updated_at: r.get(8)?,
+                    group_visibility: r.get(9)?,
+                    labels: Vec::new(),
+                },
+                r.get::<_, i64>(10)?,
+            ))
         })
         .map_err(db_err)?;
-    let out = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (mut s, id) = row.map_err(db_err)?;
+        s.labels = label_map.remove(&id).unwrap_or_default();
+        out.push(s);
+    }
     Ok(Json(out))
 }
 
@@ -315,18 +401,22 @@ pub struct AdminMcp {
     owner: String,
     name: String,
     visibility: String,
+    group_visibility: String,
     version: String,
     runtime: String,
     protocol: String,
+    labels: Vec<LabelBrief>,
     updated_at: String,
 }
 
 pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<AdminMcp>>, ApiError> {
     require_admin(&state, &headers)?;
     let conn = state.db.lock().unwrap();
+    let mut label_map = all_label_briefs(&conn, "mcp_labels", "mcp_id");
     let mut stmt = conn
         .prepare(
-            "SELECT u.username, m.name, m.visibility, m.version, m.manifest, m.updated_at
+            "SELECT u.username, m.name, m.visibility, m.version, m.manifest, m.updated_at,
+                    m.group_visibility, m.id
              FROM mcps m JOIN users u ON u.id = m.owner_id
              ORDER BY m.updated_at DESC, m.name",
         )
@@ -340,12 +430,15 @@ pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Ad
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (owner, name, visibility, version, manifest_json, updated_at) = row.map_err(db_err)?;
+        let (owner, name, visibility, version, manifest_json, updated_at, group_visibility, id) =
+            row.map_err(db_err)?;
         // 仅取运行拓扑用于展示，损坏的 manifest 不致整表失败。
         let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap_or_default();
         let runtime = manifest
@@ -362,9 +455,11 @@ pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Ad
             owner,
             name,
             visibility,
+            group_visibility,
             version,
             runtime,
             protocol,
+            labels: label_map.remove(&id).unwrap_or_default(),
             updated_at,
         });
     }
@@ -411,6 +506,684 @@ pub async fn calls(State(state): S, headers: HeaderMap) -> Result<Json<Vec<CallL
 }
 
 // ---------------------------------------------------------------------------
+// 分组 CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct AdminGroup {
+    id: i64,
+    name: String,
+    description: String,
+    users: i64,
+    created_at: String,
+}
+
+pub async fn groups(State(state): S, headers: HeaderMap) -> Result<Json<Vec<AdminGroup>>, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT g.id, g.name, g.description, g.created_at,
+                    (SELECT COUNT(*) FROM user_groups ug WHERE ug.group_id = g.id)
+             FROM groups g ORDER BY g.name",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AdminGroup {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                description: r.get(2)?,
+                created_at: r.get(3)?,
+                users: r.get(4)?,
+            })
+        })
+        .map_err(db_err)?;
+    let out = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct GroupReq {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+fn valid_group_name(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.chars().count() <= 64
+}
+
+pub async fn group_create(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<GroupReq>,
+) -> Result<Json<AdminGroup>, ApiError> {
+    require_admin(&state, &headers)?;
+    let name = req.name.trim().to_string();
+    if !valid_group_name(&name) {
+        return Err(ApiError::bad_request("分组名不能为空且长度 ≤64"));
+    }
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM groups WHERE name = ?1", [&name], |_| Ok(true))
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if exists {
+        return Err(ApiError::conflict("分组名已存在"));
+    }
+    conn.execute(
+        "INSERT INTO groups(name, description, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![name, req.description.trim(), now],
+    )
+    .map_err(db_err)?;
+    let id = conn.last_insert_rowid();
+    Ok(Json(AdminGroup {
+        id,
+        name,
+        description: req.description.trim().to_string(),
+        users: 0,
+        created_at: now,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct GroupPatch {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+pub async fn group_update(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<GroupPatch>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    if let Some(name) = req.name.as_deref().map(str::trim) {
+        if !valid_group_name(name) {
+            return Err(ApiError::bad_request("分组名不能为空且长度 ≤64"));
+        }
+        let clash: bool = conn
+            .query_row(
+                "SELECT 1 FROM groups WHERE name = ?1 AND id != ?2",
+                rusqlite::params![name, id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        if clash {
+            return Err(ApiError::conflict("分组名已存在"));
+        }
+        conn.execute(
+            "UPDATE groups SET name = ?1 WHERE id = ?2",
+            rusqlite::params![name, id],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(desc) = req.description.as_deref() {
+        conn.execute(
+            "UPDATE groups SET description = ?1 WHERE id = ?2",
+            rusqlite::params![desc.trim(), id],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn group_delete(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    // 解除该分组的全部成员关联（FK 亦会级联，这里显式清理以防 FK 未启用）。
+    conn.execute("DELETE FROM user_groups WHERE group_id = ?1", [id])
+        .map_err(db_err)?;
+    let n = conn
+        .execute("DELETE FROM groups WHERE id = ?1", [id])
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该分组"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// 标签（labels）CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct AdminLabel {
+    id: i64,
+    name: String,
+    skills: i64,
+    mcps: i64,
+    created_at: String,
+}
+
+pub async fn labels(State(state): S, headers: HeaderMap) -> Result<Json<Vec<AdminLabel>>, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.id, l.name, l.created_at,
+                    (SELECT COUNT(*) FROM skill_labels sl WHERE sl.label_id = l.id),
+                    (SELECT COUNT(*) FROM mcp_labels ml WHERE ml.label_id = l.id)
+             FROM labels l ORDER BY l.name",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AdminLabel {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                created_at: r.get(2)?,
+                skills: r.get(3)?,
+                mcps: r.get(4)?,
+            })
+        })
+        .map_err(db_err)?;
+    let out = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct LabelReq {
+    name: String,
+}
+
+fn valid_label_name(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.chars().count() <= 32
+}
+
+pub async fn label_create(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<LabelReq>,
+) -> Result<Json<AdminLabel>, ApiError> {
+    require_admin(&state, &headers)?;
+    let name = req.name.trim().to_string();
+    if !valid_label_name(&name) {
+        return Err(ApiError::bad_request("标签名不能为空且长度 ≤32"));
+    }
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM labels WHERE name = ?1", [&name], |_| Ok(true))
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if exists {
+        return Err(ApiError::conflict("标签名已存在"));
+    }
+    conn.execute(
+        "INSERT INTO labels(name, created_at) VALUES (?1, ?2)",
+        rusqlite::params![name, now],
+    )
+    .map_err(db_err)?;
+    let id = conn.last_insert_rowid();
+    Ok(Json(AdminLabel {
+        id,
+        name,
+        skills: 0,
+        mcps: 0,
+        created_at: now,
+    }))
+}
+
+pub async fn label_update(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<LabelReq>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let name = req.name.trim().to_string();
+    if !valid_label_name(&name) {
+        return Err(ApiError::bad_request("标签名不能为空且长度 ≤32"));
+    }
+    let conn = state.db.lock().unwrap();
+    let clash: bool = conn
+        .query_row(
+            "SELECT 1 FROM labels WHERE name = ?1 AND id != ?2",
+            rusqlite::params![name, id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if clash {
+        return Err(ApiError::conflict("标签名已存在"));
+    }
+    let n = conn
+        .execute(
+            "UPDATE labels SET name = ?1 WHERE id = ?2",
+            rusqlite::params![name, id],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该标签"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn label_delete(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    // 解除该标签在各资源上的关联（FK 亦会级联，这里显式清理以防 FK 未启用）。
+    conn.execute("DELETE FROM skill_labels WHERE label_id = ?1", [id])
+        .map_err(db_err)?;
+    conn.execute("DELETE FROM mcp_labels WHERE label_id = ?1", [id])
+        .map_err(db_err)?;
+    let n = conn
+        .execute("DELETE FROM labels WHERE id = ?1", [id])
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该标签"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// 用户 CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateUserReq {
+    username: String,
+    password: String,
+    #[serde(default)]
+    group_ids: Vec<i64>,
+}
+
+pub async fn user_create(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<CreateUserReq>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let username = req.username.trim().to_string();
+    if !super::routes::is_valid_username(&username) {
+        return Err(ApiError::bad_request(
+            "用户名仅允许字母、数字、_、-，且长度 1..=64",
+        ));
+    }
+    if req.password.len() < 6 {
+        return Err(ApiError::bad_request("密码至少 6 位"));
+    }
+    let hash = auth::hash_password(&req.password).map_err(|e| ApiError::internal(e.to_string()))?;
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    for gid in &req.group_ids {
+        ensure_group_exists(&conn, *gid)?;
+    }
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM users WHERE username = ?1", [&username], |_| {
+            Ok(true)
+        })
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if exists {
+        return Err(ApiError::conflict("用户名已存在"));
+    }
+    conn.execute(
+        "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![username, hash, now],
+    )
+    .map_err(db_err)?;
+    let uid = conn.last_insert_rowid();
+    replace_user_groups(&conn, uid, &req.group_ids)?;
+    Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+pub struct UserPatch {
+    /// 非空则重置密码。
+    #[serde(default)]
+    password: Option<String>,
+    /// 提供则整体覆盖分组归属（空数组=移出全部分组）；缺省则不改动分组。
+    #[serde(default)]
+    group_ids: Option<Vec<i64>>,
+}
+
+pub async fn user_update(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UserPatch>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM users WHERE id = ?1", [id], |_| Ok(true))
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if !exists {
+        return Err(ApiError::not_found("未找到该用户"));
+    }
+    if let Some(gids) = &req.group_ids {
+        for gid in gids {
+            ensure_group_exists(&conn, *gid)?;
+        }
+        replace_user_groups(&conn, id, gids)?;
+    }
+    if let Some(pw) = req.password.as_deref().filter(|p| !p.is_empty()) {
+        if pw.len() < 6 {
+            return Err(ApiError::bad_request("密码至少 6 位"));
+        }
+        let hash = auth::hash_password(pw).map_err(|e| ApiError::internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+            rusqlite::params![hash, id],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 整体覆盖某用户的分组归属：先清空再按给定 id 集重建（去重）。
+fn replace_user_groups(conn: &rusqlite::Connection, uid: i64, gids: &[i64]) -> Result<(), ApiError> {
+    conn.execute("DELETE FROM user_groups WHERE user_id = ?1", [uid])
+        .map_err(db_err)?;
+    for gid in gids {
+        conn.execute(
+            "INSERT OR IGNORE INTO user_groups(user_id, group_id) VALUES (?1, ?2)",
+            rusqlite::params![uid, gid],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+pub async fn user_delete(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    // 技能压缩体 blob 的清理：先收集该用户引用且无人共享的 sha，删除后 GC。
+    let orphan_shas = collect_user_skill_blobs(&conn, id)?;
+    let n = conn
+        .execute("DELETE FROM users WHERE id = ?1", [id])
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该用户"));
+    }
+    // 删除用户级联清掉其 skills（外键 ON DELETE CASCADE），此后无人引用的 blob 落盘清理。
+    for sha in orphan_shas {
+        let still: bool = conn
+            .query_row(
+                "SELECT 1 FROM skills WHERE archive_sha256 = ?1 LIMIT 1",
+                [&sha],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        if !still {
+            if let Some(p) = skills::find_blob(&state, &sha) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn ensure_group_exists(conn: &rusqlite::Connection, gid: i64) -> Result<(), ApiError> {
+    let ok: bool = conn
+        .query_row("SELECT 1 FROM groups WHERE id = ?1", [gid], |_| Ok(true))
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("指定的分组不存在"))
+    }
+}
+
+/// 收集某用户名下技能引用的全部非空 sha256（去重），供删除后 GC 判定。
+fn collect_user_skill_blobs(conn: &rusqlite::Connection, uid: i64) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT archive_sha256 FROM skills WHERE owner_id = ?1 AND archive_sha256 != ''")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([uid], |r| r.get::<_, String>(0))
+        .map_err(db_err)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?)
+}
+
+// ---------------------------------------------------------------------------
+// 市场资源（技能 / MCP）的可见性与分组配置 + 删除
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct ResourcePatch {
+    /// private / public。
+    #[serde(default)]
+    visibility: Option<String>,
+    /// 字符串 "all" 或分组 id 数组（如 [1,2]）。
+    #[serde(default)]
+    group_visibility: Option<serde_json::Value>,
+    /// 提供则整体覆盖该资源的受管标签（空数组=清空）；缺省则不改动。
+    #[serde(default)]
+    label_ids: Option<Vec<i64>>,
+}
+
+/// 整体覆盖某资源的受管标签：先清空再按给定 id 集重建（去重、校验标签存在）。
+/// `junction`/`fk` 为内部常量（skill_labels/skill_id 等）。
+fn replace_resource_labels(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+    rid: i64,
+    label_ids: &[i64],
+) -> Result<(), ApiError> {
+    for lid in label_ids {
+        let ok: bool = conn
+            .query_row("SELECT 1 FROM labels WHERE id = ?1", [lid], |_| Ok(true))
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        if !ok {
+            return Err(ApiError::bad_request("指定的标签不存在"));
+        }
+    }
+    conn.execute(
+        &format!("DELETE FROM {junction} WHERE {fk} = ?1"),
+        [rid],
+    )
+    .map_err(db_err)?;
+    for lid in label_ids {
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO {junction}({fk}, label_id) VALUES (?1, ?2)"),
+            rusqlite::params![rid, lid],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+/// 把前端传入的 group_visibility 归一化为存储字符串：'all' 或紧凑 JSON 数组。
+fn normalize_group_vis(v: &serde_json::Value) -> Result<String, ApiError> {
+    if let Some(s) = v.as_str() {
+        if s == "all" {
+            return Ok("all".to_string());
+        }
+        return Err(ApiError::bad_request("group_visibility 字符串只能是 \"all\""));
+    }
+    if let Some(arr) = v.as_array() {
+        let mut ids: Vec<i64> = Vec::new();
+        for it in arr {
+            let id = it
+                .as_i64()
+                .ok_or_else(|| ApiError::bad_request("group_visibility 数组元素必须是分组 id"))?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        return serde_json::to_string(&ids).map_err(|e| ApiError::internal(e.to_string()));
+    }
+    Err(ApiError::bad_request(
+        "group_visibility 只能是 \"all\" 或分组 id 数组",
+    ))
+}
+
+fn check_visibility(v: &str) -> Result<(), ApiError> {
+    if v == "private" || v == "public" {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("visibility 只能是 private 或 public"))
+    }
+}
+
+pub async fn skill_update(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<ResourcePatch>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let oid: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            [&owner],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let oid = oid.ok_or_else(|| ApiError::not_found("未找到该技能"))?;
+    if let Some(vis) = req.visibility.as_deref() {
+        check_visibility(vis)?;
+        conn.execute(
+            "UPDATE skills SET visibility = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![vis, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(gv) = &req.group_visibility {
+        let stored = normalize_group_vis(gv)?;
+        conn.execute(
+            "UPDATE skills SET group_visibility = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![stored, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(label_ids) = &req.label_ids {
+        let sid: i64 = conn
+            .query_row(
+                "SELECT id FROM skills WHERE owner_id = ?1 AND name = ?2",
+                rusqlite::params![oid, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| ApiError::not_found("未找到该技能"))?;
+        replace_resource_labels(&conn, "skill_labels", "skill_id", sid, label_ids)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn skill_delete(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    if skills::delete_skill_record(&state, &owner, &name)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("未找到该技能"))
+    }
+}
+
+pub async fn mcp_update(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<ResourcePatch>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let oid: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            [&owner],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let oid = oid.ok_or_else(|| ApiError::not_found("未找到该 MCP"))?;
+    if let Some(vis) = req.visibility.as_deref() {
+        check_visibility(vis)?;
+        conn.execute(
+            "UPDATE mcps SET visibility = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![vis, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(gv) = &req.group_visibility {
+        let stored = normalize_group_vis(gv)?;
+        conn.execute(
+            "UPDATE mcps SET group_visibility = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![stored, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(label_ids) = &req.label_ids {
+        let mid: i64 = conn
+            .query_row(
+                "SELECT id FROM mcps WHERE owner_id = ?1 AND name = ?2",
+                rusqlite::params![oid, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| ApiError::not_found("未找到该 MCP"))?;
+        replace_resource_labels(&conn, "mcp_labels", "mcp_id", mid, label_ids)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn mcp_delete(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let n = conn
+        .execute(
+            "DELETE FROM mcps WHERE name = ?2 AND owner_id =
+                (SELECT id FROM users WHERE username = ?1)",
+            rusqlite::params![owner, name],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该 MCP"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
 // 全量资源包：导入 / 导出
 // ---------------------------------------------------------------------------
 
@@ -418,6 +1191,10 @@ pub async fn calls(State(state): S, headers: HeaderMap) -> Result<Json<Vec<CallL
 struct Pack {
     version: u32,
     exported_at: String,
+    #[serde(default)]
+    groups: Vec<PackGroup>,
+    #[serde(default)]
+    labels: Vec<PackLabel>,
     users: Vec<PackUser>,
     mcps: Vec<PackMcp>,
     skills: Vec<PackSkill>,
@@ -427,9 +1204,30 @@ struct Pack {
 }
 
 #[derive(Serialize, Deserialize)]
+struct PackGroup {
+    name: String,
+    #[serde(default)]
+    description: String,
+    created_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PackLabel {
+    name: String,
+    #[serde(default)]
+    created_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct PackUser {
     username: String,
     password_hash: String,
+    /// 所属分组名列表（多对多）。
+    #[serde(default)]
+    groups: Vec<String>,
+    /// 兼容旧资源包的单分组字段（导入时并入 groups）。
+    #[serde(default)]
+    group: String,
     created_at: String,
 }
 
@@ -438,6 +1236,11 @@ struct PackMcp {
     owner: String,
     name: String,
     visibility: String,
+    #[serde(default)]
+    group_visibility: String,
+    /// 已分配的受管标签名。
+    #[serde(default)]
+    labels: Vec<String>,
     version: String,
     manifest: serde_json::Value,
     tools: serde_json::Value,
@@ -450,6 +1253,11 @@ struct PackSkill {
     name: String,
     category: String,
     visibility: String,
+    #[serde(default)]
+    group_visibility: String,
+    /// 已分配的受管标签名。
+    #[serde(default)]
+    labels: Vec<String>,
     version: String,
     description: String,
     tags: serde_json::Value,
@@ -525,6 +1333,7 @@ pub async fn export(State(state): S, headers: HeaderMap) -> Result<Response, Api
 
 #[derive(Serialize)]
 pub struct ImportSummary {
+    groups: usize,
     users: usize,
     mcps: usize,
     skills: usize,
@@ -582,15 +1391,15 @@ pub async fn import(
 fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
     let conn = state.db.lock().unwrap();
 
-    let users = {
+    let groups = {
         let mut stmt = conn
-            .prepare("SELECT username, password_hash, created_at FROM users ORDER BY id")
+            .prepare("SELECT name, description, created_at FROM groups ORDER BY id")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
-                Ok(PackUser {
-                    username: r.get(0)?,
-                    password_hash: r.get(1)?,
+                Ok(PackGroup {
+                    name: r.get(0)?,
+                    description: r.get(1)?,
                     created_at: r.get(2)?,
                 })
             })
@@ -598,10 +1407,75 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
     };
 
+    let labels = {
+        let mut stmt = conn
+            .prepare("SELECT name, created_at FROM labels ORDER BY id")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PackLabel {
+                    name: r.get(0)?,
+                    created_at: r.get(1)?,
+                })
+            })
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
+    };
+
+    // 资源 → 标签名映射，供 mcps/skills 装配。
+    let mcp_label_map = super::routes::all_resource_labels(&conn, "mcp_labels", "mcp_id");
+    let skill_label_map = super::routes::all_resource_labels(&conn, "skill_labels", "skill_id");
+
+    let users = {
+        // 先聚合每个用户名的分组列表（按用户名映射，便于装配 PackUser）。
+        let mut by_user: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT u.username, g.name FROM user_groups ug
+                     JOIN users u ON u.id = ug.user_id
+                     JOIN groups g ON g.id = ug.group_id ORDER BY g.name",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(db_err)?;
+            for row in rows {
+                let (uname, gname) = row.map_err(db_err)?;
+                by_user.entry(uname).or_default().push(gname);
+            }
+        }
+        let mut stmt = conn
+            .prepare("SELECT username, password_hash, created_at FROM users ORDER BY id")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (username, password_hash, created_at) = row.map_err(db_err)?;
+            out.push(PackUser {
+                groups: by_user.remove(&username).unwrap_or_default(),
+                group: String::new(),
+                username,
+                password_hash,
+                created_at,
+            });
+        }
+        out
+    };
+
     let mcps = {
         let mut stmt = conn
             .prepare(
-                "SELECT u.username, m.name, m.visibility, m.version, m.manifest, m.tools, m.updated_at
+                "SELECT u.username, m.name, m.visibility, m.version, m.manifest, m.tools, m.updated_at,
+                        m.group_visibility, m.id
                  FROM mcps m JOIN users u ON u.id = m.owner_id ORDER BY m.id",
             )
             .map_err(db_err)?;
@@ -609,6 +1483,7 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
             .query_map([], |r| {
                 let manifest: String = r.get(4)?;
                 let tools: String = r.get(5)?;
+                let id: i64 = r.get(8)?;
                 Ok(PackMcp {
                     owner: r.get(0)?,
                     name: r.get(1)?,
@@ -617,6 +1492,8 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
                     manifest: serde_json::from_str(&manifest).unwrap_or_default(),
                     tools: serde_json::from_str(&tools).unwrap_or(serde_json::json!([])),
                     updated_at: r.get(6)?,
+                    group_visibility: r.get(7)?,
+                    labels: mcp_label_map.get(&id).cloned().unwrap_or_default(),
                 })
             })
             .map_err(db_err)?;
@@ -627,7 +1504,8 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
         let mut stmt = conn
             .prepare(
                 "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
-                        s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at
+                        s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
+                        s.group_visibility, s.id
                  FROM skills s JOIN users u ON u.id = s.owner_id ORDER BY s.id",
             )
             .map_err(db_err)?;
@@ -635,6 +1513,7 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
             .query_map([], |r| {
                 let tags: String = r.get(6)?;
                 let metadata: String = r.get(8)?;
+                let id: i64 = r.get(13)?;
                 Ok(PackSkill {
                     owner: r.get(0)?,
                     name: r.get(1)?,
@@ -648,6 +1527,8 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
                     archive_sha256: r.get(9)?,
                     archive_size: r.get(10)?,
                     updated_at: r.get(11)?,
+                    group_visibility: r.get(12)?,
+                    labels: skill_label_map.get(&id).cloned().unwrap_or_default(),
                 })
             })
             .map_err(db_err)?;
@@ -705,11 +1586,13 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
     Ok(Pack {
         version: PACK_VERSION,
         exported_at: now_string(),
+        groups,
         users,
         mcps,
         skills,
         secrets,
         calls,
+        labels,
     })
 }
 
@@ -719,6 +1602,48 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
     let tx = guard.transaction().map_err(db_err)?;
     let mut skipped = Vec::new();
 
+    // 分组先行 upsert（按名字自然键），并构建 名字 → 本地 id 映射（含目标既有分组）。
+    for g in &pack.groups {
+        tx.execute(
+            "INSERT INTO groups(name, description, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET description = excluded.description",
+            rusqlite::params![g.name, g.description, g.created_at],
+        )
+        .map_err(db_err)?;
+    }
+    let mut gids: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT name, id FROM groups").map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(db_err)?;
+        for row in rows {
+            let (name, id) = row.map_err(db_err)?;
+            gids.insert(name, id);
+        }
+    }
+
+    // 标签 upsert（按名字自然键），并构建 名字 → 本地 id 映射。
+    for l in &pack.labels {
+        tx.execute(
+            "INSERT INTO labels(name, created_at) VALUES (?1, ?2)
+             ON CONFLICT(name) DO NOTHING",
+            rusqlite::params![l.name, l.created_at],
+        )
+        .map_err(db_err)?;
+    }
+    let mut lids: HashMap<String, i64> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT name, id FROM labels").map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(db_err)?;
+        for row in rows {
+            let (name, id) = row.map_err(db_err)?;
+            lids.insert(name, id);
+        }
+    }
+
     for u in &pack.users {
         tx.execute(
             "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)
@@ -726,6 +1651,28 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
             rusqlite::params![u.username, u.password_hash, u.created_at],
         )
         .map_err(db_err)?;
+        let uid: i64 = tx
+            .query_row(
+                "SELECT id FROM users WHERE username = ?1",
+                [&u.username],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        // 分组归属按名字解析并合并（不删除目标已有关联，符合 upsert 语义）。
+        // 兼容旧资源包：单分组 group 字段并入。
+        let mut names: Vec<&String> = u.groups.iter().collect();
+        if !u.group.is_empty() && !names.iter().any(|n| *n == &u.group) {
+            names.push(&u.group);
+        }
+        for name in names {
+            if let Some(&gid) = gids.get(name) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO user_groups(user_id, group_id) VALUES (?1, ?2)",
+                    rusqlite::params![uid, gid],
+                )
+                .map_err(db_err)?;
+            }
+        }
     }
 
     // 用户名 → 本地 id 映射（含目标实例既有用户）。
@@ -749,15 +1696,40 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
         };
         let manifest = m.manifest.to_string();
         let tools = m.tools.to_string();
+        let gv = if m.group_visibility.is_empty() {
+            "all"
+        } else {
+            m.group_visibility.as_str()
+        };
         tx.execute(
-            "INSERT INTO mcps(owner_id, name, visibility, version, manifest, tools, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO mcps(owner_id, name, visibility, group_visibility, version, manifest, tools, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(owner_id, name) DO UPDATE SET visibility=excluded.visibility,
+                 group_visibility=excluded.group_visibility,
                  version=excluded.version, manifest=excluded.manifest, tools=excluded.tools,
                  updated_at=excluded.updated_at",
-            rusqlite::params![oid, m.name, m.visibility, m.version, manifest, tools, m.updated_at],
+            rusqlite::params![oid, m.name, m.visibility, gv, m.version, manifest, tools, m.updated_at],
         )
         .map_err(db_err)?;
+        // 标签关联（合并，不删除目标已有）。按名字解析为本地 label id。
+        if !m.labels.is_empty() {
+            let mid: i64 = tx
+                .query_row(
+                    "SELECT id FROM mcps WHERE owner_id = ?1 AND name = ?2",
+                    rusqlite::params![oid, m.name],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            for lname in &m.labels {
+                if let Some(&lid) = lids.get(lname) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO mcp_labels(mcp_id, label_id) VALUES (?1, ?2)",
+                        rusqlite::params![mid, lid],
+                    )
+                    .map_err(db_err)?;
+                }
+            }
+        }
         mcps += 1;
     }
 
@@ -768,11 +1740,12 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
             continue;
         };
         tx.execute(
-            "INSERT INTO skills(owner_id, name, category, visibility, version, description,
+            "INSERT INTO skills(owner_id, name, category, visibility, group_visibility, version, description,
                                 tags, skill_md, metadata, archive_sha256, archive_size, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(owner_id, name) DO UPDATE SET category=excluded.category,
-                 visibility=excluded.visibility, version=excluded.version,
+                 visibility=excluded.visibility, group_visibility=excluded.group_visibility,
+                 version=excluded.version,
                  description=excluded.description, tags=excluded.tags, skill_md=excluded.skill_md,
                  metadata=excluded.metadata, archive_sha256=excluded.archive_sha256,
                  archive_size=excluded.archive_size, updated_at=excluded.updated_at",
@@ -781,6 +1754,7 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
                 s.name,
                 s.category,
                 s.visibility,
+                if s.group_visibility.is_empty() { "all" } else { s.group_visibility.as_str() },
                 s.version,
                 s.description,
                 s.tags.to_string(),
@@ -792,6 +1766,25 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
             ],
         )
         .map_err(db_err)?;
+        // 标签关联（合并，不删除目标已有）。
+        if !s.labels.is_empty() {
+            let sid: i64 = tx
+                .query_row(
+                    "SELECT id FROM skills WHERE owner_id = ?1 AND name = ?2",
+                    rusqlite::params![oid, s.name],
+                    |r| r.get(0),
+                )
+                .map_err(db_err)?;
+            for lname in &s.labels {
+                if let Some(&lid) = lids.get(lname) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO skill_labels(skill_id, label_id) VALUES (?1, ?2)",
+                        rusqlite::params![sid, lid],
+                    )
+                    .map_err(db_err)?;
+                }
+            }
+        }
         skills += 1;
     }
 
@@ -842,6 +1835,7 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
 
     tx.commit().map_err(db_err)?;
     Ok(ImportSummary {
+        groups: pack.groups.len(),
         users: pack.users.len(),
         mcps,
         skills,

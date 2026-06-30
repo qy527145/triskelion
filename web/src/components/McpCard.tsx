@@ -1,4 +1,5 @@
 import type { McpInfo } from "../lib/types";
+import { labelBadgeClass } from "../lib/types";
 import { colorFor, initials } from "../lib/color";
 import { ArrowIcon, TrashIcon } from "./icons";
 
@@ -37,6 +38,18 @@ export default function McpCard({
           <div className="mt-1 text-xs text-slate-400">
             @{m.owner} · {m.manifest.runtime}/{m.manifest.protocol}
           </div>
+          {(m.labels ?? []).length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {(m.labels ?? []).map((l) => (
+                <span
+                  key={l}
+                  className={`rounded-md border px-1.5 py-0.5 text-xs font-medium ${labelBadgeClass(l)}`}
+                >
+                  {l}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 

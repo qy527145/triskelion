@@ -10,19 +10,38 @@ pub fn init(conn: &Connection) -> Result<()> {
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
 
+        -- 用户分组：管理后台维护的逻辑分组，用于市场资源的可见性控制。
+        CREATE TABLE IF NOT EXISTS groups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             username      TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
+            -- 历史遗留的单分组列（保留以兼容旧库，现已由 user_groups 多对多关联取代）。
+            group_id      INTEGER,
             created_at    TEXT NOT NULL
         );
 
+        -- 用户 ↔ 分组多对多关联：一个用户可绑定多个分组。删除用户或分组时随 FK 级联清理。
+        CREATE TABLE IF NOT EXISTS user_groups (
+            user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (user_id, group_id)
+        );
+
         -- MCP 注册表：manifest 以 JSON 文本整存，逻辑分类/可见性单列索引。
+        -- group_visibility：'all' 表示所有分组可见（默认），或 JSON 数组 [id,...] 限定可见分组。
         CREATE TABLE IF NOT EXISTS mcps (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             name       TEXT NOT NULL,
             visibility TEXT NOT NULL DEFAULT 'private',
+            group_visibility TEXT NOT NULL DEFAULT 'all',
             version    TEXT NOT NULL DEFAULT '0.1.0',
             manifest   TEXT NOT NULL,
             tools      TEXT NOT NULL DEFAULT '[]',
@@ -50,6 +69,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             name           TEXT NOT NULL,
             category       TEXT NOT NULL DEFAULT 'skill',
             visibility     TEXT NOT NULL DEFAULT 'private',
+            group_visibility TEXT NOT NULL DEFAULT 'all',
             version        TEXT NOT NULL DEFAULT '0.1.0',
             description    TEXT NOT NULL DEFAULT '',
             tags           TEXT NOT NULL DEFAULT '[]',
@@ -59,6 +79,26 @@ pub fn init(conn: &Connection) -> Result<()> {
             archive_size   INTEGER NOT NULL DEFAULT 0,
             updated_at     TEXT NOT NULL,
             UNIQUE(owner_id, name)
+        );
+
+        -- 受管标签（taxonomy）：管理后台维护的标签，用于市场资源的标注与筛选。
+        -- 默认内置「官方」「社区」两种（见 init 末尾的 seed）。
+        CREATE TABLE IF NOT EXISTS labels (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT ''
+        );
+
+        -- 资源 ↔ 标签多对多关联（技能、MCP 各一张），随资源/标签删除级联清理。
+        CREATE TABLE IF NOT EXISTS skill_labels (
+            skill_id INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+            label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+            PRIMARY KEY (skill_id, label_id)
+        );
+        CREATE TABLE IF NOT EXISTS mcp_labels (
+            mcp_id   INTEGER NOT NULL REFERENCES mcps(id) ON DELETE CASCADE,
+            label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+            PRIMARY KEY (mcp_id, label_id)
         );
 
         -- 工具调用审计：每次经 Hub 网关代调用 MCP 工具时记录一行，供管理后台统计
@@ -83,6 +123,35 @@ pub fn init(conn: &Connection) -> Result<()> {
     // 迁移：为旧库补上 tools 列（已存在则忽略 "duplicate column name"）。
     let _ = conn.execute(
         "ALTER TABLE mcps ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    // 迁移：用户分组、市场资源的分组可见性（旧库补列，已存在则忽略）。
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN group_id INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE mcps ADD COLUMN group_visibility TEXT NOT NULL DEFAULT 'all'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE skills ADD COLUMN group_visibility TEXT NOT NULL DEFAULT 'all'",
+        [],
+    );
+
+    // 一次性回填：把旧的单分组 users.group_id 并入多对多关联表（仅当关联表为空时执行，
+    // 避免重复回填或覆盖后续的多分组编辑）。
+    let ug_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM user_groups", [], |r| r.get(0))
+        .unwrap_or(0);
+    if ug_count == 0 {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO user_groups(user_id, group_id)
+             SELECT id, group_id FROM users WHERE group_id IS NOT NULL",
+            [],
+        );
+    }
+
+    // 内置默认标签：官方 / 社区（幂等，已存在则忽略）。
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO labels(name) VALUES ('官方'), ('社区')",
         [],
     );
     Ok(())

@@ -35,6 +35,7 @@ export interface McpInfo {
   version: string;
   manifest: McpManifest;
   tools?: ToolMeta[];
+  labels?: string[];
   updated_at: string;
 }
 
@@ -60,6 +61,13 @@ export function categoryLabel(c: string): string {
   return SKILL_CATEGORIES.find((x) => x.id === c)?.label ?? c;
 }
 
+/** 受管标签的徽章配色：官方=金、社区=天蓝、其余=靛蓝。 */
+export function labelBadgeClass(name: string): string {
+  if (name === "官方") return "border-amber-200 bg-amber-50 text-amber-700";
+  if (name === "社区") return "border-sky-200 bg-sky-50 text-sky-600";
+  return "border-indigo-200 bg-indigo-50 text-indigo-600";
+}
+
 export interface SkillManifest {
   name: string;
   version: string;
@@ -83,6 +91,7 @@ export interface SkillInfo {
   skill_md: string;
   archive_sha256: string;
   archive_size: number;
+  labels?: string[];
   updated_at: string;
 }
 
@@ -120,12 +129,35 @@ export interface AdminStats {
   generated_at: string;
 }
 
+export interface GroupBrief {
+  id: number;
+  name: string;
+}
+
 export interface AdminUser {
+  id: number;
   username: string;
+  groups: GroupBrief[];
   created_at: string;
   skills: number;
   mcps: number;
   secrets: number;
+}
+
+export interface AdminGroup {
+  id: number;
+  name: string;
+  description: string;
+  users: number;
+  created_at: string;
+}
+
+export interface AdminLabel {
+  id: number;
+  name: string;
+  skills: number;
+  mcps: number;
+  created_at: string;
 }
 
 export interface AdminSkill {
@@ -133,10 +165,12 @@ export interface AdminSkill {
   name: string;
   category: string;
   visibility: string;
+  group_visibility: string;
   version: string;
   description: string;
   archive_size: number;
   has_archive: boolean;
+  labels: GroupBrief[];
   updated_at: string;
 }
 
@@ -144,9 +178,11 @@ export interface AdminMcp {
   owner: string;
   name: string;
   visibility: string;
+  group_visibility: string;
   version: string;
   runtime: string;
   protocol: string;
+  labels: GroupBrief[];
   updated_at: string;
 }
 
@@ -162,6 +198,7 @@ export interface CallLog {
 }
 
 export interface ImportSummary {
+  groups: number;
   users: number;
   mcps: number;
   skills: number;
@@ -169,6 +206,22 @@ export interface ImportSummary {
   calls: number;
   blobs: number;
   skipped: string[];
+}
+
+/** group_visibility 取值：字符串 "all" 或分组 id 数组。 */
+export type GroupVisibility = "all" | number[];
+
+/** 把后端存储的 group_visibility 字符串解析为前端模型。 */
+export function parseGroupVisibility(raw: string): GroupVisibility {
+  const s = (raw ?? "").trim();
+  if (s === "" || s === "all") return "all";
+  try {
+    const arr = JSON.parse(s);
+    if (Array.isArray(arr)) return arr.filter((x) => typeof x === "number");
+  } catch {
+    /* fall through */
+  }
+  return "all";
 }
 
 /** 扫描清单里的 {VAR} 占位符（与服务端 required_vars 等价）。 */

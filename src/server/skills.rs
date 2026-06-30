@@ -37,12 +37,16 @@ pub struct ExploreQuery {
     q: Option<String>,
     category: Option<String>,
     tag: Option<String>,
+    /// 按受管标签名筛选（如「官方」「社区」）。
+    label: Option<String>,
 }
 
 /// 公开技能市场：列出所有 public 技能，可按 `q`（名称/描述/SKILL.md/标签模糊）、
-/// `category`、`tag` 过滤。无需鉴权。
+/// `category`、`tag`（自由标签）、`label`（受管标签）过滤。鉴权可选——匿名访客只看
+/// 「所有分组可见」的，登录用户额外看到其分组可见的与自己的。
 pub async fn explore(
     State(state): S,
+    headers: HeaderMap,
     Query(query): Query<ExploreQuery>,
 ) -> Result<Json<Vec<SkillInfo>>, ApiError> {
     let pattern = match query.q.as_deref().map(str::trim) {
@@ -61,12 +65,26 @@ pub async fn explore(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| format!("%\"{}\"%", s.to_lowercase()));
+    let label_filter = query
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all")
+        .map(|s| s.to_string());
 
     let conn = state.db.lock().unwrap();
+    let viewer = auth::authenticate_opt(&state.jwt_secret, &headers);
+    let viewer_groups = viewer
+        .as_ref()
+        .map(|c| super::routes::groups_of_user(&conn, c.sub))
+        .unwrap_or_default();
+    let viewer_name = viewer.as_ref().map(|c| c.username.clone());
+    let label_map = super::routes::all_resource_labels(&conn, "skill_labels", "skill_id");
     let mut stmt = conn
         .prepare(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
-                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at
+                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
+                    s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
              WHERE s.visibility = 'public'
                AND (lower(s.name) LIKE ?1 OR lower(s.description) LIKE ?1
@@ -77,11 +95,26 @@ pub async fn explore(
         )
         .map_err(db_err)?;
     let rows = stmt
-        .query_map(rusqlite::params![pattern, category, tag], row_to_tuple)
+        .query_map(rusqlite::params![pattern, category, tag], |r| {
+            Ok((row_to_tuple(r)?, r.get::<_, String>(12)?, r.get::<_, i64>(13)?))
+        })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(tuple_to_info(row.map_err(db_err)?)?);
+        let (tuple, group_vis, id) = row.map_err(db_err)?;
+        let is_owner = viewer_name.as_deref() == Some(tuple.0.as_str());
+        if !super::routes::group_can_see(&group_vis, &viewer_groups, is_owner) {
+            continue;
+        }
+        let labels = label_map.get(&id).cloned().unwrap_or_default();
+        if let Some(want) = &label_filter {
+            if !labels.iter().any(|l| l == want) {
+                continue;
+            }
+        }
+        let mut info = tuple_to_info(tuple)?;
+        info.labels = labels;
+        out.push(info);
     }
     Ok(Json(out))
 }
@@ -90,19 +123,26 @@ pub async fn explore(
 pub async fn list_mine(State(state): S, headers: HeaderMap) -> Result<Json<Vec<SkillInfo>>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
     let conn = state.db.lock().unwrap();
+    let label_map = super::routes::all_resource_labels(&conn, "skill_labels", "skill_id");
     let mut stmt = conn
         .prepare(
             "SELECT ?1, s.name, s.category, s.visibility, s.version, s.description,
-                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at
+                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
+                    s.id
              FROM skills s WHERE s.owner_id = ?2 ORDER BY s.updated_at DESC, s.name",
         )
         .map_err(db_err)?;
     let rows = stmt
-        .query_map(rusqlite::params![claims.username, claims.sub], row_to_tuple)
+        .query_map(rusqlite::params![claims.username, claims.sub], |r| {
+            Ok((row_to_tuple(r)?, r.get::<_, i64>(12)?))
+        })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(tuple_to_info(row.map_err(db_err)?)?);
+        let (tuple, id) = row.map_err(db_err)?;
+        let mut info = tuple_to_info(tuple)?;
+        info.labels = label_map.get(&id).cloned().unwrap_or_default();
+        out.push(info);
     }
     Ok(Json(out))
 }
@@ -197,23 +237,19 @@ pub async fn upsert(
         skill_md: req.skill_md,
         archive_sha256,
         archive_size: archive_size as u64,
+        labels: Vec::new(),
         updated_at: now,
     }))
 }
 
-/// 技能详情。public 任何人可读；private 仅 owner（带有效 token）可读。
+/// 技能详情。public 受分组可见性约束；private 仅 owner（带有效 token）可读。
 pub async fn get(
     State(state): S,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<SkillInfo>, ApiError> {
-    let info = load_skill(&state, &owner, &name)?;
-    if info.visibility != "public" {
-        let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-        if claims.username != owner {
-            return Err(ApiError::not_found("未找到该技能（或为私有）"));
-        }
-    }
+    let (info, group_vis) = load_skill(&state, &owner, &name)?;
+    ensure_skill_access(&state, &headers, &info, &group_vis)?;
     Ok(Json(info))
 }
 
@@ -304,7 +340,7 @@ pub async fn rename(
         return Err(ApiError::not_found("未找到该技能"));
     }
     drop(conn);
-    Ok(Json(load_skill(&state, &owner, &new_name)?))
+    Ok(Json(load_skill(&state, &owner, &new_name)?.0))
 }
 
 /// 上传技能压缩体（tar.zst 原始字节，亦兼容旧版 gzip）。仅 owner。服务端计算 sha256 落盘并写回记录。
@@ -347,19 +383,14 @@ pub async fn archive_put(
     })))
 }
 
-/// 下载技能压缩体。public 任何人可下；private 仅 owner。
+/// 下载技能压缩体。public 受分组可见性约束；private 仅 owner。
 pub async fn archive_get(
     State(state): S,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let info = load_skill(&state, &owner, &name)?;
-    if info.visibility != "public" {
-        let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-        if claims.username != owner {
-            return Err(ApiError::not_found("未找到该技能（或为私有）"));
-        }
-    }
+    let (info, group_vis) = load_skill(&state, &owner, &name)?;
+    ensure_skill_access(&state, &headers, &info, &group_vis)?;
     if info.archive_sha256.is_empty() {
         return Err(ApiError::not_found("该技能没有压缩体（纯文本裸说明书包）"));
     }
@@ -485,24 +516,103 @@ fn tuple_to_info(t: SkillRow) -> Result<SkillInfo, ApiError> {
         skill_md,
         archive_sha256: sha,
         archive_size: size as u64,
+        labels: Vec::new(),
         updated_at,
     })
 }
 
-fn load_skill(state: &AppState, owner: &str, name: &str) -> Result<SkillInfo, ApiError> {
+fn load_skill(state: &AppState, owner: &str, name: &str) -> Result<(SkillInfo, String), ApiError> {
     let conn = state.db.lock().unwrap();
-    let row: Option<SkillRow> = conn
+    let row: Option<(SkillRow, String, i64)> = conn
         .query_row(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
-                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at
+                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
+                    s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
              WHERE u.username = ?1 AND s.name = ?2",
             rusqlite::params![owner, name],
-            row_to_tuple,
+            |r| Ok((row_to_tuple(r)?, r.get::<_, String>(12)?, r.get::<_, i64>(13)?)),
         )
         .optional()
         .map_err(db_err)?;
+    let (row, group_vis, id) =
+        row.ok_or_else(|| ApiError::not_found(format!("未找到技能: {owner}/{name}")))?;
+    let labels = super::routes::labels_of(&conn, "skill_labels", "skill_id", id);
     drop(conn);
-    let row = row.ok_or_else(|| ApiError::not_found(format!("未找到技能: {owner}/{name}")))?;
-    tuple_to_info(row)
+    let mut info = tuple_to_info(row)?;
+    info.labels = labels;
+    Ok((info, group_vis))
+}
+
+/// 非 owner 访问技能时的可见性 + 分组校验。不可见统一报 not_found（避免泄漏存在性）。
+fn ensure_skill_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    info: &SkillInfo,
+    group_vis: &str,
+) -> Result<(), ApiError> {
+    let viewer = auth::authenticate_opt(&state.jwt_secret, headers);
+    let is_owner = viewer.as_ref().map(|c| c.username.as_str()) == Some(info.owner.as_str());
+    if is_owner {
+        return Ok(());
+    }
+    if info.visibility != "public" {
+        return Err(ApiError::not_found("未找到该技能（或为私有）"));
+    }
+    let viewer_groups = {
+        let conn = state.db.lock().unwrap();
+        viewer
+            .as_ref()
+            .map(|c| super::routes::groups_of_user(&conn, c.sub))
+            .unwrap_or_default()
+    };
+    if !super::routes::group_can_see(group_vis, &viewer_groups, false) {
+        return Err(ApiError::not_found("未找到该技能（或所属分组不可见）"));
+    }
+    Ok(())
+}
+
+/// 管理后台用：按 owner 用户名 + 技能名删除（含 blob GC）。返回是否删除了行。
+pub(super) fn delete_skill_record(
+    state: &AppState,
+    owner: &str,
+    name: &str,
+) -> Result<bool, ApiError> {
+    let conn = state.db.lock().unwrap();
+    let sha: Option<String> = conn
+        .query_row(
+            "SELECT s.archive_sha256 FROM skills s JOIN users u ON u.id = s.owner_id
+             WHERE u.username = ?1 AND s.name = ?2",
+            rusqlite::params![owner, name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let n = conn
+        .execute(
+            "DELETE FROM skills WHERE name = ?2 AND owner_id =
+                (SELECT id FROM users WHERE username = ?1)",
+            rusqlite::params![owner, name],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        return Ok(false);
+    }
+    if let Some(sha) = sha.filter(|s| !s.is_empty()) {
+        let still: bool = conn
+            .query_row(
+                "SELECT 1 FROM skills WHERE archive_sha256 = ?1 LIMIT 1",
+                [&sha],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        if !still {
+            if let Some(p) = find_blob(state, &sha) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    Ok(true)
 }

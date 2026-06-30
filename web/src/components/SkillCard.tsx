@@ -1,5 +1,5 @@
 import type { SkillInfo } from "../lib/types";
-import { categoryLabel, humanSize } from "../lib/types";
+import { categoryLabel, humanSize, labelBadgeClass } from "../lib/types";
 import { colorFor, initials } from "../lib/color";
 import { ArrowIcon, BookIcon, SparkIcon, TrashIcon, WrenchIcon } from "./icons";
 
@@ -42,7 +42,7 @@ export default function SkillCard({
             <h3 className="truncate text-[17px] font-bold text-slate-800">{s.name}</h3>
             <span className="text-xs font-medium text-slate-400">· v{s.version}</span>
           </div>
-          <div className="mt-1 flex items-center gap-2 text-xs text-slate-400">
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-400">
             <span
               className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 font-medium ${
                 catBadge[s.category] ?? catBadge.skill
@@ -51,6 +51,14 @@ export default function SkillCard({
               <CategoryIcon category={s.category} width={12} height={12} />
               {categoryLabel(s.category)}
             </span>
+            {(s.labels ?? []).map((l) => (
+              <span
+                key={l}
+                className={`rounded-md border px-1.5 py-0.5 font-medium ${labelBadgeClass(l)}`}
+              >
+                {l}
+              </span>
+            ))}
             <span>@{s.owner}</span>
           </div>
         </div>

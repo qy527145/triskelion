@@ -1,9 +1,12 @@
 import type {
+  AdminGroup,
+  AdminLabel,
   AdminMcp,
   AdminSkill,
   AdminStats,
   AdminUser,
   CallLog,
+  GroupVisibility,
   ImportSummary,
   McpInfo,
   McpManifest,
@@ -100,8 +103,13 @@ export const api = {
   register: (username: string, password: string) =>
     req<AuthResp>("/v1/auth/register", { method: "POST", body: { username, password } }),
 
-  explore: (q: string) =>
-    req<McpInfo[]>("/v1/explore" + (q ? "?q=" + encodeURIComponent(q) : "")),
+  explore: (q: string, label?: string) => {
+    const p = new URLSearchParams();
+    if (q) p.set("q", q);
+    if (label) p.set("label", label);
+    const qs = p.toString();
+    return req<McpInfo[]>("/v1/explore" + (qs ? "?" + qs : ""));
+  },
   listMine: () => req<McpInfo[]>("/v1/mcp", { auth: true }),
   upsertMcp: (manifest: McpManifest, visibility: string) =>
     req<McpInfo>("/v1/mcp", { method: "POST", auth: true, body: { manifest, visibility } }),
@@ -127,11 +135,12 @@ export const api = {
     req<null>("/v1/secret/" + encodeURIComponent(key), { method: "DELETE", auth: true }),
 
   // 技能市场
-  skillExplore: (q: string, category?: string, tag?: string) => {
+  skillExplore: (q: string, category?: string, tag?: string, label?: string) => {
     const p = new URLSearchParams();
     if (q) p.set("q", q);
     if (category) p.set("category", category);
     if (tag) p.set("tag", tag);
+    if (label) p.set("label", label);
     const qs = p.toString();
     return req<SkillInfo[]>("/v1/skill/explore" + (qs ? "?" + qs : ""));
   },
@@ -153,19 +162,34 @@ export const api = {
     }),
   skillArchiveUrl: (owner: string, name: string) =>
     rel("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/archive"),
+
+  /** 公开受管标签名清单（供市场筛选）。 */
+  listLabels: () => req<string[]>("/v1/labels"),
 };
 
 // ---------------------------------------------------------------------------
 // 管理后台（ADMIN_TOKEN 鉴权，请求头 X-Admin-Token）
 // ---------------------------------------------------------------------------
 
-async function adminReq<T>(path: string, token: string): Promise<T> {
+async function adminReq<T>(
+  path: string,
+  token: string,
+  opts: { method?: string; body?: unknown } = {},
+): Promise<T> {
+  const { method = "GET", body } = opts;
+  const headers: Record<string, string> = { "X-Admin-Token": token };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
   let res: Response;
   try {
-    res = await fetch(rel(path), { headers: { "X-Admin-Token": token } });
+    res = await fetch(rel(path), {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
   } catch (e) {
     throw new ApiError(0, "无法连接 Hub：" + (e as Error).message);
   }
+  if (res.status === 204) return null as T;
   const text = await res.text();
   let data: unknown = null;
   try {
@@ -189,6 +213,77 @@ export const admin = {
   skills: (token: string) => adminReq<AdminSkill[]>("/v1/admin/skills", token),
   mcps: (token: string) => adminReq<AdminMcp[]>("/v1/admin/mcps", token),
   calls: (token: string) => adminReq<CallLog[]>("/v1/admin/calls", token),
+
+  // 分组 CRUD
+  groups: (token: string) => adminReq<AdminGroup[]>("/v1/admin/groups", token),
+  createGroup: (token: string, name: string, description: string) =>
+    adminReq<AdminGroup>("/v1/admin/groups", token, {
+      method: "POST",
+      body: { name, description },
+    }),
+  updateGroup: (token: string, id: number, body: { name?: string; description?: string }) =>
+    adminReq<null>("/v1/admin/groups/" + id, token, { method: "PATCH", body }),
+  deleteGroup: (token: string, id: number) =>
+    adminReq<null>("/v1/admin/groups/" + id, token, { method: "DELETE" }),
+
+  // 标签 CRUD
+  labels: (token: string) => adminReq<AdminLabel[]>("/v1/admin/labels", token),
+  createLabel: (token: string, name: string) =>
+    adminReq<AdminLabel>("/v1/admin/labels", token, { method: "POST", body: { name } }),
+  updateLabel: (token: string, id: number, name: string) =>
+    adminReq<null>("/v1/admin/labels/" + id, token, { method: "PATCH", body: { name } }),
+  deleteLabel: (token: string, id: number) =>
+    adminReq<null>("/v1/admin/labels/" + id, token, { method: "DELETE" }),
+
+  // 用户 CRUD
+  createUser: (token: string, username: string, password: string, group_ids: number[]) =>
+    adminReq<null>("/v1/admin/users", token, {
+      method: "POST",
+      body: { username, password, group_ids },
+    }),
+  updateUser: (
+    token: string,
+    id: number,
+    body: { password?: string; group_ids: number[] },
+  ) => adminReq<null>("/v1/admin/users/" + id, token, { method: "PATCH", body }),
+  deleteUser: (token: string, id: number) =>
+    adminReq<null>("/v1/admin/users/" + id, token, { method: "DELETE" }),
+
+  // 市场资源（技能 / MCP）可见性配置 + 删除
+  updateSkill: (
+    token: string,
+    owner: string,
+    name: string,
+    body: { visibility?: string; group_visibility?: GroupVisibility; label_ids?: number[] },
+  ) =>
+    adminReq<null>(
+      "/v1/admin/skills/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),
+      token,
+      { method: "PATCH", body },
+    ),
+  deleteSkill: (token: string, owner: string, name: string) =>
+    adminReq<null>(
+      "/v1/admin/skills/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),
+      token,
+      { method: "DELETE" },
+    ),
+  updateMcp: (
+    token: string,
+    owner: string,
+    name: string,
+    body: { visibility?: string; group_visibility?: GroupVisibility; label_ids?: number[] },
+  ) =>
+    adminReq<null>(
+      "/v1/admin/mcps/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),
+      token,
+      { method: "PATCH", body },
+    ),
+  deleteMcp: (token: string, owner: string, name: string) =>
+    adminReq<null>(
+      "/v1/admin/mcps/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),
+      token,
+      { method: "DELETE" },
+    ),
 
   /** 导出全量资源包，触发浏览器下载 .tskpack。 */
   exportPack: async (token: string): Promise<void> => {

@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, ApiError } from "../lib/api";
-import { humanSize } from "../lib/types";
+import { humanSize, parseGroupVisibility } from "../lib/types";
 import type {
+  AdminGroup,
+  AdminLabel,
   AdminMcp,
   AdminSkill,
   AdminStats,
   AdminUser,
   CallLog,
+  GroupVisibility,
   ImportSummary,
 } from "../lib/types";
-import { DownloadIcon, LogoutIcon } from "./icons";
+import Modal from "./Modal";
+import { DownloadIcon, LogoutIcon, PlusIcon, TrashIcon } from "./icons";
 
 const TOKEN_KEY = "tsk_admin_token";
 
@@ -18,6 +22,8 @@ const TABS = [
   { id: "skills", label: "技能" },
   { id: "mcps", label: "MCP 服务" },
   { id: "users", label: "用户" },
+  { id: "groups", label: "分组" },
+  { id: "labels", label: "标签" },
   { id: "calls", label: "调用日志" },
   { id: "migrate", label: "数据迁移" },
 ] as const;
@@ -173,9 +179,11 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
 
           <div className="min-w-0 flex-1">
             {tab === "overview" && <Overview token={token} />}
-            {tab === "skills" && <SkillsTable token={token} />}
-            {tab === "mcps" && <McpsTable token={token} />}
-            {tab === "users" && <UsersTable token={token} />}
+            {tab === "skills" && <SkillsTable token={token} notify={notify} />}
+            {tab === "mcps" && <McpsTable token={token} notify={notify} />}
+            {tab === "users" && <UsersTable token={token} notify={notify} />}
+            {tab === "groups" && <GroupsTable token={token} notify={notify} />}
+            {tab === "labels" && <LabelsTable token={token} notify={notify} />}
             {tab === "calls" && <CallsTable token={token} />}
             {tab === "migrate" && <Migrate token={token} notify={notify} />}
           </div>
@@ -341,76 +349,983 @@ function Table({ head, children }: { head: string[]; children: React.ReactNode }
   );
 }
 
-function SkillsTable({ token }: { token: string }) {
-  const { data, loading, error } = useAdminData<AdminSkill[]>(() => admin.skills(token), [token]);
-  if (loading || error) return <StateLine loading={loading} error={error} />;
-  const rows = data!;
-  if (rows.length === 0) return <Panel>暂无技能。</Panel>;
+// ---------------------------------------------------------------------------
+// 共享：表头操作区、行内按钮、表单控件、分组可见性编辑器
+// ---------------------------------------------------------------------------
+
+function Toolbar({ title, hint, action }: { title: string; hint?: string; action?: React.ReactNode }) {
   return (
-    <Table head={["技能", "分类", "可见性", "版本", "压缩体", "更新于"]}>
-      {rows.map((s) => (
-        <tr key={s.owner + "/" + s.name} className="text-slate-700">
-          <td className="px-5 py-3">
-            <div className="font-semibold text-slate-800">{s.name}</div>
-            <div className="text-xs text-slate-400">@{s.owner}</div>
-          </td>
-          <td className="px-5 py-3 text-slate-500">{s.category}</td>
-          <td className="px-5 py-3">
-            <Badge kind={s.visibility === "public" ? "public" : "private"}>{s.visibility}</Badge>
-          </td>
-          <td className="px-5 py-3 text-slate-500">v{s.version}</td>
-          <td className="px-5 py-3 text-slate-500">
-            {s.has_archive ? `📦 ${humanSize(s.archive_size)}` : "纯文本"}
-          </td>
-          <td className="px-5 py-3 text-xs text-slate-400">{s.updated_at}</td>
-        </tr>
-      ))}
-    </Table>
+    <div className="mb-4 flex items-end justify-between gap-4">
+      <div>
+        <h2 className="font-bold text-slate-800">{title}</h2>
+        {hint && <p className="mt-1 text-sm text-slate-400">{hint}</p>}
+      </div>
+      {action}
+    </div>
   );
 }
 
-function McpsTable({ token }: { token: string }) {
-  const { data, loading, error } = useAdminData<AdminMcp[]>(() => admin.mcps(token), [token]);
-  if (loading || error) return <StateLine loading={loading} error={error} />;
-  const rows = data!;
-  if (rows.length === 0) return <Panel>暂无 MCP。</Panel>;
+function PrimaryButton({
+  onClick,
+  children,
+}: {
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
   return (
-    <Table head={["MCP", "可见性", "版本", "运行时", "协议", "更新于"]}>
-      {rows.map((m) => (
-        <tr key={m.owner + "/" + m.name} className="text-slate-700">
-          <td className="px-5 py-3">
-            <div className="font-semibold text-slate-800">{m.name}</div>
-            <div className="text-xs text-slate-400">@{m.owner}</div>
-          </td>
-          <td className="px-5 py-3">
-            <Badge kind={m.visibility === "public" ? "public" : "private"}>{m.visibility}</Badge>
-          </td>
-          <td className="px-5 py-3 text-slate-500">v{m.version}</td>
-          <td className="px-5 py-3 text-slate-500">{m.runtime}</td>
-          <td className="px-5 py-3 text-slate-500">{m.protocol}</td>
-          <td className="px-5 py-3 text-xs text-slate-400">{m.updated_at}</td>
-        </tr>
-      ))}
-    </Table>
+    <button
+      onClick={onClick}
+      className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+    >
+      {children}
+    </button>
   );
 }
 
-function UsersTable({ token }: { token: string }) {
-  const { data, loading, error } = useAdminData<AdminUser[]>(() => admin.users(token), [token]);
+function RowActions({ children }: { children: React.ReactNode }) {
+  return <div className="flex justify-end gap-2">{children}</div>;
+}
+
+function MiniButton({
+  onClick,
+  tone = "indigo",
+  children,
+}: {
+  onClick: () => void;
+  tone?: "indigo" | "rose";
+  children: React.ReactNode;
+}) {
+  const styles =
+    tone === "rose"
+      ? "border-rose-200 text-rose-500 hover:bg-rose-50"
+      : "border-indigo-200 text-indigo-500 hover:bg-indigo-50";
+  return (
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition ${styles}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+const inputCls =
+  "w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-500/10";
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-sm font-medium text-slate-600">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+/** 拉取分组列表（一次）。 */
+function useGroups(token: string) {
+  const [groups, setGroups] = useState<AdminGroup[]>([]);
+  useEffect(() => {
+    admin.groups(token).then(setGroups).catch(() => setGroups([]));
+  }, [token]);
+  return groups;
+}
+
+/** 拉取标签列表（一次）。 */
+function useLabels(token: string) {
+  const [labels, setLabels] = useState<AdminLabel[]>([]);
+  useEffect(() => {
+    admin.labels(token).then(setLabels).catch(() => setLabels([]));
+  }, [token]);
+  return labels;
+}
+
+/** 资源已分配标签的徽章行。 */
+function LabelBadges({ labels }: { labels: { id: number; name: string }[] }) {
+  if (labels.length === 0) return <span className="text-xs text-slate-300">—</span>;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {labels.map((l) => (
+        <span
+          key={l.id}
+          className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs text-slate-600"
+        >
+          {l.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** 把存储的 group_visibility 字符串渲染成简短标签。 */
+function groupVisLabel(raw: string, groups: AdminGroup[]): string {
+  const v = parseGroupVisibility(raw);
+  if (v === "all") return "所有分组";
+  if (v.length === 0) return "仅作者";
+  const names = v.map((id) => groups.find((g) => g.id === id)?.name ?? `#${id}`);
+  return names.join("、");
+}
+
+function GroupVisibilityEditor({
+  value,
+  groups,
+  onChange,
+}: {
+  value: GroupVisibility;
+  groups: AdminGroup[];
+  onChange: (v: GroupVisibility) => void;
+}) {
+  const all = value === "all";
+  const selected = Array.isArray(value) ? value : [];
+  const toggle = (id: number) =>
+    onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id]);
+  return (
+    <div className="space-y-2.5">
+      <div className="flex gap-4 text-sm">
+        <label className="flex items-center gap-2">
+          <input type="radio" checked={all} onChange={() => onChange("all")} />
+          所有分组可见
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="radio" checked={!all} onChange={() => onChange([])} />
+          指定分组
+        </label>
+      </div>
+      {!all &&
+        (groups.length === 0 ? (
+          <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+            还没有分组，请先在「分组」中创建。未选择任何分组时仅作者本人可见。
+          </p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {groups.map((g) => {
+              const on = selected.includes(g.id);
+              return (
+                <button
+                  key={g.id}
+                  type="button"
+                  onClick={() => toggle(g.id)}
+                  className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                    on
+                      ? "border-indigo-300 bg-indigo-50 text-indigo-600"
+                      : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                  }`}
+                >
+                  {g.name}
+                </button>
+              );
+            })}
+          </div>
+        ))}
+    </div>
+  );
+}
+
+function ModalError({ error }: { error: string }) {
+  if (!error) return null;
+  return <div className="mt-3 text-sm text-rose-500">{error}</div>;
+}
+
+
+
+function SkillsTable({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const { data, loading, error, reload } = useAdminData<AdminSkill[]>(
+    () => admin.skills(token),
+    [token],
+  );
+  const groups = useGroups(token);
+  const labels = useLabels(token);
+  const [edit, setEdit] = useState<AdminSkill | null>(null);
   if (loading || error) return <StateLine loading={loading} error={error} />;
   const rows = data!;
+
+  async function del(s: AdminSkill) {
+    if (!confirm(`删除技能「${s.owner}/${s.name}」？此操作不可恢复。`)) return;
+    try {
+      await admin.deleteSkill(token, s.owner, s.name);
+      notify("已删除");
+      reload();
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+
   return (
-    <Table head={["用户名", "技能", "MCP", "凭据", "注册于"]}>
-      {rows.map((u) => (
-        <tr key={u.username} className="text-slate-700">
-          <td className="px-5 py-3 font-semibold text-slate-800">{u.username}</td>
-          <td className="px-5 py-3 text-slate-500">{u.skills}</td>
-          <td className="px-5 py-3 text-slate-500">{u.mcps}</td>
-          <td className="px-5 py-3 text-slate-500">{u.secrets}</td>
-          <td className="px-5 py-3 text-xs text-slate-400">{u.created_at}</td>
-        </tr>
-      ))}
-    </Table>
+    <div>
+      {rows.length === 0 ? (
+        <Panel>暂无技能。</Panel>
+      ) : (
+        <Table head={["技能", "分类", "可见性", "可见分组", "标签", "压缩体", "更新于", "操作"]}>
+          {rows.map((s) => (
+            <tr key={s.owner + "/" + s.name} className="text-slate-700">
+              <td className="px-5 py-3">
+                <div className="font-semibold text-slate-800">{s.name}</div>
+                <div className="text-xs text-slate-400">@{s.owner}</div>
+              </td>
+              <td className="px-5 py-3 text-slate-500">{s.category}</td>
+              <td className="px-5 py-3">
+                <Badge kind={s.visibility === "public" ? "public" : "private"}>{s.visibility}</Badge>
+              </td>
+              <td className="px-5 py-3 text-xs text-slate-500">
+                {s.visibility === "public" ? groupVisLabel(s.group_visibility, groups) : "—"}
+              </td>
+              <td className="px-5 py-3">
+                <LabelBadges labels={s.labels} />
+              </td>
+              <td className="px-5 py-3 text-slate-500">
+                {s.has_archive ? `📦 ${humanSize(s.archive_size)}` : "纯文本"}
+              </td>
+              <td className="px-5 py-3 text-xs text-slate-400">{s.updated_at}</td>
+              <td className="px-5 py-3">
+                <RowActions>
+                  <MiniButton onClick={() => setEdit(s)}>配置</MiniButton>
+                  <MiniButton tone="rose" onClick={() => del(s)}>
+                    <TrashIcon width={13} height={13} />
+                  </MiniButton>
+                </RowActions>
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {edit && (
+        <VisibilityModal
+          kind="skill"
+          token={token}
+          owner={edit.owner}
+          name={edit.name}
+          visibility={edit.visibility}
+          groupVisibilityRaw={edit.group_visibility}
+          groups={groups}
+          labels={labels}
+          currentLabelIds={edit.labels.map((l) => l.id)}
+          onClose={() => setEdit(null)}
+          onSaved={() => {
+            setEdit(null);
+            notify("已更新");
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function McpsTable({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const { data, loading, error, reload } = useAdminData<AdminMcp[]>(
+    () => admin.mcps(token),
+    [token],
+  );
+  const groups = useGroups(token);
+  const labels = useLabels(token);
+  const [edit, setEdit] = useState<AdminMcp | null>(null);
+  if (loading || error) return <StateLine loading={loading} error={error} />;
+  const rows = data!;
+
+  async function del(m: AdminMcp) {
+    if (!confirm(`删除 MCP「${m.owner}/${m.name}」？此操作不可恢复。`)) return;
+    try {
+      await admin.deleteMcp(token, m.owner, m.name);
+      notify("已删除");
+      reload();
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+
+  return (
+    <div>
+      {rows.length === 0 ? (
+        <Panel>暂无 MCP。</Panel>
+      ) : (
+        <Table head={["MCP", "可见性", "可见分组", "标签", "运行时", "协议", "更新于", "操作"]}>
+          {rows.map((m) => (
+            <tr key={m.owner + "/" + m.name} className="text-slate-700">
+              <td className="px-5 py-3">
+                <div className="font-semibold text-slate-800">{m.name}</div>
+                <div className="text-xs text-slate-400">@{m.owner}</div>
+              </td>
+              <td className="px-5 py-3">
+                <Badge kind={m.visibility === "public" ? "public" : "private"}>{m.visibility}</Badge>
+              </td>
+              <td className="px-5 py-3 text-xs text-slate-500">
+                {m.visibility === "public" ? groupVisLabel(m.group_visibility, groups) : "—"}
+              </td>
+              <td className="px-5 py-3">
+                <LabelBadges labels={m.labels} />
+              </td>
+              <td className="px-5 py-3 text-slate-500">{m.runtime}</td>
+              <td className="px-5 py-3 text-slate-500">{m.protocol}</td>
+              <td className="px-5 py-3 text-xs text-slate-400">{m.updated_at}</td>
+              <td className="px-5 py-3">
+                <RowActions>
+                  <MiniButton onClick={() => setEdit(m)}>配置</MiniButton>
+                  <MiniButton tone="rose" onClick={() => del(m)}>
+                    <TrashIcon width={13} height={13} />
+                  </MiniButton>
+                </RowActions>
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {edit && (
+        <VisibilityModal
+          kind="mcp"
+          token={token}
+          owner={edit.owner}
+          name={edit.name}
+          visibility={edit.visibility}
+          groupVisibilityRaw={edit.group_visibility}
+          groups={groups}
+          labels={labels}
+          currentLabelIds={edit.labels.map((l) => l.id)}
+          onClose={() => setEdit(null)}
+          onSaved={() => {
+            setEdit(null);
+            notify("已更新");
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** 技能 / MCP 的可见性 + 分组可见性 + 标签配置弹窗。 */
+function VisibilityModal({
+  kind,
+  token,
+  owner,
+  name,
+  visibility: initVis,
+  groupVisibilityRaw,
+  groups,
+  labels,
+  currentLabelIds,
+  onClose,
+  onSaved,
+}: {
+  kind: "skill" | "mcp";
+  token: string;
+  owner: string;
+  name: string;
+  visibility: string;
+  groupVisibilityRaw: string;
+  groups: AdminGroup[];
+  labels: AdminLabel[];
+  currentLabelIds: number[];
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [visibility, setVisibility] = useState(initVis);
+  const [gv, setGv] = useState<GroupVisibility>(parseGroupVisibility(groupVisibilityRaw));
+  const [labelIds, setLabelIds] = useState<number[]>(currentLabelIds);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const toggleLabel = (id: number) =>
+    setLabelIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      const body = { visibility, group_visibility: gv, label_ids: labelIds };
+      if (kind === "skill") await admin.updateSkill(token, owner, name, body);
+      else await admin.updateMcp(token, owner, name, body);
+      onSaved();
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title="配置资源"
+      subtitle={`${owner}/${name}`}
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            onClick={onClose}
+            className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+          >
+            取消
+          </button>
+          <button
+            onClick={save}
+            disabled={busy}
+            className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
+          >
+            {busy ? "保存中…" : "保存"}
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-5">
+        <Field label="可见性">
+          <div className="flex gap-4 text-sm">
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                checked={visibility === "public"}
+                onChange={() => setVisibility("public")}
+              />
+              public（上架市场）
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                checked={visibility === "private"}
+                onChange={() => setVisibility("private")}
+              />
+              private（仅作者）
+            </label>
+          </div>
+        </Field>
+        {visibility === "public" && (
+          <Field label="可见分组">
+            <GroupVisibilityEditor value={gv} groups={groups} onChange={setGv} />
+          </Field>
+        )}
+        <Field label="标签">
+          {labels.length === 0 ? (
+            <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+              还没有标签，请先在「标签」中创建。
+            </p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {labels.map((l) => {
+                const on = labelIds.includes(l.id);
+                return (
+                  <button
+                    key={l.id}
+                    type="button"
+                    onClick={() => toggleLabel(l.id)}
+                    className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                      on
+                        ? "border-indigo-300 bg-indigo-50 text-indigo-600"
+                        : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                    }`}
+                  >
+                    {l.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Field>
+        <ModalError error={error} />
+      </div>
+    </Modal>
+  );
+}
+
+function UsersTable({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const { data, loading, error, reload } = useAdminData<AdminUser[]>(
+    () => admin.users(token),
+    [token],
+  );
+  const groups = useGroups(token);
+  const [modal, setModal] = useState<{ edit: AdminUser | null } | null>(null);
+  if (loading || error) return <StateLine loading={loading} error={error} />;
+  const rows = data!;
+
+  async function del(u: AdminUser) {
+    if (
+      !confirm(
+        `删除用户「${u.username}」？\n其名下 ${u.skills} 个技能、${u.mcps} 个 MCP、${u.secrets} 条凭据将一并删除，不可恢复。`,
+      )
+    )
+      return;
+    try {
+      await admin.deleteUser(token, u.id);
+      notify("已删除");
+      reload();
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Toolbar
+        title="用户"
+        hint="创建用户、调整分组归属、重置密码或删除。"
+        action={
+          <PrimaryButton onClick={() => setModal({ edit: null })}>
+            <PlusIcon width={16} height={16} /> 新建用户
+          </PrimaryButton>
+        }
+      />
+      <Table head={["用户名", "分组", "技能", "MCP", "凭据", "注册于", "操作"]}>
+        {rows.map((u) => (
+          <tr key={u.id} className="text-slate-700">
+            <td className="px-5 py-3 font-semibold text-slate-800">{u.username}</td>
+            <td className="px-5 py-3">
+              {u.groups.length > 0 ? (
+                <div className="flex flex-wrap gap-1">
+                  {u.groups.map((g) => (
+                    <span
+                      key={g.id}
+                      className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs text-slate-600"
+                    >
+                      {g.name}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-xs text-slate-300">无</span>
+              )}
+            </td>
+            <td className="px-5 py-3 text-slate-500">{u.skills}</td>
+            <td className="px-5 py-3 text-slate-500">{u.mcps}</td>
+            <td className="px-5 py-3 text-slate-500">{u.secrets}</td>
+            <td className="px-5 py-3 text-xs text-slate-400">{u.created_at}</td>
+            <td className="px-5 py-3">
+              <RowActions>
+                <MiniButton onClick={() => setModal({ edit: u })}>编辑</MiniButton>
+                <MiniButton tone="rose" onClick={() => del(u)}>
+                  <TrashIcon width={13} height={13} />
+                </MiniButton>
+              </RowActions>
+            </td>
+          </tr>
+        ))}
+      </Table>
+      {modal && (
+        <UserModal
+          token={token}
+          edit={modal.edit}
+          groups={groups}
+          onClose={() => setModal(null)}
+          onSaved={(msg) => {
+            setModal(null);
+            notify(msg);
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function UserModal({
+  token,
+  edit,
+  groups,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  edit: AdminUser | null;
+  groups: AdminGroup[];
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [username, setUsername] = useState(edit?.username ?? "");
+  const [password, setPassword] = useState("");
+  const [groupIds, setGroupIds] = useState<number[]>(edit ? edit.groups.map((g) => g.id) : []);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const toggleGroup = (id: number) =>
+    setGroupIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      if (edit) {
+        await admin.updateUser(token, edit.id, {
+          password: password || undefined,
+          group_ids: groupIds,
+        });
+        onSaved("已更新 " + edit.username);
+      } else {
+        await admin.createUser(token, username.trim(), password, groupIds);
+        onSaved("已创建 " + username.trim());
+      }
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={edit ? "编辑用户" : "新建用户"}
+      subtitle={edit ? edit.username : "创建一个登录账号并指定分组"}
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            onClick={onClose}
+            className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+          >
+            取消
+          </button>
+          <button
+            onClick={save}
+            disabled={busy}
+            className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
+          >
+            {busy ? "保存中…" : "保存"}
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        {!edit && (
+          <Field label="用户名">
+            <input
+              autoFocus
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="字母 / 数字 / _ / -"
+              className={inputCls}
+            />
+          </Field>
+        )}
+        <Field label={edit ? "重置密码（留空则不变）" : "密码（至少 6 位）"}>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder={edit ? "••••••" : "至少 6 位"}
+            className={inputCls}
+          />
+        </Field>
+        <Field label="分组（可多选）">
+          {groups.length === 0 ? (
+            <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+              还没有分组，请先在「分组」中创建。
+            </p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {groups.map((g) => {
+                const on = groupIds.includes(g.id);
+                return (
+                  <button
+                    key={g.id}
+                    type="button"
+                    onClick={() => toggleGroup(g.id)}
+                    className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                      on
+                        ? "border-indigo-300 bg-indigo-50 text-indigo-600"
+                        : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                    }`}
+                  >
+                    {g.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Field>
+        <ModalError error={error} />
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 分组 CRUD
+// ---------------------------------------------------------------------------
+
+function GroupsTable({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const { data, loading, error, reload } = useAdminData<AdminGroup[]>(
+    () => admin.groups(token),
+    [token],
+  );
+  const [modal, setModal] = useState<{ edit: AdminGroup | null } | null>(null);
+  if (loading || error) return <StateLine loading={loading} error={error} />;
+  const rows = data!;
+
+  async function del(g: AdminGroup) {
+    if (!confirm(`删除分组「${g.name}」？\n该分组下 ${g.users} 个成员将被移出分组（不会删除用户）。`))
+      return;
+    try {
+      await admin.deleteGroup(token, g.id);
+      notify("已删除");
+      reload();
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Toolbar
+        title="分组"
+        hint="分组用于控制市场技能 / MCP 对哪些用户可见。"
+        action={
+          <PrimaryButton onClick={() => setModal({ edit: null })}>
+            <PlusIcon width={16} height={16} /> 新建分组
+          </PrimaryButton>
+        }
+      />
+      {rows.length === 0 ? (
+        <Panel>还没有分组。点击「新建分组」创建第一个。</Panel>
+      ) : (
+        <Table head={["分组名", "描述", "成员数", "创建于", "操作"]}>
+          {rows.map((g) => (
+            <tr key={g.id} className="text-slate-700">
+              <td className="px-5 py-3 font-semibold text-slate-800">{g.name}</td>
+              <td className="px-5 py-3 text-slate-500">{g.description || "—"}</td>
+              <td className="px-5 py-3 text-slate-500">{g.users}</td>
+              <td className="px-5 py-3 text-xs text-slate-400">{g.created_at}</td>
+              <td className="px-5 py-3">
+                <RowActions>
+                  <MiniButton onClick={() => setModal({ edit: g })}>编辑</MiniButton>
+                  <MiniButton tone="rose" onClick={() => del(g)}>
+                    <TrashIcon width={13} height={13} />
+                  </MiniButton>
+                </RowActions>
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {modal && (
+        <GroupModal
+          token={token}
+          edit={modal.edit}
+          onClose={() => setModal(null)}
+          onSaved={(msg) => {
+            setModal(null);
+            notify(msg);
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function GroupModal({
+  token,
+  edit,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  edit: AdminGroup | null;
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [name, setName] = useState(edit?.name ?? "");
+  const [description, setDescription] = useState(edit?.description ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      if (edit) {
+        await admin.updateGroup(token, edit.id, { name: name.trim(), description });
+        onSaved("已更新 " + name.trim());
+      } else {
+        await admin.createGroup(token, name.trim(), description);
+        onSaved("已创建 " + name.trim());
+      }
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={edit ? "编辑分组" : "新建分组"}
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            onClick={onClose}
+            className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+          >
+            取消
+          </button>
+          <button
+            onClick={save}
+            disabled={busy}
+            className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
+          >
+            {busy ? "保存中…" : "保存"}
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <Field label="分组名">
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="如：内部团队 / 合作伙伴"
+            className={inputCls}
+          />
+        </Field>
+        <Field label="描述（可选）">
+          <input
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="用途说明"
+            className={inputCls}
+          />
+        </Field>
+        <ModalError error={error} />
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 标签（labels）CRUD
+// ---------------------------------------------------------------------------
+
+function LabelsTable({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const { data, loading, error, reload } = useAdminData<AdminLabel[]>(
+    () => admin.labels(token),
+    [token],
+  );
+  const [modal, setModal] = useState<{ edit: AdminLabel | null } | null>(null);
+  if (loading || error) return <StateLine loading={loading} error={error} />;
+  const rows = data!;
+
+  async function del(l: AdminLabel) {
+    if (
+      !confirm(
+        `删除标签「${l.name}」？\n将从 ${l.skills} 个技能、${l.mcps} 个 MCP 上移除该标签（不删除资源）。`,
+      )
+    )
+      return;
+    try {
+      await admin.deleteLabel(token, l.id);
+      notify("已删除");
+      reload();
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Toolbar
+        title="标签"
+        hint="受管标签用于标注与筛选市场资源（默认内置「官方」「社区」）。在资源「配置」中分配。"
+        action={
+          <PrimaryButton onClick={() => setModal({ edit: null })}>
+            <PlusIcon width={16} height={16} /> 新建标签
+          </PrimaryButton>
+        }
+      />
+      {rows.length === 0 ? (
+        <Panel>还没有标签。点击「新建标签」创建。</Panel>
+      ) : (
+        <Table head={["标签", "技能", "MCP", "创建于", "操作"]}>
+          {rows.map((l) => (
+            <tr key={l.id} className="text-slate-700">
+              <td className="px-5 py-3 font-semibold text-slate-800">{l.name}</td>
+              <td className="px-5 py-3 text-slate-500">{l.skills}</td>
+              <td className="px-5 py-3 text-slate-500">{l.mcps}</td>
+              <td className="px-5 py-3 text-xs text-slate-400">{l.created_at || "—"}</td>
+              <td className="px-5 py-3">
+                <RowActions>
+                  <MiniButton onClick={() => setModal({ edit: l })}>编辑</MiniButton>
+                  <MiniButton tone="rose" onClick={() => del(l)}>
+                    <TrashIcon width={13} height={13} />
+                  </MiniButton>
+                </RowActions>
+              </td>
+            </tr>
+          ))}
+        </Table>
+      )}
+      {modal && (
+        <LabelModal
+          token={token}
+          edit={modal.edit}
+          onClose={() => setModal(null)}
+          onSaved={(msg) => {
+            setModal(null);
+            notify(msg);
+            reload();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function LabelModal({
+  token,
+  edit,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  edit: AdminLabel | null;
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [name, setName] = useState(edit?.name ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      if (edit) {
+        await admin.updateLabel(token, edit.id, name.trim());
+        onSaved("已更新 " + name.trim());
+      } else {
+        await admin.createLabel(token, name.trim());
+        onSaved("已创建 " + name.trim());
+      }
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={edit ? "编辑标签" : "新建标签"}
+      onClose={onClose}
+      footer={
+        <>
+          <button
+            onClick={onClose}
+            className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+          >
+            取消
+          </button>
+          <button
+            onClick={save}
+            disabled={busy}
+            className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
+          >
+            {busy ? "保存中…" : "保存"}
+          </button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <Field label="标签名">
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="如：官方 / 社区 / 精选"
+            className={inputCls}
+          />
+        </Field>
+        <ModalError error={error} />
+      </div>
+    </Modal>
   );
 }
 
