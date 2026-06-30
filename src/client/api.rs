@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::shared::{
     AuthReq, AuthResp, McpInfo, McpManifest, McpUpsertReq, ResolveResp, SecretInfo, SecretSetReq,
-    SetToolsReq, ToolMeta,
+    SetToolsReq, SkillInfo, SkillManifest, SkillUpsertReq, ToolMeta,
 };
 
 /// 带 HTTP 状态码的客户端错误，status==0 表示传输层失败。
@@ -208,5 +208,118 @@ impl HubClient {
             .map_err(HubError::transport)?;
         let v: serde_json::Value = Self::parse(resp)?;
         Ok(v.get("indexed").and_then(|x| x.as_u64()).unwrap_or(0) as usize)
+    }
+
+    // -----------------------------------------------------------------------
+    // 技能市场
+    // -----------------------------------------------------------------------
+
+    /// 搜索公开技能（按关键字 / 分类 / 标签）。无需登录。
+    pub fn skill_explore(
+        &self,
+        query: &str,
+        category: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<SkillInfo>, HubError> {
+        let mut rb = self.http.get(self.url("/v1/skill/explore"));
+        let mut q: Vec<(&str, &str)> = Vec::new();
+        if !query.is_empty() {
+            q.push(("q", query));
+        }
+        if let Some(c) = category.filter(|s| !s.is_empty()) {
+            q.push(("category", c));
+        }
+        if let Some(t) = tag.filter(|s| !s.is_empty()) {
+            q.push(("tag", t));
+        }
+        if !q.is_empty() {
+            rb = rb.query(&q);
+        }
+        let resp = rb.send().map_err(HubError::transport)?;
+        Self::parse(resp)
+    }
+
+    /// 列出名下全部技能（含私有）。
+    pub fn skill_list(&self) -> Result<Vec<SkillInfo>, HubError> {
+        let resp = self
+            .auth(self.http.get(self.url("/v1/skill")))
+            .send()
+            .map_err(HubError::transport)?;
+        Self::parse(resp)
+    }
+
+    /// 技能详情（public 任何人可读；private 需 owner token）。
+    pub fn skill_get(&self, owner: &str, name: &str) -> Result<SkillInfo, HubError> {
+        let resp = self
+            .auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}"))))
+            .send()
+            .map_err(HubError::transport)?;
+        Self::parse(resp)
+    }
+
+    /// 发布/更新技能元数据（压缩体单独上传）。
+    pub fn skill_upsert(
+        &self,
+        manifest: &SkillManifest,
+        visibility: &str,
+        skill_md: &str,
+        archive_sha256: &str,
+        archive_size: u64,
+    ) -> Result<SkillInfo, HubError> {
+        let resp = self
+            .auth(self.http.post(self.url("/v1/skill")))
+            .json(&SkillUpsertReq {
+                manifest: manifest.clone(),
+                visibility: visibility.to_string(),
+                skill_md: skill_md.to_string(),
+                archive_sha256: archive_sha256.to_string(),
+                archive_size,
+            })
+            .send()
+            .map_err(HubError::transport)?;
+        Self::parse(resp)
+    }
+
+    /// 上传技能压缩体（tar.gz 原始字节）。
+    pub fn skill_archive_put(&self, owner: &str, name: &str, bytes: Vec<u8>) -> Result<(), HubError> {
+        let resp = self
+            .auth(self.http.put(self.url(&format!("/v1/skill/{owner}/{name}/archive"))))
+            .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+            .body(bytes)
+            .send()
+            .map_err(HubError::transport)?;
+        let _: serde_json::Value = Self::parse(resp)?;
+        Ok(())
+    }
+
+    /// 下载技能压缩体（tar.gz 原始字节）。
+    pub fn skill_archive_get(&self, owner: &str, name: &str) -> Result<Vec<u8>, HubError> {
+        let resp = self
+            .auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}/archive"))))
+            .send()
+            .map_err(HubError::transport)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let code = status.as_u16();
+            let message = resp
+                .json::<crate::shared::ErrorResp>()
+                .map(|e| e.error)
+                .unwrap_or_else(|_| status.to_string());
+            return Err(HubError { status: code, message });
+        }
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| HubError {
+                status: status.as_u16(),
+                message: format!("读取压缩体失败: {e}"),
+            })
+    }
+
+    pub fn skill_delete(&self, owner: &str, name: &str) -> Result<(), HubError> {
+        let resp = self
+            .auth(self.http.delete(self.url(&format!("/v1/skill/{owner}/{name}"))))
+            .send()
+            .map_err(HubError::transport)?;
+        Self::ok_empty(resp)
     }
 }

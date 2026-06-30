@@ -25,7 +25,17 @@ required-features = ["server"]
 [features]
 default = ["client", "server"]
 # tsk 客户端 CLI 侧能力
-client = ["dep:clap", "dep:reqwest", "dep:dialoguer", "dep:rpassword", "dep:dirs"]
+client = [
+    "dep:clap",
+    "dep:reqwest",
+    "dep:dialoguer",
+    "dep:rpassword",
+    "dep:dirs",
+    # 技能包 build/pull：gzip + tar 打包与校验
+    "dep:tar",
+    "dep:flate2",
+    "dep:sha2",
+]
 # triskelion Hub 服务端侧能力
 server = [
     "dep:axum",
@@ -40,6 +50,8 @@ server = [
     "dep:mime_guess",
     # Hub 作为网关需连接 MCP（crate::mcp 用阻塞 reqwest）
     "dep:reqwest",
+    # 校验上传技能包压缩体的 sha256
+    "dep:sha2",
 ]
 
 [dependencies]
@@ -58,6 +70,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 dialoguer = { version = "0.11", optional = true }
 rpassword = { version = "7", optional = true }
 dirs = { version = "5", optional = true }
+# 技能包打包：gzip 流 + tar 归档（纯 Rust，无系统依赖）
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true }
+# 压缩体内容寻址与完整性校验（client 打包 / server 校验）
+sha2 = { version = "0.10", optional = true }
 
 # server 侧
 axum = { version = "0.7", optional = true }

@@ -16,6 +16,7 @@ use crate::shared::{
 use super::auth;
 use super::crypto;
 use super::error::ApiError;
+use super::skills;
 use super::web;
 use super::AppState;
 
@@ -34,10 +35,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/mcp/:name/rename", post(mcp_rename))
         .route("/v1/mcp/:name/tools", post(mcp_set_tools))
         .route("/v1/mcp/:owner/:name", get(mcp_get))
+        // 技能市场
+        .route("/v1/skill/explore", get(skills::explore))
+        .route("/v1/skill", get(skills::list_mine).post(skills::upsert))
+        .route(
+            "/v1/skill/:owner/:name",
+            get(skills::get).delete(skills::delete),
+        )
+        .route("/v1/skill/:owner/:name/rename", post(skills::rename))
+        .route(
+            "/v1/skill/:owner/:name/archive",
+            get(skills::archive_get).put(skills::archive_put),
+        )
         .route("/v1/secret", get(secret_list).put(secret_set))
         .route("/v1/secret/:key", delete(secret_delete))
         .route("/v1/run/:owner/:name/resolve", post(run_resolve))
         .route("/v1/run/:owner/:name/call", post(run_call))
+        // 技能压缩体可能较大，放宽请求体上限至 512 MiB
+        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024))
         // 内置 Web UI 静态资源 + SPA 回退
         .fallback(web::static_handler)
         .with_state(state)
@@ -616,13 +631,13 @@ fn parse_tools(s: &str) -> Vec<ToolMeta> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
-fn db_err(e: rusqlite::Error) -> ApiError {
+pub(super) fn db_err(e: rusqlite::Error) -> ApiError {
     eprintln!("db error: {e}");
     ApiError::internal(format!("数据库错误: {e}"))
 }
 
 /// 当前时间 `YYYY-MM-DD HH:MM:SS UTC`（不引入 chrono）。
-fn now_string() -> String {
+pub(super) fn now_string() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

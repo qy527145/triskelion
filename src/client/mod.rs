@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod mcp2cli;
+mod skill;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,6 +44,24 @@ enum Cmd {
     Mcp {
         #[command(subcommand)]
         cmd: McpCmd,
+    },
+    /// 技能市场：打包 / 发布 / 检索 / 拉取技能包（含 SKILL.md 的文件夹）
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
+    /// 拉取并解压一个技能包：tsk pull <owner>/<name>
+    Pull {
+        /// owner/name 或 name（默认当前用户）
+        package: String,
+        /// 解压到的父目录（默认当前目录，最终落在 <dir>/<name>）
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// 在当前目录打包技能包（tar.gz），等价于 tsk skill build
+    Build {
+        /// 技能根目录（默认当前目录）
+        dir: Option<PathBuf>,
     },
     /// 变量（凭据）管理
     Secret {
@@ -95,6 +114,50 @@ enum SecretCmd {
     Rm { key: String },
 }
 
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// 在目录里生成技能脚手架（SKILL.md + tsk-skill.json）
+    Init {
+        /// 目标目录（默认当前目录）
+        dir: Option<PathBuf>,
+    },
+    /// 本地打包技能包为 tar.gz（不联网）
+    Build {
+        /// 技能根目录（默认当前目录）
+        dir: Option<PathBuf>,
+    },
+    /// 打包并发布到技能市场
+    Publish {
+        /// 技能根目录（默认当前目录）
+        dir: Option<PathBuf>,
+        /// private（默认）或 public
+        #[arg(long)]
+        visibility: Option<String>,
+    },
+    /// 列出名下全部技能（含私有）
+    List,
+    /// 搜索公开技能（可按 --category / --tag 过滤）
+    Search {
+        query: Option<String>,
+        /// 逻辑分类：skill / kb / toolchain
+        #[arg(long)]
+        category: Option<String>,
+        /// 标签
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    /// 查看技能详情与 SKILL.md：tsk skill show <owner>/<name>
+    Show { package: String },
+    /// 拉取并解压一个技能包
+    Pull {
+        package: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// 删除一个技能
+    Remove { name: String },
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -108,6 +171,22 @@ pub fn run() -> Result<()> {
             McpCmd::Index { package } => cmd_mcp_index(&package),
             McpCmd::Remove { name } => cmd_mcp_remove(&name),
         },
+        Cmd::Skill { cmd } => match cmd {
+            SkillCmd::Init { dir } => skill::init(dir),
+            SkillCmd::Build { dir } => skill::cmd_build(dir),
+            SkillCmd::Publish { dir, visibility } => skill::publish(dir, visibility),
+            SkillCmd::List => skill::list(),
+            SkillCmd::Search { query, category, tag } => skill::search(
+                query.as_deref().unwrap_or(""),
+                category.as_deref(),
+                tag.as_deref(),
+            ),
+            SkillCmd::Show { package } => skill::show(&package),
+            SkillCmd::Pull { package, dir } => skill::pull(&package, dir),
+            SkillCmd::Remove { name } => skill::remove(&name),
+        },
+        Cmd::Pull { package, dir } => skill::pull(&package, dir),
+        Cmd::Build { dir } => skill::cmd_build(dir),
         Cmd::Secret { cmd } => match cmd {
             SecretCmd::Set { key, value } => cmd_secret_set(&key, &value),
             SecretCmd::List => cmd_secret_list(),

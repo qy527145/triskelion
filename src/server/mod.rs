@@ -9,6 +9,7 @@ mod crypto;
 mod db;
 mod error;
 mod routes;
+mod skills;
 mod web;
 
 use std::path::PathBuf;
@@ -24,6 +25,8 @@ pub struct AppState {
     pub jwt_secret: Vec<u8>,
     /// AES-256-GCM 主密钥（32 字节），加密凭据池。
     pub master_key: [u8; 32],
+    /// 技能包压缩体落盘目录（按 sha256 内容寻址）。
+    pub blobs_dir: PathBuf,
 }
 
 /// 启动 Hub。自建多线程 tokio runtime 并阻塞，bin 侧保持同步 main。
@@ -57,10 +60,15 @@ pub fn run() -> Result<()> {
     let mut master_key = [0u8; 32];
     master_key.copy_from_slice(&master_key_vec);
 
+    let blobs_dir = data_dir.join("blobs");
+    std::fs::create_dir_all(&blobs_dir)
+        .with_context(|| format!("创建技能包目录 {}", blobs_dir.display()))?;
+
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         jwt_secret,
         master_key,
+        blobs_dir,
     });
 
     let bind = std::env::var("TRISKELION_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
