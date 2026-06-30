@@ -92,6 +92,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         // 外部系统（如 aiko_hub）批量分发用户变量。
         .route("/v1/admin/secrets", post(admin::secrets_distribute))
+        // 外部系统在登录/注册时配给账号（create-or-update + 注入变量）。
+        .route("/v1/admin/provision-user", post(admin::user_provision))
         .route("/v1/admin/calls", get(admin::calls))
         .route("/v1/admin/export", get(admin::export))
         .route("/v1/admin/import", post(admin::import))

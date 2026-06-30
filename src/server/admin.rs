@@ -1586,11 +1586,11 @@ pub struct SecretDistributeReq {
 #[derive(Serialize)]
 pub struct SecretDistributeResp {
     applied: usize,
-    created_users: Vec<String>,
     skipped: Vec<String>,
 }
 
-/// 批量为多个用户写同一变量（按 (owner, key) upsert，缺失用户自动创建）。供外部系统分发用户 KEY。
+/// 批量为多个用户写同一变量（按 (owner, key) upsert）。供外部系统分发用户 KEY。
+/// 不存在的同名用户**跳过**（不自动创建），计入 `skipped`。
 pub async fn secrets_distribute(
     State(state): S,
     headers: HeaderMap,
@@ -1604,7 +1604,6 @@ pub async fn secrets_distribute(
     let now = now_string();
     let conn = state.db.lock().unwrap();
     let mut applied = 0usize;
-    let mut created_users = Vec::new();
     let mut skipped = Vec::new();
     for entry in &req.entries {
         let username = entry.username.trim();
@@ -1612,17 +1611,18 @@ pub async fn secrets_distribute(
             skipped.push(format!("{username}（用户名非法）"));
             continue;
         }
-        let existed: bool = conn
-            .query_row("SELECT 1 FROM users WHERE username = ?1", [username], |_| {
-                Ok(true)
-            })
+        let oid: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM users WHERE username = ?1",
+                [username],
+                |r| r.get(0),
+            )
             .optional()
-            .map_err(db_err)?
-            .unwrap_or(false);
-        let oid = ensure_user(&conn, username)?;
-        if !existed {
-            created_users.push(username.to_string());
-        }
+            .map_err(db_err)?;
+        let Some(oid) = oid else {
+            skipped.push(format!("{username}（用户不存在）"));
+            continue;
+        };
         let (nonce, ct) = crypto::encrypt(&state.master_key, &entry.value)?;
         conn.execute(
             "INSERT INTO secrets(owner_id, key, nonce, ciphertext, updated_at)
@@ -1635,10 +1635,96 @@ pub async fn secrets_distribute(
         .map_err(db_err)?;
         applied += 1;
     }
-    Ok(Json(SecretDistributeResp {
-        applied,
-        created_users,
-        skipped,
+    Ok(Json(SecretDistributeResp { applied, skipped }))
+}
+
+#[derive(Deserialize)]
+pub struct UserProvisionReq {
+    username: String,
+    password: String,
+    /// 可选：随账号一并注入的变量名（如 "AIKO_HUB_KEY"）。
+    #[serde(default)]
+    key: Option<String>,
+    /// 可选：上述变量的值。
+    #[serde(default)]
+    value: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct UserProvisionResp {
+    username: String,
+    created: bool,
+    secret_set: bool,
+}
+
+/// 配给一个用户账号（外部系统如 aiko_hub 在登录 / 注册时调用）：按用户名 create-or-update，
+/// 始终同步口令以保持一致；可选随账号注入一个变量。
+pub async fn user_provision(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<UserProvisionReq>,
+) -> Result<Json<UserProvisionResp>, ApiError> {
+    require_admin(&state, &headers)?;
+    let username = req.username.trim().to_string();
+    if !super::routes::is_valid_username(&username) {
+        return Err(ApiError::bad_request(
+            "用户名仅允许字母、数字、_、-，且长度 1..=64",
+        ));
+    }
+    if req.password.is_empty() {
+        return Err(ApiError::bad_request("密码不能为空"));
+    }
+    let hash = auth::hash_password(&req.password).map_err(|e| ApiError::internal(e.to_string()))?;
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            [&username],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let (uid, created) = match existing {
+        Some(id) => {
+            // 同步口令保持一致。
+            conn.execute(
+                "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+                rusqlite::params![hash, id],
+            )
+            .map_err(db_err)?;
+            (id, false)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![username, hash, now],
+            )
+            .map_err(db_err)?;
+            (conn.last_insert_rowid(), true)
+        }
+    };
+    let mut secret_set = false;
+    if let (Some(key), Some(value)) = (req.key.as_deref(), req.value.as_deref()) {
+        let key = key.trim();
+        if !key.is_empty() {
+            let (nonce, ct) = crypto::encrypt(&state.master_key, value)?;
+            conn.execute(
+                "INSERT INTO secrets(owner_id, key, nonce, ciphertext, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(owner_id, key)
+                 DO UPDATE SET nonce=excluded.nonce, ciphertext=excluded.ciphertext,
+                               updated_at=excluded.updated_at",
+                rusqlite::params![uid, key, nonce, ct, now],
+            )
+            .map_err(db_err)?;
+            secret_set = true;
+        }
+    }
+    Ok(Json(UserProvisionResp {
+        username,
+        created,
+        secret_set,
     }))
 }
 
