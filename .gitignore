@@ -25,9 +25,10 @@ target
 
 /target
 
-# Frontend build artifacts & deps (managed by bun)
+# Frontend deps (managed by bun)
 /web/node_modules
-/web/dist
+# 注意：web/dist 不再忽略——它是 rust-embed 嵌入二进制的前端构建产物，
+# 必须随 `cargo publish` 一起打包（cargo 基于 git 选择文件，忽略的文件不会进包）。
 *.tsbuildinfo
 
 # Runtime data
