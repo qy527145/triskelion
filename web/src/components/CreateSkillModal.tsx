@@ -1,7 +1,12 @@
 import { useState } from "react";
 import Modal from "./Modal";
 import { api } from "../lib/api";
-import { SKILL_CATEGORIES, type SkillCategory, type SkillManifest } from "../lib/types";
+import {
+  SKILL_CATEGORIES,
+  type SkillCategory,
+  type SkillInfo,
+  type SkillManifest,
+} from "../lib/types";
 
 const inputCls =
   "w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-500/10";
@@ -31,21 +36,26 @@ function parseList(text: string): string[] {
 }
 
 export default function CreateSkillModal({
+  edit,
   onClose,
   onSaved,
 }: {
+  edit?: SkillInfo | null;
   onClose: () => void;
   onSaved: (name: string) => void;
 }) {
-  const [name, setName] = useState("");
-  const [version, setVersion] = useState("0.1.0");
-  const [category, setCategory] = useState<SkillCategory>("skill");
-  const [description, setDescription] = useState("");
-  const [tags, setTags] = useState("");
-  const [mcpDeps, setMcpDeps] = useState("");
-  const [preferred, setPreferred] = useState("");
-  const [skillMd, setSkillMd] = useState(SKILL_TEMPLATE);
-  const [visibility, setVisibility] = useState("private");
+  const editing = !!edit;
+  const [name, setName] = useState(edit?.name ?? "");
+  const [version, setVersion] = useState(edit?.version ?? "0.1.0");
+  const [category, setCategory] = useState<SkillCategory>(
+    (edit?.category as SkillCategory) ?? "skill",
+  );
+  const [description, setDescription] = useState(edit?.description ?? "");
+  const [tags, setTags] = useState((edit?.tags ?? []).join(", "));
+  const [mcpDeps, setMcpDeps] = useState((edit?.mcp_dependencies ?? []).join(", "));
+  const [preferred, setPreferred] = useState((edit?.preferred_tools ?? []).join(", "));
+  const [skillMd, setSkillMd] = useState(edit?.skill_md ?? SKILL_TEMPLATE);
+  const [visibility, setVisibility] = useState(edit?.visibility ?? "private");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -65,6 +75,10 @@ export default function CreateSkillModal({
     };
     setBusy(true);
     try {
+      // 编辑时若改了名称，先重命名再覆盖其余字段（保留已上传的压缩体）。
+      if (editing && edit && name.trim() !== edit.name) {
+        await api.renameSkill(edit.owner, edit.name, name.trim());
+      }
       await api.upsertSkill(manifest, visibility, skillMd);
       onSaved(name.trim());
     } catch (e) {
@@ -76,8 +90,12 @@ export default function CreateSkillModal({
 
   return (
     <Modal
-      title="新建技能（纯文本）"
-      subtitle="在 Web 端直接创建一份裸说明书技能。需要打包大文件夹时请用 tsk skill publish。"
+      title={editing ? "编辑技能" : "新建技能（纯文本）"}
+      subtitle={
+        editing
+          ? "修改技能的基础信息与 SKILL.md。已上传的压缩体保持不变。"
+          : "在 Web 端直接创建一份裸说明书技能。需要打包大文件夹时请用 tsk skill publish。"
+      }
       onClose={onClose}
       wide
       footer={
@@ -93,7 +111,7 @@ export default function CreateSkillModal({
             disabled={busy}
             className="rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white hover:bg-indigo-600 disabled:opacity-60"
           >
-            {busy ? "保存中…" : "创建"}
+            {busy ? "保存中…" : editing ? "保存" : "创建"}
           </button>
         </>
       }
@@ -108,6 +126,11 @@ export default function CreateSkillModal({
               placeholder="shield-dev-pack"
               onChange={(e) => setName(e.target.value)}
             />
+            {editing && edit && name.trim() !== edit.name && (
+              <p className="mt-1.5 text-xs text-amber-600">
+                将重命名 {edit.name} → {name.trim() || "?"}（旧的 owner/name 引用会失效）
+              </p>
+            )}
           </div>
           <div>
             <label className={labelCls}>版本</label>

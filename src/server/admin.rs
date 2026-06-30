@@ -10,7 +10,7 @@
 //! 寻址的全部压缩体 blob。凭据以「nonce + 密文」原样承载，迁移目标须共用同一
 //! `master.key`（或 `TRISKELION_MASTER_KEY`）方可解密。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::archive::ZSTD_LEVEL;
+use crate::shared::{McpManifest, Protocol, Runtime, SKILL_CATEGORIES};
 
 use super::auth;
 use super::error::ApiError;
@@ -316,10 +317,35 @@ pub struct AdminSkill {
     group_visibility: String,
     version: String,
     description: String,
+    tags: Vec<String>,
+    skill_md: String,
+    mcp_dependencies: Vec<String>,
+    preferred_tools: Vec<String>,
     archive_size: i64,
     has_archive: bool,
     labels: Vec<LabelBrief>,
     updated_at: String,
+}
+
+/// 技能 `metadata` 列里 JSON 承载的扩展字段（与 [`super::skills`] 中的同名结构对齐）。
+#[derive(Serialize, Deserialize, Default)]
+struct SkillMeta {
+    #[serde(default)]
+    mcp_dependencies: Vec<String>,
+    #[serde(default)]
+    preferred_tools: Vec<String>,
+}
+
+/// 标签归一化：去空白、转小写、去重（与 [`super::skills`] 的 `lower_tags` 对齐）。
+fn lower_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t = t.trim().to_lowercase();
+        if !t.is_empty() && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 #[derive(Serialize, Clone)]
@@ -361,7 +387,8 @@ pub async fn skills_all(
     let mut stmt = conn
         .prepare(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
-                    s.archive_size, s.archive_sha256, s.updated_at, s.group_visibility, s.id
+                    s.archive_size, s.archive_sha256, s.updated_at, s.group_visibility, s.id,
+                    s.tags, s.skill_md, s.metadata
              FROM skills s JOIN users u ON u.id = s.owner_id
              ORDER BY s.updated_at DESC, s.name",
         )
@@ -369,6 +396,10 @@ pub async fn skills_all(
     let rows = stmt
         .query_map([], |r| {
             let sha: String = r.get(7)?;
+            let tags_json: String = r.get(11)?;
+            let meta_json: String = r.get(13)?;
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            let meta: SkillMeta = serde_json::from_str(&meta_json).unwrap_or_default();
             Ok((
                 AdminSkill {
                     owner: r.get(0)?,
@@ -381,6 +412,10 @@ pub async fn skills_all(
                     has_archive: !sha.is_empty(),
                     updated_at: r.get(8)?,
                     group_visibility: r.get(9)?,
+                    tags,
+                    skill_md: r.get(12)?,
+                    mcp_dependencies: meta.mcp_dependencies,
+                    preferred_tools: meta.preferred_tools,
                     labels: Vec::new(),
                 },
                 r.get::<_, i64>(10)?,
@@ -405,6 +440,7 @@ pub struct AdminMcp {
     version: String,
     runtime: String,
     protocol: String,
+    manifest: McpManifest,
     labels: Vec<LabelBrief>,
     updated_at: String,
 }
@@ -439,26 +475,31 @@ pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Ad
     for row in rows {
         let (owner, name, visibility, version, manifest_json, updated_at, group_visibility, id) =
             row.map_err(db_err)?;
-        // 仅取运行拓扑用于展示，损坏的 manifest 不致整表失败。
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_json).unwrap_or_default();
-        let runtime = manifest
-            .get("runtime")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let protocol = manifest
-            .get("protocol")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
+        // 解析完整 manifest；损坏时回退到一个由已知列拼出的最小可编辑 manifest，
+        // 避免单条坏数据拖垮整表，也保证前端编辑表单总有结构可填。
+        let manifest: McpManifest = serde_json::from_str(&manifest_json).unwrap_or_else(|_| {
+            McpManifest {
+                resource_type: "mcp".into(),
+                name: name.clone(),
+                description: String::new(),
+                version: version.clone(),
+                runtime: Runtime::Remote,
+                protocol: Protocol::Streamable,
+                url: None,
+                command: None,
+                env: BTreeMap::new(),
+                headers: BTreeMap::new(),
+            }
+        });
         out.push(AdminMcp {
             owner,
             name,
             visibility,
             group_visibility,
             version,
-            runtime,
-            protocol,
+            runtime: manifest.runtime.as_str().to_string(),
+            protocol: manifest.protocol.as_str().to_string(),
+            manifest,
             labels: label_map.remove(&id).unwrap_or_default(),
             updated_at,
         });
@@ -983,6 +1024,31 @@ pub struct ResourcePatch {
     /// 提供则整体覆盖该资源的受管标签（空数组=清空）；缺省则不改动。
     #[serde(default)]
     label_ids: Option<Vec<i64>>,
+    // --- 内容编辑（管理员）。每个字段缺省则不改动对应内容 ---
+    /// 版本号（技能 / MCP 通用）。
+    #[serde(default)]
+    version: Option<String>,
+    /// 技能：逻辑分类 skill / kb / toolchain。
+    #[serde(default)]
+    category: Option<String>,
+    /// 技能：一句话描述。
+    #[serde(default)]
+    description: Option<String>,
+    /// 技能：自由标签。
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    /// 技能：SKILL.md 正文。
+    #[serde(default)]
+    skill_md: Option<String>,
+    /// 技能：依赖的底层 MCP。
+    #[serde(default)]
+    mcp_dependencies: Option<Vec<String>>,
+    /// 技能：倾向优先使用的工具。
+    #[serde(default)]
+    preferred_tools: Option<Vec<String>>,
+    /// MCP：完整运行清单（覆盖式更新；name 始终锁定为路径名，不在此重命名）。
+    #[serde(default)]
+    manifest: Option<McpManifest>,
 }
 
 /// 整体覆盖某资源的受管标签：先清空再按给定 id 集重建（去重、校验标签存在）。
@@ -1078,6 +1144,77 @@ pub async fn skill_update(
         )
         .map_err(db_err)?;
     }
+    // 内容编辑：分类 / 版本 / 描述 / 标签 / SKILL.md / 依赖与倾向工具。
+    if let Some(cat) = req.category.as_deref() {
+        if !SKILL_CATEGORIES.contains(&cat) {
+            return Err(ApiError::bad_request(format!(
+                "category 只能是 {}",
+                SKILL_CATEGORIES.join(" / ")
+            )));
+        }
+        conn.execute(
+            "UPDATE skills SET category = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![cat, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(ver) = req.version.as_deref() {
+        conn.execute(
+            "UPDATE skills SET version = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![ver, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(desc) = req.description.as_deref() {
+        conn.execute(
+            "UPDATE skills SET description = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![desc, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(tags) = &req.tags {
+        let tags_json = serde_json::to_string(&lower_tags(tags))
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE skills SET tags = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![tags_json, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(md) = req.skill_md.as_deref() {
+        conn.execute(
+            "UPDATE skills SET skill_md = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![md, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    // metadata 列同时承载 mcp_dependencies 与 preferred_tools：读-改-写，缺省字段保留旧值。
+    if req.mcp_dependencies.is_some() || req.preferred_tools.is_some() {
+        let meta_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM skills WHERE owner_id = ?1 AND name = ?2",
+                rusqlite::params![oid, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let mut meta: SkillMeta = meta_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        if let Some(deps) = &req.mcp_dependencies {
+            meta.mcp_dependencies = deps.clone();
+        }
+        if let Some(tools) = &req.preferred_tools {
+            meta.preferred_tools = tools.clone();
+        }
+        let new_meta = serde_json::to_string(&meta).map_err(|e| ApiError::internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE skills SET metadata = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![new_meta, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
     if let Some(gv) = &req.group_visibility {
         let stored = normalize_group_vis(gv)?;
         conn.execute(
@@ -1137,6 +1274,28 @@ pub async fn mcp_update(
         conn.execute(
             "UPDATE mcps SET visibility = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
             rusqlite::params![vis, now, oid, name],
+        )
+        .map_err(db_err)?;
+    }
+    // 内容编辑：覆盖式更新运行清单。name 锁定为路径名（管理面板不在此重命名，
+    // 以免 owner/name 引用失效），version 随 manifest 同步。
+    if let Some(mut manifest) = req.manifest.clone() {
+        manifest.name = name.clone();
+        match manifest.runtime {
+            Runtime::Remote if manifest.url.as_deref().unwrap_or("").is_empty() => {
+                return Err(ApiError::bad_request("remote 运行时必须提供 url"));
+            }
+            Runtime::Local if manifest.command.as_deref().unwrap_or("").is_empty() => {
+                return Err(ApiError::bad_request("local 运行时必须提供 command"));
+            }
+            _ => {}
+        }
+        let manifest_json =
+            serde_json::to_string(&manifest).map_err(|e| ApiError::internal(e.to_string()))?;
+        conn.execute(
+            "UPDATE mcps SET manifest = ?1, version = ?2, updated_at = ?3
+             WHERE owner_id = ?4 AND name = ?5",
+            rusqlite::params![manifest_json, manifest.version, now, oid, name],
         )
         .map_err(db_err)?;
     }

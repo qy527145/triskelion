@@ -40,7 +40,7 @@ export default function App() {
 
   const [showLogin, setShowLogin] = useState(false);
   const [mcpModal, setMcpModal] = useState<{ edit: McpInfo | null } | null>(null);
-  const [skillModal, setSkillModal] = useState(false);
+  const [skillModal, setSkillModal] = useState<{ edit: SkillInfo | null } | null>(null);
   const [detail, setDetail] = useState<McpInfo | null>(null);
   const [skillDetail, setSkillDetail] = useState<SkillInfo | null>(null);
   const [secretEdit, setSecretEdit] = useState<{ key: string | null } | null>(null);
@@ -198,7 +198,7 @@ export default function App() {
           )}
           {tab === "skill-mine" && (
             <button
-              onClick={() => setSkillModal(true)}
+              onClick={() => setSkillModal({ edit: null })}
               className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-600"
             >
               <PlusIcon /> 新建技能
@@ -323,6 +323,7 @@ export default function App() {
                     s={s}
                     mine={tab === "skill-mine"}
                     onDetail={() => setSkillDetail(s)}
+                    onEdit={() => setSkillModal({ edit: s })}
                     onDelete={() => deleteSkill(s)}
                   />
                 ))}
@@ -366,10 +367,12 @@ export default function App() {
       )}
       {skillModal && (
         <CreateSkillModal
-          onClose={() => setSkillModal(false)}
+          edit={skillModal.edit}
+          onClose={() => setSkillModal(null)}
           onSaved={(name) => {
-            setSkillModal(false);
-            notify("已创建 " + name);
+            const editing = !!skillModal.edit;
+            setSkillModal(null);
+            notify(editing ? "已更新 " + name : "已创建 " + name);
             load();
           }}
         />
