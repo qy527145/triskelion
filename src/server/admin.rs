@@ -25,10 +25,13 @@ use base64::Engine;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
+use rand::RngCore;
+
 use crate::archive::ZSTD_LEVEL;
-use crate::shared::{McpManifest, Protocol, Runtime, SKILL_CATEGORIES};
+use crate::shared::{McpManifest, Protocol, Runtime, SKILL_CATEGORIES, ToolMeta};
 
 use super::auth;
+use super::crypto;
 use super::error::ApiError;
 use super::routes::{db_err, now_string, now_unix};
 use super::skills;
@@ -1436,6 +1439,207 @@ pub async fn mcp_delete(
         return Err(ApiError::not_found("未找到该 MCP"));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// 外部系统注入：注册 MCP / 批量分发用户变量（供 aiko_hub 等上游推送）
+// ---------------------------------------------------------------------------
+
+/// 生成一个随机不可登录的口令哈希，供自动创建的占位用户使用。
+fn random_password_hash() -> Result<String, ApiError> {
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    auth::hash_password(&hex).map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// 取用户 id；不存在则按用户名自动创建（随机不可登录口令）。
+/// 调用方须先校验用户名合法。
+fn ensure_user(conn: &rusqlite::Connection, username: &str) -> Result<i64, ApiError> {
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            [username],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(db_err)?
+    {
+        return Ok(id);
+    }
+    let hash = random_password_hash()?;
+    conn.execute(
+        "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![username, hash, now_string()],
+    )
+    .map_err(db_err)?;
+    Ok(conn.last_insert_rowid())
+}
+
+#[derive(Deserialize)]
+pub struct AdminMcpRegisterReq {
+    /// MCP 归属账号名（不存在则自动创建）。
+    owner: String,
+    manifest: McpManifest,
+    /// private / public；默认 public。
+    #[serde(default)]
+    visibility: Option<String>,
+    /// "all" 或分组 id 数组；默认 all。
+    #[serde(default)]
+    group_visibility: Option<serde_json::Value>,
+    /// 可选工具清单，供市场检索 / 展示。
+    #[serde(default)]
+    tools: Option<Vec<ToolMeta>>,
+}
+
+/// 管理员注册 / 覆盖一条 MCP（按 (owner, name) 自然键 upsert）。供外部系统统一注入。
+pub async fn mcp_register(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<AdminMcpRegisterReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let owner = req.owner.trim().to_string();
+    if !super::routes::is_valid_username(&owner) {
+        return Err(ApiError::bad_request(
+            "owner 用户名仅允许字母、数字、_、-，且长度 1..=64",
+        ));
+    }
+    let manifest = req.manifest;
+    if manifest.name.trim().is_empty() {
+        return Err(ApiError::bad_request("manifest.name 不能为空"));
+    }
+    match manifest.runtime {
+        Runtime::Remote if manifest.url.as_deref().unwrap_or("").is_empty() => {
+            return Err(ApiError::bad_request("remote 运行时必须提供 url"));
+        }
+        Runtime::Local if manifest.command.as_deref().unwrap_or("").is_empty() => {
+            return Err(ApiError::bad_request("local 运行时必须提供 command"));
+        }
+        _ => {}
+    }
+    let visibility = match req.visibility.as_deref().unwrap_or("public") {
+        v @ ("private" | "public") => v.to_string(),
+        _ => return Err(ApiError::bad_request("visibility 只能是 private 或 public")),
+    };
+    let group_vis = match &req.group_visibility {
+        Some(v) => normalize_group_vis(v)?,
+        None => "all".to_string(),
+    };
+    let manifest_json =
+        serde_json::to_string(&manifest).map_err(|e| ApiError::internal(e.to_string()))?;
+    let tools_json = match &req.tools {
+        Some(tools) => {
+            Some(serde_json::to_string(tools).map_err(|e| ApiError::internal(e.to_string()))?)
+        }
+        None => None,
+    };
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let oid = ensure_user(&conn, &owner)?;
+    conn.execute(
+        "INSERT INTO mcps(owner_id, name, visibility, group_visibility, version, manifest, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(owner_id, name)
+         DO UPDATE SET visibility=excluded.visibility, group_visibility=excluded.group_visibility,
+                       version=excluded.version, manifest=excluded.manifest,
+                       updated_at=excluded.updated_at",
+        rusqlite::params![
+            oid,
+            manifest.name,
+            visibility,
+            group_vis,
+            manifest.version,
+            manifest_json,
+            now
+        ],
+    )
+    .map_err(db_err)?;
+    // tools 单独维护：仅当显式传入时覆盖（插入默认 '[]'，更新时不动旧值）。
+    if let Some(tools_json) = tools_json {
+        conn.execute(
+            "UPDATE mcps SET tools = ?1 WHERE owner_id = ?2 AND name = ?3",
+            rusqlite::params![tools_json, oid, manifest.name],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(Json(serde_json::json!({
+        "owner": owner,
+        "name": manifest.name,
+        "visibility": visibility,
+        "updated_at": now,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct SecretEntry {
+    username: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+pub struct SecretDistributeReq {
+    key: String,
+    entries: Vec<SecretEntry>,
+}
+
+#[derive(Serialize)]
+pub struct SecretDistributeResp {
+    applied: usize,
+    created_users: Vec<String>,
+    skipped: Vec<String>,
+}
+
+/// 批量为多个用户写同一变量（按 (owner, key) upsert，缺失用户自动创建）。供外部系统分发用户 KEY。
+pub async fn secrets_distribute(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<SecretDistributeReq>,
+) -> Result<Json<SecretDistributeResp>, ApiError> {
+    require_admin(&state, &headers)?;
+    let key = req.key.trim().to_string();
+    if key.is_empty() {
+        return Err(ApiError::bad_request("变量名不能为空"));
+    }
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let mut applied = 0usize;
+    let mut created_users = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in &req.entries {
+        let username = entry.username.trim();
+        if !super::routes::is_valid_username(username) {
+            skipped.push(format!("{username}（用户名非法）"));
+            continue;
+        }
+        let existed: bool = conn
+            .query_row("SELECT 1 FROM users WHERE username = ?1", [username], |_| {
+                Ok(true)
+            })
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        let oid = ensure_user(&conn, username)?;
+        if !existed {
+            created_users.push(username.to_string());
+        }
+        let (nonce, ct) = crypto::encrypt(&state.master_key, &entry.value)?;
+        conn.execute(
+            "INSERT INTO secrets(owner_id, key, nonce, ciphertext, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(owner_id, key)
+             DO UPDATE SET nonce=excluded.nonce, ciphertext=excluded.ciphertext,
+                           updated_at=excluded.updated_at",
+            rusqlite::params![oid, key, nonce, ct, now],
+        )
+        .map_err(db_err)?;
+        applied += 1;
+    }
+    Ok(Json(SecretDistributeResp {
+        applied,
+        created_users,
+        skipped,
+    }))
 }
 
 // ---------------------------------------------------------------------------
