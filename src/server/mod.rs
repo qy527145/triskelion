@@ -5,6 +5,7 @@
 //! 持久化用 SQLite（rusqlite，bundled）。
 
 mod auth;
+mod admin;
 mod crypto;
 mod db;
 mod error;
@@ -27,6 +28,8 @@ pub struct AppState {
     pub master_key: [u8; 32],
     /// 技能包压缩体落盘目录（按 sha256 内容寻址）。
     pub blobs_dir: PathBuf,
+    /// 管理后台令牌（取自 `ADMIN_TOKEN` 环境变量）。为 None 时管理后台 API 禁用。
+    pub admin_token: Option<String>,
 }
 
 /// 启动 Hub。自建多线程 tokio runtime 并阻塞，bin 侧保持同步 main。
@@ -64,11 +67,18 @@ pub fn run() -> Result<()> {
     std::fs::create_dir_all(&blobs_dir)
         .with_context(|| format!("创建技能包目录 {}", blobs_dir.display()))?;
 
+    // 管理后台令牌：仅当设置了 ADMIN_TOKEN 才启用 /v1/admin 接口。
+    let admin_token = std::env::var("ADMIN_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         jwt_secret,
         master_key,
         blobs_dir,
+        admin_token,
     });
 
     let bind = std::env::var("TRISKELION_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
@@ -79,6 +89,7 @@ pub fn run() -> Result<()> {
         .context("构建 tokio runtime")?;
 
     rt.block_on(async move {
+        let admin_enabled = state.admin_token.is_some();
         let app = routes::router(state);
         let listener = tokio::net::TcpListener::bind(&bind)
             .await
@@ -86,6 +97,11 @@ pub fn run() -> Result<()> {
         let local = listener.local_addr()?;
         println!("triskelion hub listening on http://{local}");
         println!("  data dir: {}", data_dir.display());
+        if admin_enabled {
+            println!("  admin panel: enabled (ADMIN_TOKEN set) → http://{local}/#admin");
+        } else {
+            println!("  admin panel: disabled (set ADMIN_TOKEN to enable)");
+        }
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await

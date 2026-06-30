@@ -9,6 +9,10 @@
 
 pub mod shared;
 
+/// 压缩体格式探测与压缩参数（zstd 升级 + gzip 向后兼容），client / server 双侧复用。
+#[cfg(any(feature = "client", feature = "server"))]
+pub mod archive;
+
 /// MCP 传输层，client / server 双侧按需复用。
 #[cfg(any(feature = "client", feature = "server"))]
 pub mod mcp;

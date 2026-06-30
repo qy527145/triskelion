@@ -1,17 +1,15 @@
 //! `tsk skill`：技能包的本地打包（build）、发布（publish）、检索（search）、
 //! 拉取（pull）与查看。技能包是一个文件夹，必须含 `SKILL.md`；元数据放在
-//! `tsk-skill.json`。发布前由 `tsk build` 打成 tar.gz 压缩体，服务端只收元数据
+//! `tsk-skill.json`。发布前由 `tsk build` 打成 tar.zst 压缩体（zstd），服务端只收元数据
 //! 与 SKILL.md，庞大的数据体以压缩包形式承载。
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use sha2::{Digest, Sha256};
 
+use crate::archive::{self, Format, ZSTD_LEVEL};
 use crate::shared::{SkillInfo, SkillManifest, SKILL_CATEGORIES};
 
 use super::api::HubClient;
@@ -102,7 +100,7 @@ tsk run alice/github-inspector create_issue --title \"...\" --body \"...\"\n\
 }
 
 // ---------------------------------------------------------------------------
-// build：打包成 tar.gz
+// build：打包成 tar.zst
 // ---------------------------------------------------------------------------
 
 /// 一次构建的产物。
@@ -147,15 +145,22 @@ pub fn build(dir: &Path) -> Result<Build> {
         bail!("打包后未包含 {SKILL_MD}（被忽略规则排除了？）");
     }
 
-    // tar -> gzip。
-    let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+    // tar -> zstd（高压缩比、解压快；大包用多线程编码摊薄耗时）。
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), ZSTD_LEVEL)
+        .context("初始化 zstd 编码器")?;
+    // 多线程编码：失败（如未编入 MT 支持）则回退单线程，不影响产物正确性。
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    let _ = encoder.multithread(workers);
+    let mut tar = tar::Builder::new(encoder);
     for rel in &files {
         let full = dir.join(rel);
         tar.append_path_with_name(&full, rel)
             .with_context(|| format!("打包 {}", full.display()))?;
     }
-    let gz = tar.into_inner().context("收尾 tar")?;
-    let archive = gz.finish().context("收尾 gzip")?;
+    let encoder = tar.into_inner().context("收尾 tar")?;
+    let archive = encoder.finish().context("收尾 zstd")?;
 
     let sha256 = sha256_hex(&archive);
     let size = archive.len() as u64;
@@ -163,7 +168,7 @@ pub fn build(dir: &Path) -> Result<Build> {
     let build_dir = dir.join(BUILD_DIR);
     std::fs::create_dir_all(&build_dir)
         .with_context(|| format!("创建 {}", build_dir.display()))?;
-    let out_path = build_dir.join(format!("{}-{}.tar.gz", manifest.name, manifest.version));
+    let out_path = build_dir.join(format!("{}-{}.tar.zst", manifest.name, manifest.version));
     std::fs::write(&out_path, &archive)
         .with_context(|| format!("写入 {}", out_path.display()))?;
 
@@ -334,9 +339,7 @@ pub fn pull(package: &str, dir: Option<PathBuf>) -> Result<()> {
         if got != s.archive_sha256 {
             bail!("压缩体校验失败：期望 {} 实得 {got}", s.archive_sha256);
         }
-        let dec = GzDecoder::new(&bytes[..]);
-        let mut ar = tar::Archive::new(dec);
-        ar.unpack(&target)
+        unpack_archive(&bytes, &target)
             .with_context(|| format!("解压到 {}", target.display()))?;
     } else {
         // 纯文本裸说明书包：服务端只有 SKILL.md。
@@ -360,6 +363,25 @@ pub fn pull(package: &str, dir: Option<PathBuf>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// 解压 tar 压缩体到目标目录，按魔数自动识别 zstd（新）或 gzip（历史遗留）。
+fn unpack_archive(bytes: &[u8], target: &Path) -> Result<()> {
+    match archive::detect(bytes) {
+        Format::Zstd => {
+            let dec = zstd::stream::Decoder::new(bytes).context("初始化 zstd 解码器")?;
+            tar::Archive::new(dec).unpack(target)?;
+        }
+        Format::Gzip => {
+            let dec = flate2::read::GzDecoder::new(bytes);
+            tar::Archive::new(dec).unpack(target)?;
+        }
+        Format::Unknown => {
+            // 兜底：可能是未压缩的裸 tar，尝试直接解包。
+            tar::Archive::new(bytes).unpack(target)?;
+        }
+    }
+    Ok(())
+}
 
 fn load_manifest(dir: &Path) -> Result<SkillManifest> {
     let path = dir.join(MANIFEST);

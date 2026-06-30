@@ -280,11 +280,11 @@ impl HubClient {
         Self::parse(resp)
     }
 
-    /// 上传技能压缩体（tar.gz 原始字节）。
+    /// 上传技能压缩体（tar.zst 原始字节）。
     pub fn skill_archive_put(&self, owner: &str, name: &str, bytes: Vec<u8>) -> Result<(), HubError> {
         let resp = self
             .auth(self.http.put(self.url(&format!("/v1/skill/{owner}/{name}/archive"))))
-            .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+            .header(reqwest::header::CONTENT_TYPE, "application/zstd")
             .body(bytes)
             .send()
             .map_err(HubError::transport)?;
@@ -292,7 +292,7 @@ impl HubClient {
         Ok(())
     }
 
-    /// 下载技能压缩体（tar.gz 原始字节）。
+    /// 下载技能压缩体（tar.zst 原始字节，旧包可能仍为 gzip）。
     pub fn skill_archive_get(&self, owner: &str, name: &str) -> Result<Vec<u8>, HubError> {
         let resp = self
             .auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}/archive"))))

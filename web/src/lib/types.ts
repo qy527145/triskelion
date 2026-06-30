@@ -98,6 +98,79 @@ export function humanSize(n: number): string {
   return i === 0 ? `${n} B` : `${f.toFixed(1)} ${u[i]}`;
 }
 
+// --------------------------------------------------------------------------
+// 管理后台（admin）
+// --------------------------------------------------------------------------
+
+export interface AdminStats {
+  users: number;
+  skills: number;
+  skills_public: number;
+  mcps: number;
+  mcps_public: number;
+  secrets: number;
+  blobs: number;
+  blobs_bytes: number;
+  calls_total: number;
+  calls_24h: number;
+  calls_errors_24h: number;
+  top_tools: { tool: string; count: number }[];
+  recent_errors: { tool: string; caller: string; error: string; at: string }[];
+  admin_enabled: boolean;
+  generated_at: string;
+}
+
+export interface AdminUser {
+  username: string;
+  created_at: string;
+  skills: number;
+  mcps: number;
+  secrets: number;
+}
+
+export interface AdminSkill {
+  owner: string;
+  name: string;
+  category: string;
+  visibility: string;
+  version: string;
+  description: string;
+  archive_size: number;
+  has_archive: boolean;
+  updated_at: string;
+}
+
+export interface AdminMcp {
+  owner: string;
+  name: string;
+  visibility: string;
+  version: string;
+  runtime: string;
+  protocol: string;
+  updated_at: string;
+}
+
+export interface CallLog {
+  caller: string;
+  owner: string;
+  mcp_name: string;
+  tool: string;
+  ok: boolean;
+  error: string;
+  ms: number;
+  created_at: string;
+}
+
+export interface ImportSummary {
+  users: number;
+  mcps: number;
+  skills: number;
+  secrets: number;
+  calls: number;
+  blobs: number;
+  skipped: string[];
+}
+
 /** 扫描清单里的 {VAR} 占位符（与服务端 required_vars 等价）。 */
 export function requiredVars(m: McpManifest): string[] {
   const found: string[] = [];
