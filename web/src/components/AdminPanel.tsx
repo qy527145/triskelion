@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { admin, ApiError } from "../lib/api";
-import { humanSize, parseGroupVisibility, SKILL_CATEGORIES } from "../lib/types";
+import { docFilename, humanSize, parseGroupVisibility, SKILL_CATEGORIES } from "../lib/types";
 import type {
   AdminGroup,
   AdminLabel,
@@ -940,9 +940,12 @@ function AdminSkillEditModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  // 说明书文件名随分类而定：agent → AGENT.md，其余 → SKILL.md。
+  const doc = docFilename(category);
+
   async function save() {
     if (!skillMd.trim()) {
-      setError("SKILL.md 不能为空");
+      setError(`${doc} 不能为空`);
       return;
     }
     setBusy(true);
@@ -1022,7 +1025,7 @@ function AdminSkillEditModal({
           <input className={inputCls} value={preferred} onChange={(e) => setPreferred(e.target.value)} />
         </div>
         <div>
-          <label className={adminLabelCls}>SKILL.md</label>
+          <label className={adminLabelCls}>{doc}</label>
           <textarea
             className={`${inputCls} min-h-[180px] resize-y font-mono text-xs leading-relaxed`}
             value={skillMd}
@@ -1031,7 +1034,7 @@ function AdminSkillEditModal({
         </div>
         {skill.has_archive && (
           <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
-            该技能含压缩体：此处仅改写元数据与展示用的 SKILL.md，压缩包内文件不变。
+            该技能含压缩体：此处仅改写元数据与展示用的 {doc}，压缩包内文件不变。
           </p>
         )}
         <ModalError error={error} />

@@ -49,16 +49,25 @@ export interface SecretInfo {
 // --------------------------------------------------------------------------
 
 /** 逻辑分类：万物皆 Skill，category 仅是分类标签。 */
-export type SkillCategory = "skill" | "kb" | "toolchain";
+export type SkillCategory = "skill" | "kb" | "toolchain" | "agent";
 
 export const SKILL_CATEGORIES: { id: SkillCategory; label: string }[] = [
   { id: "skill", label: "技能" },
   { id: "kb", label: "知识库" },
   { id: "toolchain", label: "工具链" },
+  { id: "agent", label: "Agent" },
 ];
 
 export function categoryLabel(c: string): string {
   return SKILL_CATEGORIES.find((x) => x.id === c)?.label ?? c;
+}
+
+/**
+ * 该分类对应的「能力说明书」文件名。agent 分类用 AGENT.md，其余用 SKILL.md。
+ * 服务端始终以 skill_md 字段承载其全文，文件名仅用于市场展示与本地打包。
+ */
+export function docFilename(category: string): string {
+  return category === "agent" ? "AGENT.md" : "SKILL.md";
 }
 
 /** 受管标签的徽章配色：官方=金、社区=天蓝、其余=靛蓝。 */

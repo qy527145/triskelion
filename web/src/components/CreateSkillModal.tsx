@@ -2,6 +2,7 @@ import { useState } from "react";
 import Modal from "./Modal";
 import { api } from "../lib/api";
 import {
+  docFilename,
   SKILL_CATEGORIES,
   type SkillCategory,
   type SkillInfo,
@@ -59,11 +60,14 @@ export default function CreateSkillModal({
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // 说明书文件名随分类而定：agent → AGENT.md，其余 → SKILL.md。
+  const doc = docFilename(category);
+
   async function submit() {
     setErr("");
     if (!name.trim()) return setErr("请填写技能名");
     if (!/^[A-Za-z0-9_.-]+$/.test(name.trim())) return setErr("技能名仅允许字母/数字/_-.");
-    if (!skillMd.trim()) return setErr("请填写 SKILL.md 内容");
+    if (!skillMd.trim()) return setErr(`请填写 ${doc} 内容`);
     const manifest: SkillManifest = {
       name: name.trim(),
       version: version.trim() || "0.1.0",
@@ -93,7 +97,7 @@ export default function CreateSkillModal({
       title={editing ? "编辑技能" : "新建技能（纯文本）"}
       subtitle={
         editing
-          ? "修改技能的基础信息与 SKILL.md。已上传的压缩体保持不变。"
+          ? `修改技能的基础信息与 ${doc}。已上传的压缩体保持不变。`
           : "在 Web 端直接创建一份裸说明书技能。需要打包大文件夹时请用 tsk skill publish。"
       }
       onClose={onClose}
@@ -199,7 +203,7 @@ export default function CreateSkillModal({
           />
         </div>
         <div>
-          <label className={labelCls}>SKILL.md</label>
+          <label className={labelCls}>{doc}</label>
           <textarea
             className={`${inputCls} min-h-[180px] resize-y font-mono text-xs leading-relaxed`}
             value={skillMd}

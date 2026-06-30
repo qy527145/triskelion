@@ -83,6 +83,12 @@ export const WrenchIcon = (p: P) => (
     <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2-2 2.6-2.6z" />
   </svg>
 );
+export const BotIcon = (p: P) => (
+  <svg {...base(p)}>
+    <rect width="16" height="11" x="4" y="9" rx="2" />
+    <path d="M12 3v3M8 16h.01M16 16h.01M2 13v2M22 13v2" />
+  </svg>
+);
 export const DownloadIcon = (p: P) => (
   <svg {...base(p)}>
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />

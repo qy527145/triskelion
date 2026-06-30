@@ -2,17 +2,17 @@
 
 Welcome to the Triskelion. Equip your AI Agents with tactical Skills, localized Knowledge Intel, and bulletproof CLI tools.
 
-万物皆 **Skill**：技能（skill）、知识库（kb）、工具链（toolchain）只是逻辑分类标签，底层共用同一数据结构。Agent 初始化时只读几百 Token 的精简 `SKILL.md`，需要动作时才用 `tsk` 触发底层 MCP。
+万物皆 **Skill**：技能（skill）、知识库（kb）、工具链（toolchain）、Agent（agent）只是逻辑分类标签，底层共用同一数据结构。Agent 初始化时只读几百 Token 的精简说明书（`agent` 分类用 `AGENT.md`，其余用 `SKILL.md`），需要动作时才用 `tsk` 触发底层 MCP。
 
 ## 两个市场
 
-- **技能市场（Skill）** —— 平台首页。技能包是一个文件夹（必须含 `SKILL.md`），发布前由 `tsk build` 打成 `tar.zst`。服务端只持元数据 + `SKILL.md` 文本，庞大的数据体以压缩包形式按 sha256 内容寻址承载。支持按分类、标签、关键字检索。
+- **技能市场（Skill）** —— 平台首页。技能包是一个文件夹（必须含说明书：`agent` 分类为 `AGENT.md`，其余为 `SKILL.md`），发布前由 `tsk build` 打成 `tar.zst`。服务端只持元数据 + 说明书文本，庞大的数据体以压缩包形式按 sha256 内容寻址承载。支持按分类、标签、关键字检索。
 - **MCP 市场** —— 注册可被 `tsk run` 当 CLI 调用的 MCP 工具，声明运行拓扑（local / remote）与所需 `{VAR}` 变量。
 
 ## 技能全生命周期（tsk）
 
 ```bash
-# 1) 脚手架：生成 SKILL.md + tsk-skill.json
+# 1) 脚手架：生成 SKILL.md + tsk-skill.json（Agent 用 tsk skill init --category agent，生成 AGENT.md）
 tsk skill init my-skill && cd my-skill
 
 # 2) 本地打包校验（产出 .tsk/dist/<name>-<version>.tar.gz）
@@ -34,7 +34,7 @@ tsk skill list                        # 名下全部技能（含私有）
 {
   "name": "shield-dev-pack",
   "version": "1.0.0",
-  "category": "toolchain",            // skill | kb | toolchain
+  "category": "toolchain",            // skill | kb | toolchain | agent
   "description": "盾局开发工具链",
   "tags": ["github", "ci"],
   "mcp_dependencies": ["alice/github-inspector"],   // 依赖的底层 MCP
