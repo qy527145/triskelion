@@ -42,14 +42,20 @@ fn main() {
     let has_modules = web.join("node_modules").is_dir();
 
     if !web.join("package.json").exists() {
-        ensure_placeholder(&dist);
+        // 发布包场景：仅随包携带预构建的 web/dist，无前端源码。
+        note_prebuilt_or_placeholder(&dist);
         return;
     }
     if !has_bun || !has_modules {
-        println!(
-            "cargo:warning=跳过前端构建（bun={has_bun}, node_modules={has_modules}）。\
-             如需内置 UI：cd web && bun install && bun run build"
-        );
+        // 无法（重新）构建前端。若已随包携带预构建产物则直接使用，否则放占位页。
+        if has_prebuilt(&dist) {
+            println!("cargo:warning=使用随包预构建的 web/dist（bun={has_bun}, node_modules={has_modules}），跳过前端构建");
+        } else {
+            println!(
+                "cargo:warning=跳过前端构建（bun={has_bun}, node_modules={has_modules}）。\
+                 如需内置 UI：cd web && bun install && bun run build"
+            );
+        }
         ensure_placeholder(&dist);
         return;
     }
@@ -80,4 +86,17 @@ fn ensure_placeholder(dist: &Path) {
          <p>Web UI 尚未构建。请运行 <code>cd web &amp;&amp; bun install &amp;&amp; bun run build</code> 后重新编译。</p>\
          <p>API 仍正常工作，见 <code>/v1/*</code>。</p></body>",
     );
+}
+
+/// 是否存在「真实」的预构建前端产物（vite 会生成 assets/ 目录），用以区分占位页。
+fn has_prebuilt(dist: &Path) -> bool {
+    dist.join("index.html").exists() && dist.join("assets").is_dir()
+}
+
+/// 发布包安装场景：有预构建产物则告知直接使用，否则放占位页。
+fn note_prebuilt_or_placeholder(dist: &Path) {
+    if has_prebuilt(dist) {
+        println!("cargo:warning=使用随包预构建的 web/dist，跳过前端构建");
+    }
+    ensure_placeholder(dist);
 }
