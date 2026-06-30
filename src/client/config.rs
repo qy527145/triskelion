@@ -1,9 +1,23 @@
-//! 本地配置：Hub 地址与登录 token。存于用户配置目录的 `triskelion/config.json`。
+//! 本地配置与数据目录。客户端数据统一存放在 `~/.tsk`（可用 `TRISKELION_CLIENT_DATA_DIR`
+//! 覆盖）：`config.json`（Hub 地址与登录 token）、`secrets.json`（本地变量）。
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// 客户端数据目录：优先 `TRISKELION_CLIENT_DATA_DIR`，否则 `~/.tsk`。
+pub fn client_data_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TRISKELION_CLIENT_DATA_DIR") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".tsk")
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Config {
@@ -20,8 +34,7 @@ impl Config {
         if let Ok(p) = std::env::var("TRISKELION_CONFIG") {
             return PathBuf::from(p);
         }
-        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        base.join("triskelion").join("config.json")
+        client_data_dir().join("config.json")
     }
 
     pub fn load() -> Self {
@@ -48,10 +61,26 @@ impl Config {
         Ok(())
     }
 
+    /// 解析 Hub 地址：配置文件优先，否则回退环境变量 `TRISKELION_HUB`。
+    /// 未登录用户也可借此访问公开市场（无需 token）。
+    pub fn hub(&self) -> Option<String> {
+        self.hub_url.clone().or_else(|| {
+            std::env::var("TRISKELION_HUB")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    }
+
+    /// 是否已登录（持有 token）。
+    pub fn logged_in(&self) -> bool {
+        self.token.is_some()
+    }
+
     /// 返回已登录的 (hub_url, token)，否则报错提示登录。
     pub fn require_auth(&self) -> Result<(String, String)> {
-        match (&self.hub_url, &self.token) {
-            (Some(h), Some(t)) => Ok((h.clone(), t.clone())),
+        match (self.hub(), &self.token) {
+            (Some(h), Some(t)) => Ok((h, t.clone())),
             _ => bail!("尚未登录，请先执行 tsk login --hub <url>"),
         }
     }

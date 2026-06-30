@@ -34,9 +34,7 @@ pub struct AppState {
 
 /// 启动 Hub。自建多线程 tokio runtime 并阻塞，bin 侧保持同步 main。
 pub fn run() -> Result<()> {
-    let data_dir = std::env::var("TRISKELION_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("triskelion-data"));
+    let data_dir = server_data_dir();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("创建数据目录 {}", data_dir.display()))?;
 
@@ -113,6 +111,20 @@ pub fn run() -> Result<()> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     println!("\ntriskelion hub shutting down");
+}
+
+/// 服务端数据目录：优先 `TRISKELION_SERVER_DATA_DIR`，兼容旧的 `TRISKELION_DATA_DIR`，
+/// 否则默认用户主目录下的 `~/.triskelion`。
+fn server_data_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TRISKELION_SERVER_DATA_DIR").or_else(|_| std::env::var("TRISKELION_DATA_DIR")) {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".triskelion")
 }
 
 /// 读取密钥文件，不存在则生成随机字节并写入（0600 权限）。

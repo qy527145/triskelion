@@ -59,6 +59,8 @@ server = [
     "dep:zstd",
     # 调试期：允许浏览器/Tauri webview 跨源直连本 Hub（CORS）
     "dep:tower-http",
+    # 默认数据目录 ~/.triskelion 需要解析用户主目录
+    "dep:dirs",
 ]
 
 [dependencies]

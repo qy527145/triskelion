@@ -325,16 +325,18 @@ pub struct SecretInfo {
     pub updated_at: String,
 }
 
-/// `tsk run` 的解析响应：Hub 完成凭据缝合后回吐 ready manifest、
-/// 该包声明的全部变量（`required`）与其中尚未设置的（`missing`）。
+/// `tsk run` 的解析响应：Hub 返回**原始** manifest（含 `{VAR}` 占位符）、该包声明的
+/// 全部变量（`required`），以及调用者**线上**已设置的相关变量值（`vars`，仅在已登录时非空）。
+/// 客户端据此用「本地变量覆盖线上变量」的优先级在本地完成凭据缝合。
 #[derive(Serialize, Deserialize)]
 pub struct ResolveResp {
     pub manifest: McpManifest,
     /// 该包依赖的全部变量名（无论是否已设置）。
     #[serde(default)]
     pub required: Vec<String>,
-    /// 调用者尚未设置的变量名。
-    pub missing: Vec<String>,
+    /// 调用者线上已设置且被该包引用的变量（名→值）。未登录时为空。
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]

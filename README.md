@@ -51,6 +51,21 @@ tsk run alice/github-inspector create_issue --title "..." --body "..."
 
 纯文本「裸说明书」技能无需任何压缩体，也可在 Web 端「我的技能 → 新建技能」直接创建。
 
+## 免登录使用与本地变量
+
+`tsk` 对登录**非强制**：未登录即可浏览公开市场、拉取公开技能、`tsk run` 公开 MCP。
+
+- **变量（凭据）**：`tsk secret set/list/rm` 未登录时读写本地文件 `~/.tsk/secrets.json`（0600）；
+  登录后写变量会在本地之外**同时写线上**（个人变量）。运行解析时**本地优先于线上**
+  （同名变量本地覆盖线上）。
+- **Hub 地址**：未登录可用 `TRISKELION_HUB` 环境变量指定 Hub，例如
+  `TRISKELION_HUB=http://hub tsk run alice/foo ...`（带 `/` 的 `owner/name` 形式）。
+
+## 数据目录
+
+- **服务端**：默认 `~/.triskelion`，可用 `TRISKELION_SERVER_DATA_DIR` 覆盖（兼容旧的 `TRISKELION_DATA_DIR`）。
+- **客户端 CLI**：统一存放于 `~/.tsk`（`config.json` 登录态 + `secrets.json` 本地变量），可用 `TRISKELION_CLIENT_DATA_DIR` 覆盖。
+
 ## 压缩算法（zstd）
 
 技能压缩体与管理后台的「全量资源包」统一采用 **zstd（Zstandard）**：相比旧版 gzip，在
