@@ -688,15 +688,43 @@ fn cmd_run(package: &str, args: &[String]) -> Result<()> {
     let ms = started.elapsed().as_millis() as i64;
     // 把调用结果回传 Hub 作审计统计（尽力而为；仅已登录时上报，匿名跑公开 MCP 不记账）。
     if cfg.logged_in() {
-        let (ok, err) = match &outcome {
-            Ok(_) => (true, String::new()),
-            Err(e) => (false, format!("{e:#}")),
+        let (ok, err, summary) = match &outcome {
+            Ok(v) => (true, String::new(), summarize_result(v)),
+            Err(e) => (false, format!("{e:#}"), String::new()),
         };
-        let _ = api.report_call(&owner, &name, tool_name, ok, &err, ms);
+        let _ = api.report_call(&owner, &name, tool_name, ok, &err, ms, &summary);
     }
     let result = outcome?;
     if !mcp2cli::print_result(&result) {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// 把一次工具调用结果压缩成单行摘要，回传 Hub 供审计面板「结果摘要」列展示。
+/// 优先拼接 `content[].text`，否则回退紧凑 JSON；统一截断到 240 字符。
+fn summarize_result(result: &serde_json::Value) -> String {
+    let mut s = String::new();
+    if let Some(items) = result.get("content").and_then(|c| c.as_array()) {
+        for item in items {
+            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                if !s.is_empty() {
+                    s.push(' ');
+                }
+                s.push_str(t);
+            }
+        }
+    }
+    if s.trim().is_empty() {
+        s = result.to_string();
+    }
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= 240 {
+        trimmed.to_string()
+    } else {
+        let mut out: String = trimmed.chars().take(240).collect();
+        out.push('…');
+        out
+    }
 }

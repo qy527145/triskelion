@@ -9,6 +9,8 @@ import type {
   AdminStats,
   AdminUser,
   CallLog,
+  CallsQuery,
+  CallsResp,
   GroupVisibility,
   ImportSummary,
   McpManifest,
@@ -1692,29 +1694,278 @@ function LabelModal({
   );
 }
 
-function CallsTable({ token }: { token: string }) {
-  const { data, loading, error } = useAdminData<CallLog[]>(() => admin.calls(token), [token]);
-  if (loading || error) return <StateLine loading={loading} error={error} />;
-  const rows = data!;
-  if (rows.length === 0) return <Panel>暂无调用日志。</Panel>;
+/** 时间窗口选项（小时；0 表示不限）。 */
+const CALL_WINDOWS = [
+  { v: 24, label: "近 24 小时" },
+  { v: 168, label: "近 7 天" },
+  { v: 720, label: "近 30 天" },
+  { v: 0, label: "全部" },
+] as const;
+
+const CALLS_PAGE_SIZE = 20;
+
+const selectCls = `${inputCls} appearance-none bg-[length:18px] bg-[right_0.6rem_center] bg-no-repeat pr-9`;
+const caretBg = {
+  backgroundImage:
+    "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")",
+};
+
+/** 绿/红状态药丸，对齐参考稿（ok / err）。 */
+function StatusPill({ ok }: { ok: boolean }) {
   return (
-    <Table head={["状态", "工具", "调用者", "耗时", "时间", "错误"]}>
-      {rows.map((c, i) => (
-        <tr key={i} className="text-slate-700">
-          <td className="px-5 py-3">
-            <Badge kind={c.ok ? "ok" : "err"}>{c.ok ? "成功" : "失败"}</Badge>
-          </td>
-          <td className="px-5 py-3 font-mono text-xs text-slate-600">
-            {c.mcp_name}/{c.tool}
-            <div className="text-slate-400">@{c.owner}</div>
-          </td>
-          <td className="px-5 py-3 text-slate-500">{c.caller || "—"}</td>
-          <td className="px-5 py-3 text-slate-500">{c.ms}ms</td>
-          <td className="px-5 py-3 text-xs text-slate-400">{c.created_at}</td>
-          <td className="px-5 py-3 max-w-xs truncate font-mono text-xs text-rose-500">{c.error}</td>
-        </tr>
-      ))}
-    </Table>
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${
+        ok ? "bg-emerald-50 text-emerald-600" : "bg-rose-50 text-rose-500"
+      }`}
+    >
+      <span className={`size-1.5 rounded-full ${ok ? "bg-emerald-500" : "bg-rose-500"}`} />
+      {ok ? "ok" : "err"}
+    </span>
+  );
+}
+
+/** 极简开关（仅错误）。 */
+function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      onClick={() => onChange(!on)}
+      className={`relative inline-flex h-6 w-11 flex-none items-center rounded-full transition ${
+        on ? "bg-indigo-500" : "bg-slate-200"
+      }`}
+    >
+      <span
+        className={`inline-block size-5 transform rounded-full bg-white shadow transition ${
+          on ? "translate-x-5" : "translate-x-0.5"
+        }`}
+      />
+    </button>
+  );
+}
+
+function CallsTable({ token }: { token: string }) {
+  // 已应用的过滤条件（点「查询」才生效）与草稿态分离，避免边输边查。
+  const [applied, setApplied] = useState<CallsQuery>({ window: 24 });
+  const [service, setService] = useState("");
+  const [tool, setTool] = useState("");
+  const [caller, setCaller] = useState("");
+  const [window, setWindow] = useState(24);
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const [page, setPage] = useState(0);
+
+  const [data, setData] = useState<CallsResp | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError("");
+    admin
+      .calls(token, { ...applied, limit: CALLS_PAGE_SIZE, offset: page * CALLS_PAGE_SIZE })
+      .then((d) => alive && setData(d))
+      .catch((e) => alive && setError((e as Error).message))
+      .finally(() => alive && setLoading(false));
+    return () => {
+      alive = false;
+    };
+  }, [token, applied, page]);
+
+  function query() {
+    setApplied({
+      service: service || undefined,
+      tool: tool || undefined,
+      caller: caller.trim() || undefined,
+      window: window || undefined,
+      errors_only: errorsOnly || undefined,
+    });
+    setPage(0);
+  }
+  function reset() {
+    setService("");
+    setTool("");
+    setCaller("");
+    setWindow(24);
+    setErrorsOnly(false);
+    setApplied({ window: 24 });
+    setPage(0);
+  }
+
+  const services = data?.services ?? [];
+  const tools = data?.tools ?? [];
+  const total = data?.total ?? 0;
+  const rows = data?.rows ?? [];
+  const lastPage = Math.max(0, Math.ceil(total / CALLS_PAGE_SIZE) - 1);
+
+  return (
+    <div className="space-y-5">
+      <Panel>
+        <h2 className="mb-4 font-bold text-slate-800">调用日志</h2>
+        <div className="grid grid-cols-2 items-end gap-4 lg:grid-cols-5">
+          <label className="block">
+            <span className={adminLabelCls}>服务</span>
+            <select
+              className={selectCls}
+              style={caretBg}
+              value={service}
+              onChange={(e) => setService(e.target.value)}
+            >
+              <option value="">全部服务</option>
+              {services.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>工具</span>
+            <select
+              className={selectCls}
+              style={caretBg}
+              value={tool}
+              onChange={(e) => setTool(e.target.value)}
+            >
+              <option value="">全部工具</option>
+              {tools.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>用户</span>
+            <input
+              className={inputCls}
+              placeholder="任意"
+              value={caller}
+              onChange={(e) => setCaller(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && query()}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>时间窗口</span>
+            <select
+              className={selectCls}
+              style={caretBg}
+              value={window}
+              onChange={(e) => setWindow(Number(e.target.value))}
+            >
+              {CALL_WINDOWS.map((w) => (
+                <option key={w.v} value={w.v}>
+                  {w.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div>
+            <span className={adminLabelCls}>仅错误</span>
+            <div className="flex h-[42px] items-center">
+              <Toggle on={errorsOnly} onChange={setErrorsOnly} />
+            </div>
+          </div>
+        </div>
+        <div className="mt-4 flex gap-2.5">
+          <button
+            onClick={query}
+            className="rounded-xl bg-indigo-500 px-5 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+          >
+            查询
+          </button>
+          <button
+            onClick={reset}
+            className="rounded-xl border border-slate-200 px-5 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-50"
+          >
+            重置
+          </button>
+        </div>
+      </Panel>
+
+      <Panel className="p-0">
+        <div className="flex items-center justify-between gap-4 px-6 py-4">
+          <div className="text-sm text-slate-500">
+            匹配 <span className="font-semibold text-slate-800">{total}</span> 条
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page <= 0}
+              className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              上一页
+            </button>
+            <button
+              onClick={() => setPage((p) => Math.min(lastPage, p + 1))}
+              disabled={page >= lastPage}
+              className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              下一页
+            </button>
+          </div>
+        </div>
+
+        {loading ? (
+          <StateLine loading error="" />
+        ) : error ? (
+          <StateLine loading={false} error={error} />
+        ) : rows.length === 0 ? (
+          <div className="px-6 py-16 text-center text-slate-400">暂无匹配的调用日志。</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-t border-slate-100 text-xs uppercase tracking-wide text-slate-400">
+                  {["时间", "状态", "用户", "服务 / 工具", "耗时", "结果摘要"].map((h) => (
+                    <th key={h} className="px-6 py-3 font-medium">
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {rows.map((c, i) => (
+                  <CallRow key={i} c={c} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function CallRow({ c }: { c: CallLog }) {
+  const summary = c.ok ? c.result : c.error;
+  return (
+    <tr className="text-slate-700 transition hover:bg-slate-50/60">
+      <td className="whitespace-nowrap px-6 py-3.5 text-sm text-slate-500">{c.created_at}</td>
+      <td className="px-6 py-3.5">
+        <StatusPill ok={c.ok} />
+      </td>
+      <td className="px-6 py-3.5">
+        <div className="font-semibold text-slate-800">{c.caller || "—"}</div>
+        {c.caller_id != null && <div className="text-xs text-slate-400">id: {c.caller_id}</div>}
+      </td>
+      <td className="px-6 py-3.5">
+        <span className="rounded-md bg-slate-100 px-2 py-1 font-mono text-xs font-medium text-slate-600">
+          {c.mcp_name}/{c.tool}
+        </span>
+        <div className="mt-0.5 text-xs text-slate-400">@{c.owner}</div>
+      </td>
+      <td className="whitespace-nowrap px-6 py-3.5 text-slate-500">{c.ms} ms</td>
+      <td className="px-6 py-3.5">
+        <div
+          className={`max-w-md truncate font-mono text-xs ${c.ok ? "text-slate-500" : "text-rose-500"}`}
+          title={summary}
+        >
+          {summary || "—"}
+        </div>
+      </td>
+    </tr>
   );
 }
 

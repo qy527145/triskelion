@@ -5,7 +5,8 @@ import type {
   AdminSkill,
   AdminStats,
   AdminUser,
-  CallLog,
+  CallsQuery,
+  CallsResp,
   GroupVisibility,
   ImportSummary,
   McpInfo,
@@ -217,7 +218,18 @@ export const admin = {
   users: (token: string) => adminReq<AdminUser[]>("/v1/admin/users", token),
   skills: (token: string) => adminReq<AdminSkill[]>("/v1/admin/skills", token),
   mcps: (token: string) => adminReq<AdminMcp[]>("/v1/admin/mcps", token),
-  calls: (token: string) => adminReq<CallLog[]>("/v1/admin/calls", token),
+  calls: (token: string, params: CallsQuery = {}) => {
+    const p = new URLSearchParams();
+    if (params.service) p.set("service", params.service);
+    if (params.tool) p.set("tool", params.tool);
+    if (params.caller) p.set("caller", params.caller);
+    if (params.window) p.set("window", String(params.window));
+    if (params.errors_only) p.set("errors_only", "true");
+    if (params.limit != null) p.set("limit", String(params.limit));
+    if (params.offset != null) p.set("offset", String(params.offset));
+    const qs = p.toString();
+    return adminReq<CallsResp>("/v1/admin/calls" + (qs ? "?" + qs : ""), token);
+  },
 
   // 分组 CRUD
   groups: (token: string) => adminReq<AdminGroup[]>("/v1/admin/groups", token),

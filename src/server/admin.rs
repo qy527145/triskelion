@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -510,40 +510,136 @@ pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Ad
 #[derive(Serialize)]
 pub struct CallLog {
     caller: String,
+    /// 发起者用户 id（按用户名快照关联，用户已删除则为 null）。
+    caller_id: Option<i64>,
     owner: String,
     mcp_name: String,
     tool: String,
     ok: bool,
     error: String,
+    /// 结果摘要（成功调用的结果概要；失败时为空，错误见 error）。
+    result: String,
     ms: i64,
     created_at: String,
 }
 
-pub async fn calls(State(state): S, headers: HeaderMap) -> Result<Json<Vec<CallLog>>, ApiError> {
+/// 调用日志查询参数：服务 / 工具 / 发起者 / 时间窗口（小时）/ 仅错误 + 分页。
+#[derive(Deserialize)]
+pub struct CallsQuery {
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    caller: Option<String>,
+    /// 时间窗口（小时）；缺省或 0 表示不限。
+    #[serde(default)]
+    window: Option<i64>,
+    #[serde(default)]
+    errors_only: Option<bool>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct CallsResp {
+    /// 命中过滤条件的总条数（用于分页）。
+    total: i64,
+    rows: Vec<CallLog>,
+    /// 下拉候选：去重后的全部服务名与工具名（不随当前过滤变化）。
+    services: Vec<String>,
+    tools: Vec<String>,
+}
+
+pub async fn calls(
+    State(state): S,
+    headers: HeaderMap,
+    Query(q): Query<CallsQuery>,
+) -> Result<Json<CallsResp>, ApiError> {
     require_admin(&state, &headers)?;
     let conn = state.db.lock().unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT caller, owner, mcp_name, tool, ok, error, ms, created_at
-             FROM tool_calls ORDER BY id DESC LIMIT 200",
+
+    // 动态拼装过滤条件，参数按出现顺序绑定（占位符仅来自计数，无注入风险）。
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(s) = q.service.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(s.to_string().into());
+        where_sql.push_str(&format!(" AND mcp_name = ?{}", params.len()));
+    }
+    if let Some(t) = q.tool.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(t.to_string().into());
+        where_sql.push_str(&format!(" AND tool = ?{}", params.len()));
+    }
+    if let Some(c) = q.caller.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(format!("%{}%", c.to_lowercase()).into());
+        where_sql.push_str(&format!(" AND lower(caller) LIKE ?{}", params.len()));
+    }
+    if let Some(w) = q.window.filter(|w| *w > 0) {
+        params.push((now_unix() - w * 3600).into());
+        where_sql.push_str(&format!(" AND created_ts >= ?{}", params.len()));
+    }
+    if q.errors_only.unwrap_or(false) {
+        where_sql.push_str(" AND ok = 0");
+    }
+
+    let total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM tool_calls{where_sql}"),
+            rusqlite::params_from_iter(params.iter()),
+            |r| r.get(0),
         )
         .map_err(db_err)?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(CallLog {
-                caller: r.get(0)?,
-                owner: r.get(1)?,
-                mcp_name: r.get(2)?,
-                tool: r.get(3)?,
-                ok: r.get::<_, i64>(4)? != 0,
-                error: r.get(5)?,
-                ms: r.get(6)?,
-                created_at: r.get(7)?,
+
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let rows = {
+        let sql = format!(
+            "SELECT tc.caller, u.id, tc.owner, tc.mcp_name, tc.tool, tc.ok, tc.error, tc.result, tc.ms, tc.created_at
+             FROM tool_calls tc LEFT JOIN users u ON u.username = tc.caller
+             {where_sql} ORDER BY tc.id DESC LIMIT ?{} OFFSET ?{}",
+            params.len() + 1,
+            params.len() + 2,
+        );
+        let mut p = params.clone();
+        p.push(limit.into());
+        p.push(offset.into());
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(p.iter()), |r| {
+                Ok(CallLog {
+                    caller: r.get(0)?,
+                    caller_id: r.get(1)?,
+                    owner: r.get(2)?,
+                    mcp_name: r.get(3)?,
+                    tool: r.get(4)?,
+                    ok: r.get::<_, i64>(5)? != 0,
+                    error: r.get(6)?,
+                    result: r.get(7)?,
+                    ms: r.get(8)?,
+                    created_at: r.get(9)?,
+                })
             })
-        })
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
+    };
+
+    let services = distinct_calls_column(&conn, "mcp_name")?;
+    let tools = distinct_calls_column(&conn, "tool")?;
+
+    Ok(Json(CallsResp { total, rows, services, tools }))
+}
+
+/// 取 tool_calls 某列去重非空值（升序），供过滤下拉。`col` 仅来自固定字面量。
+fn distinct_calls_column(conn: &rusqlite::Connection, col: &str) -> Result<Vec<String>, ApiError> {
+    let sql = format!("SELECT DISTINCT {col} FROM tool_calls WHERE {col} <> '' ORDER BY {col}");
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
         .map_err(db_err)?;
-    let out = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?;
-    Ok(Json(out))
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,6 +1540,8 @@ struct PackCall {
     tool: String,
     ok: i64,
     error: String,
+    #[serde(default)]
+    result: String,
     ms: i64,
     created_at: String,
     created_ts: i64,
@@ -1720,7 +1818,7 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
     let calls = {
         let mut stmt = conn
             .prepare(
-                "SELECT caller, owner, mcp_name, tool, ok, error, ms, created_at, created_ts
+                "SELECT caller, owner, mcp_name, tool, ok, error, result, ms, created_at, created_ts
                  FROM tool_calls ORDER BY id",
             )
             .map_err(db_err)?;
@@ -1733,9 +1831,10 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
                     tool: r.get(3)?,
                     ok: r.get(4)?,
                     error: r.get(5)?,
-                    ms: r.get(6)?,
-                    created_at: r.get(7)?,
-                    created_ts: r.get(8)?,
+                    result: r.get(6)?,
+                    ms: r.get(7)?,
+                    created_at: r.get(8)?,
+                    created_ts: r.get(9)?,
                 })
             })
             .map_err(db_err)?;
@@ -1978,11 +2077,11 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
     if existing == 0 {
         for c in &pack.calls {
             tx.execute(
-                "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, ms, created_at, created_ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, result, ms, created_at, created_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
-                    c.caller, c.owner, c.mcp_name, c.tool, c.ok, c.error, c.ms, c.created_at,
-                    c.created_ts
+                    c.caller, c.owner, c.mcp_name, c.tool, c.ok, c.error, c.result, c.ms,
+                    c.created_at, c.created_ts
                 ],
             )
             .map_err(db_err)?;

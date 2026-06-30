@@ -111,6 +111,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             tool       TEXT NOT NULL DEFAULT '',
             ok         INTEGER NOT NULL DEFAULT 1,
             error      TEXT NOT NULL DEFAULT '',
+            result     TEXT NOT NULL DEFAULT '',
             ms         INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             created_ts INTEGER NOT NULL DEFAULT 0
@@ -133,6 +134,11 @@ pub fn init(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE skills ADD COLUMN group_visibility TEXT NOT NULL DEFAULT 'all'",
+        [],
+    );
+    // 迁移：调用审计补上「结果摘要」列（成功调用的结果概要 / 失败可留空，旧库补列）。
+    let _ = conn.execute(
+        "ALTER TABLE tool_calls ADD COLUMN result TEXT NOT NULL DEFAULT ''",
         [],
     );
 

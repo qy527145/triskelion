@@ -193,13 +193,35 @@ export interface AdminMcp {
 
 export interface CallLog {
   caller: string;
+  caller_id: number | null;
   owner: string;
   mcp_name: string;
   tool: string;
   ok: boolean;
   error: string;
+  result: string;
   ms: number;
   created_at: string;
+}
+
+/** 调用日志查询参数（全部可选）。 */
+export interface CallsQuery {
+  service?: string;
+  tool?: string;
+  caller?: string;
+  /** 时间窗口（小时）；0 / 省略表示不限。 */
+  window?: number;
+  errors_only?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+/** 调用日志分页响应：命中总数 + 当前页 + 过滤下拉候选。 */
+export interface CallsResp {
+  total: number;
+  rows: CallLog[];
+  services: string[];
+  tools: string[];
 }
 
 export interface ImportSummary {
