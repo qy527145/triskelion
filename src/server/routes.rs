@@ -82,11 +82,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/admin/skills/:owner/:name",
             patch(admin::skill_update).delete(admin::skill_delete),
         )
-        .route("/v1/admin/mcps", get(admin::mcps_all))
+        .route(
+            "/v1/admin/mcps",
+            get(admin::mcps_all).post(admin::mcp_register),
+        )
         .route(
             "/v1/admin/mcps/:owner/:name",
             patch(admin::mcp_update).delete(admin::mcp_delete),
         )
+        // 外部系统（如 aiko_hub）批量分发用户变量。
+        .route("/v1/admin/secrets", post(admin::secrets_distribute))
         .route("/v1/admin/calls", get(admin::calls))
         .route("/v1/admin/export", get(admin::export))
         .route("/v1/admin/import", post(admin::import))
