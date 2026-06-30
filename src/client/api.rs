@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use crate::shared::{
-    AuthReq, AuthResp, McpInfo, McpManifest, McpUpsertReq, ResolveResp, SecretInfo, SecretSetReq,
-    SetToolsReq, SkillInfo, SkillManifest, SkillUpsertReq, ToolMeta,
+    AuthReq, AuthResp, McpInfo, McpManifest, McpUpsertReq, ReportCallReq, ResolveResp, SecretInfo,
+    SecretSetReq, SetToolsReq, SkillInfo, SkillManifest, SkillUpsertReq, ToolMeta,
 };
 
 /// 带 HTTP 状态码的客户端错误，status==0 表示传输层失败。
@@ -195,6 +195,32 @@ impl HubClient {
             .send()
             .map_err(HubError::transport)?;
         Self::parse(resp)
+    }
+
+    /// 回传一次本地 `tsk run` 工具调用的审计元信息（尽力而为，仅记录成败/耗时）。
+    pub fn report_call(
+        &self,
+        owner: &str,
+        name: &str,
+        tool: &str,
+        ok: bool,
+        error: &str,
+        ms: i64,
+    ) -> Result<(), HubError> {
+        let resp = self
+            .auth(
+                self.http
+                    .post(self.url(&format!("/v1/run/{owner}/{name}/report"))),
+            )
+            .json(&ReportCallReq {
+                tool: tool.to_string(),
+                ok,
+                error: error.to_string(),
+                ms,
+            })
+            .send()
+            .map_err(HubError::transport)?;
+        Self::ok_empty(resp)
     }
 
     /// 上报某 MCP 的工具清单（写入检索索引；仅限本人）。返回已索引数量。

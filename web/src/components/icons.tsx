@@ -88,3 +88,9 @@ export const DownloadIcon = (p: P) => (
     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
   </svg>
 );
+/** 旋转加载指示器（依赖 Tailwind 的 animate-spin）。 */
+export const Spinner = (p: P) => (
+  <svg {...base({ ...p, className: `animate-spin ${p.className ?? ""}`.trim() })}>
+    <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+  </svg>
+);

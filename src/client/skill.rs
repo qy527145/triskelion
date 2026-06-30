@@ -133,7 +133,7 @@ pub fn build(dir: &Path) -> Result<Build> {
 
     let mut manifest = load_manifest(&dir)?;
     if manifest.description.trim().is_empty() {
-        manifest.description = first_meaningful_line(&skill_md);
+        manifest.description = extract_description(&skill_md);
     }
     validate_manifest(&manifest)?;
 
@@ -230,8 +230,124 @@ pub fn publish(dir: Option<PathBuf>, visibility: Option<String>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// list / search / show / remove
+// import：批量导入第三方技能生态（一个目录下的多个技能子文件夹）
 // ---------------------------------------------------------------------------
+
+/// 把 `root` 下每个含 `SKILL.md` 的子文件夹作为技能发布到市场。
+/// `category` 作为归类 tag 写入每个技能（默认「社区资源」）；`visibility` 默认 public。
+pub fn import(
+    root: PathBuf,
+    category: Option<String>,
+    visibility: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let cfg = Config::load();
+    let api = client(&cfg)?;
+
+    if !root.is_dir() {
+        bail!("{} 不是目录", root.display());
+    }
+    let category = category
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "社区资源".into());
+    let visibility = visibility.unwrap_or_else(|| "public".into());
+
+    // 收集直接子目录里含 SKILL.md 的技能文件夹（按名称排序，结果稳定）。
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&root).with_context(|| format!("读取目录 {}", root.display()))? {
+        let path = entry?.path();
+        if path.is_dir() && path.join(SKILL_MD).is_file() {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+
+    if candidates.is_empty() {
+        // 兜底：目录本身就是一个技能（直接含 SKILL.md）。
+        if root.join(SKILL_MD).is_file() {
+            candidates.push(root.clone());
+        } else {
+            bail!(
+                "{} 下未发现任何含 {SKILL_MD} 的技能子文件夹",
+                root.display()
+            );
+        }
+    }
+
+    println!(
+        "发现 {} 个技能，将以 [{}] 可见性导入，归类标签「{}」：",
+        candidates.len(),
+        visibility,
+        category
+    );
+    for p in &candidates {
+        println!("  • {}", p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    }
+    if !yes
+        && !dialoguer::Confirm::new()
+            .with_prompt("确认导入以上全部技能？")
+            .default(true)
+            .interact()
+            .unwrap_or(false)
+    {
+        bail!("已取消");
+    }
+
+    let mut ok = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for dir in &candidates {
+        let label = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        match import_one(&api, dir, &category, &visibility) {
+            Ok(info) => {
+                ok += 1;
+                println!("  ✓ {}/{} v{} [{}]", info.owner, info.name, info.version, info.visibility);
+            }
+            Err(e) => {
+                failed.push(format!("{label}: {e:#}"));
+                println!("  ✗ {label}：{e:#}");
+            }
+        }
+    }
+
+    println!("\n导入完成：成功 {ok} / 共 {}", candidates.len());
+    if !failed.is_empty() {
+        println!("失败 {} 个：", failed.len());
+        for f in &failed {
+            println!("  - {f}");
+        }
+    }
+    Ok(())
+}
+
+/// 导入单个技能文件夹：打包 → 注入归类 tag → 上传元数据 + 压缩体。
+fn import_one(
+    api: &HubClient,
+    dir: &Path,
+    category: &str,
+    visibility: &str,
+) -> Result<SkillInfo> {
+    let mut b = build(dir)?;
+    // 注入归类 tag（去重，避免与已有标签重复）。
+    if !b
+        .manifest
+        .tags
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(category))
+    {
+        b.manifest.tags.push(category.to_string());
+    }
+    let info = api.skill_upsert(&b.manifest, visibility, &b.skill_md, &b.sha256, b.size)?;
+    if b.size > 0 {
+        api.skill_archive_put(&info.owner, &info.name, b.archive)?;
+    }
+    Ok(info)
+}
+
+
 
 pub fn list() -> Result<()> {
     let cfg = Config::load();
@@ -453,6 +569,50 @@ fn first_meaningful_line(md: &str) -> String {
         }
     }
     String::new()
+}
+
+/// 从 SKILL.md 提取一句话描述：优先解析 YAML frontmatter 的 `description:` 字段
+/// （Anthropic 风格技能包惯用 `--- name/description ---` 头），否则退回首个有意义的正文行。
+fn extract_description(md: &str) -> String {
+    if let Some(d) = frontmatter_field(md, "description") {
+        return clip(&d, 240);
+    }
+    first_meaningful_line(md)
+}
+
+/// 解析以 `---` 围起的 YAML frontmatter，取指定标量字段的值（仅支持单行标量，足够覆盖
+/// `name:` / `description:` 这类常见头字段）。非 frontmatter 文档返回 None。
+fn frontmatter_field(md: &str, key: &str) -> Option<String> {
+    let mut lines = md.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    let prefix = format!("{key}:");
+    for line in lines {
+        let t = line.trim_end();
+        let trimmed = t.trim();
+        if trimmed == "---" || trimmed == "..." {
+            break;
+        }
+        if let Some(rest) = t.strip_prefix(&prefix) {
+            let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 按字符数（非字节）截断，避免切坏多字节字符；超长时补省略号。
+fn clip(s: &str, n: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= n {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(n).collect();
+    out.push('…');
+    out
 }
 
 fn split_package(package: &str, cfg: &Config) -> Result<(String, String)> {

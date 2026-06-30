@@ -289,6 +289,18 @@ pub struct CallReq {
     pub arguments: serde_json::Value,
 }
 
+/// `tsk run` 在本地直连 MCP 调用工具后，把调用结果**回传** Hub 作审计统计。
+/// CLI 路径不经 Hub 网关，否则这些调用不会出现在管理后台的调用日志/热门工具里。
+#[derive(Serialize, Deserialize)]
+pub struct ReportCallReq {
+    pub tool: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub ms: i64,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct McpRenameReq {
     pub new_name: String,

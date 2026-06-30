@@ -1,5 +1,6 @@
 import { initials } from "../lib/color";
 import { LogoutIcon } from "./icons";
+import Brand from "./Brand";
 
 export type Tab = "skill-market" | "mcp-market" | "skill-mine" | "mcp-mine" | "secrets";
 
@@ -27,13 +28,8 @@ export default function Header({
 }) {
   const personalActive = isPersonal(tab);
   return (
-    <header className="sticky top-0 z-40 flex items-center gap-7 border-b border-slate-200 bg-white/90 px-6 py-3.5 backdrop-blur">
-      <div className="flex items-center gap-2.5 text-lg font-bold text-slate-800">
-        <span className="grid size-9 place-items-center rounded-[10px] bg-gradient-to-br from-indigo-500 to-violet-500 font-extrabold text-white">
-          T
-        </span>
-        triskelion
-      </div>
+    <header className="sticky top-0 z-40 flex items-center gap-7 border-b border-slate-200/70 bg-white/80 px-6 py-3.5 backdrop-blur-xl">
+      <Brand />
 
       <nav className="flex gap-1">
         {MARKET_TABS.map((t) => (

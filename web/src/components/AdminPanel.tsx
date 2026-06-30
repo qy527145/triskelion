@@ -17,7 +17,8 @@ import type {
   SkillCategory,
 } from "../lib/types";
 import Modal from "./Modal";
-import { DownloadIcon, LogoutIcon, PlusIcon, TrashIcon } from "./icons";
+import Brand from "./Brand";
+import { DownloadIcon, LogoutIcon, PlusIcon, Spinner, TrashIcon } from "./icons";
 
 const TOKEN_KEY = "tsk_admin_token";
 
@@ -90,13 +91,10 @@ function TokenGate({ onAuthed }: { onAuthed: (token: string) => void }) {
   }
 
   return (
-    <div className="grid min-h-screen place-items-center bg-slate-50 px-6">
-      <div className="w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
-        <div className="mb-6 flex items-center gap-2.5 text-lg font-bold text-slate-800">
-          <span className="grid size-9 place-items-center rounded-[10px] bg-gradient-to-br from-indigo-500 to-violet-500 font-extrabold text-white">
-            T
-          </span>
-          管理后台
+    <div className="grid min-h-screen place-items-center px-6">
+      <div className="w-full max-w-sm rounded-2xl border border-slate-200/70 bg-white/90 p-8 shadow-xl shadow-slate-300/30 backdrop-blur">
+        <div className="mb-6">
+          <Brand sub="管理后台" />
         </div>
         <p className="mb-5 text-sm text-slate-400">
           输入 <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs">ADMIN_TOKEN</code>{" "}
@@ -140,14 +138,9 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   }, []);
 
   return (
-    <div className="min-h-screen bg-slate-50">
-      <header className="sticky top-0 z-40 flex items-center gap-3 border-b border-slate-200 bg-white/90 px-6 py-3.5 backdrop-blur">
-        <div className="flex items-center gap-2.5 text-lg font-bold text-slate-800">
-          <span className="grid size-9 place-items-center rounded-[10px] bg-gradient-to-br from-indigo-500 to-violet-500 font-extrabold text-white">
-            T
-          </span>
-          triskelion · 管理后台
-        </div>
+    <div className="min-h-screen">
+      <header className="sticky top-0 z-40 flex items-center gap-3 border-b border-slate-200/70 bg-white/80 px-6 py-3.5 backdrop-blur-xl">
+        <Brand sub="· 管理后台" />
         <div className="flex-1" />
         <a href="#" className="rounded-lg px-3 py-1.5 text-sm text-slate-500 transition hover:bg-slate-100">
           市场首页
@@ -233,7 +226,12 @@ function Panel({ children, className = "" }: { children: React.ReactNode; classN
 }
 
 function StateLine({ loading, error }: { loading: boolean; error: string }) {
-  if (loading) return <div className="py-16 text-center text-slate-400">加载中…</div>;
+  if (loading)
+    return (
+      <div className="flex items-center justify-center gap-2.5 py-16 text-slate-400">
+        <Spinner width={18} height={18} /> 加载中…
+      </div>
+    );
   if (error) return <div className="py-16 text-center text-rose-500">加载失败：{error}</div>;
   return null;
 }
@@ -260,9 +258,14 @@ function Overview({ token }: { token: string }) {
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         {cards.map((c) => (
-          <div key={c.label} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div
+            key={c.label}
+            className="rounded-2xl border border-slate-200/70 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
+          >
             <div className="text-sm text-slate-400">{c.label}</div>
-            <div className="mt-2 text-3xl font-bold text-slate-800">{c.value}</div>
+            <div className="mt-2 bg-gradient-to-br from-slate-800 to-slate-600 bg-clip-text text-3xl font-bold text-transparent">
+              {c.value}
+            </div>
             <div className="mt-2 text-xs text-slate-400">{c.sub}</div>
           </div>
         ))}

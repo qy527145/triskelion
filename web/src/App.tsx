@@ -8,7 +8,7 @@ import CreateSkillModal from "./components/CreateSkillModal";
 import DetailModal from "./components/DetailModal";
 import SkillDetailModal from "./components/SkillDetailModal";
 import SecretModal from "./components/SecretModal";
-import { SearchIcon, PlusIcon, KeyIcon, TrashIcon } from "./components/icons";
+import { SearchIcon, PlusIcon, KeyIcon, TrashIcon, Spinner } from "./components/icons";
 import { api, clearAuth, getUser } from "./lib/api";
 import type { McpInfo, SecretInfo, SkillInfo } from "./lib/types";
 import { SKILL_CATEGORIES } from "./lib/types";
@@ -148,7 +148,8 @@ export default function App() {
     },
     "skill-mine": {
       title: "我的技能",
-      subtitle: "你发布的全部技能（含私有）。大文件夹技能用 tsk skill publish 上传，纯文本可在此直接新建。",
+      subtitle:
+        "你发布的全部技能（含私有）。大文件夹技能用 tsk skill publish 上传；批量导入第三方生态用 tsk import <目录>（默认归类「社区资源」）；纯文本可在此直接新建。",
     },
     "mcp-mine": {
       title: "我的 MCP",
@@ -261,18 +262,18 @@ export default function App() {
 
         <div className="mt-8">
           {loading ? (
-            <Empty>加载中…</Empty>
+            <Loading />
           ) : error ? (
             <Empty big="加载失败">{error}</Empty>
           ) : tab === "secrets" ? (
             secrets.length === 0 ? (
               <Empty big="还没有变量">点击 “设置变量” 添加，例如 AIKO_HUB_KEY。</Empty>
             ) : (
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-5">
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-5 tsk-rise">
                 {secrets.map((s) => (
                   <div
                     key={s.key}
-                    className="flex flex-col rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm"
+                    className="flex flex-col rounded-2xl border border-slate-200/70 bg-white p-6 shadow-sm transition hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-500/10"
                   >
                     <div className="flex items-start gap-4">
                       <div className="grid size-12 flex-none place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 text-white">
@@ -316,7 +317,7 @@ export default function App() {
                 <Empty big="你还没有发布任何技能">点击 “新建技能”，或在本地 tsk skill init && tsk skill publish。</Empty>
               )
             ) : (
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5">
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5 tsk-rise">
                 {skills.map((s) => (
                   <SkillCard
                     key={s.owner + "/" + s.name}
@@ -336,7 +337,7 @@ export default function App() {
               <Empty big="你还没有注册任何 MCP">点击 “新建 MCP” 开始。</Empty>
             )
           ) : (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5 tsk-rise">
               {items.map((m) => (
                 <McpCard
                   key={m.owner + "/" + m.name}
@@ -430,6 +431,14 @@ function Empty({ big, children }: { big?: string; children: React.ReactNode }) {
     <div className="py-20 text-center text-slate-400">
       {big && <div className="mb-2 text-lg text-slate-500">{big}</div>}
       <div>{children}</div>
+    </div>
+  );
+}
+
+function Loading() {
+  return (
+    <div className="flex items-center justify-center gap-2.5 py-20 text-slate-400">
+      <Spinner width={20} height={20} /> 加载中…
     </div>
   );
 }
