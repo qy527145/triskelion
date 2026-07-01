@@ -108,7 +108,12 @@ tokio = { version = "1", features = [
     "signal",
 ], optional = true }
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
-jsonwebtoken = { version = "10", optional = true }
+# jsonwebtoken 10 默认不含加密后端，须显式选一个。用 rust_crypto（纯 Rust，HS256/HMAC，
+# 无需 CMake/NASM），避免 aws_lc_rs 的外部构建工具依赖。
+jsonwebtoken = { version = "10", default-features = false, features = [
+    "use_pem",
+    "rust_crypto",
+], optional = true }
 argon2 = { version = "0.5", optional = true }
 aes-gcm = { version = "0.11", optional = true }
 rand = { version = "0.10", optional = true }
