@@ -183,6 +183,8 @@ enum SkillCmd {
 }
 
 pub fn run() -> Result<()> {
+    // reqwest/rustls 走 ring 后端：首个 TLS 连接前须安装默认 CryptoProvider（幂等，忽略重复安装）。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     install_interrupt_handler();
     let cli = Cli::parse();
     match cli.cmd {

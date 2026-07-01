@@ -28,6 +28,7 @@ default = ["client", "server"]
 client = [
     "dep:clap",
     "dep:reqwest",
+    "dep:rustls",
     "dep:dialoguer",
     "dep:dirs",
     # 技能包 build/pull：tar 归档 + zstd 压缩
@@ -53,6 +54,7 @@ server = [
     "dep:mime_guess",
     # Hub 作为网关需连接 MCP（crate::mcp 用阻塞 reqwest）
     "dep:reqwest",
+    "dep:rustls",
     # 校验上传技能包压缩体的 sha256
     "dep:sha2",
     # 管理后台「全量资源包」导入/导出：tar 归档 + zstd 压缩
@@ -76,8 +78,13 @@ reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",
     "query",
-    "rustls",
+    "rustls-no-provider",
     "webpki-roots",
+], optional = true }
+# reqwest 0.13 的 rustls 特性默认改用 aws-lc-rs（Windows 需 NASM+CMake，Linux/交叉编译易挂）；
+# 显式改回 ring：自带预生成汇编，无需额外构建工具。进程启动时安装为默认 CryptoProvider。
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
 ], optional = true }
 # 隐藏输入密码；password 特性走 console 宽字符 API，兼容 Windows 非 UTF-8 代码页
 dialoguer = { version = "0.12", features = ["password"], optional = true }
