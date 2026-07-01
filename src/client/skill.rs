@@ -64,6 +64,7 @@ pub fn init(dir: Option<PathBuf>, category: Option<String>) -> Result<()> {
             category: category.clone(),
             description: "一句话描述这个技能能干什么".into(),
             tags: vec![],
+            labels: vec![],
             mcp_dependencies: vec![],
             preferred_tools: vec![],
         };
@@ -126,8 +127,24 @@ pub struct Build {
     pub out_path: PathBuf,
 }
 
+/// 导入时对每个技能清单的批量覆盖：统一改分类、追加标签/受管标签。
+#[derive(Default)]
+pub struct Overrides {
+    /// 覆盖逻辑分类（skill / kb / toolchain / agent）；None 则保留各自清单值。
+    pub category: Option<String>,
+    /// 追加的自由标签（去重合并进 manifest.tags）。
+    pub tags: Vec<String>,
+    /// 追加的受管标签名（去重合并进 manifest.labels，服务端按名关联）。
+    pub labels: Vec<String>,
+}
+
 /// 读取目录、校验、打包。不联网。
 pub fn build(dir: &Path) -> Result<Build> {
+    build_with(dir, &Overrides::default())
+}
+
+/// 同 [`build`]，但在读取清单后按 `ov` 覆盖分类 / 追加标签，再据（可能被覆盖的）分类选说明书。
+pub fn build_with(dir: &Path, ov: &Overrides) -> Result<Build> {
     let dir = if dir.as_os_str().is_empty() {
         PathBuf::from(".")
     } else {
@@ -136,6 +153,20 @@ pub fn build(dir: &Path) -> Result<Build> {
 
     // 先确定分类，再据此决定必须包含的说明书文件（agent → AGENT.md，其余 → SKILL.md）。
     let mut manifest = load_manifest(&dir)?;
+    // 应用导入覆盖：分类覆盖须在选说明书之前，标签/受管标签去重合并。
+    if let Some(cat) = &ov.category {
+        manifest.category = cat.clone();
+    }
+    for t in &ov.tags {
+        if !t.trim().is_empty() && !manifest.tags.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+            manifest.tags.push(t.clone());
+        }
+    }
+    for l in &ov.labels {
+        if !l.trim().is_empty() && !manifest.labels.iter().any(|x| x == l) {
+            manifest.labels.push(l.clone());
+        }
+    }
     validate_manifest(&manifest)?;
     let doc = doc_filename(&manifest.category);
 
@@ -250,11 +281,14 @@ pub fn publish(dir: Option<PathBuf>, visibility: Option<String>) -> Result<()> {
 // import：批量导入第三方技能生态（一个目录下的多个技能子文件夹）
 // ---------------------------------------------------------------------------
 
-/// 把 `root` 下每个含 `SKILL.md` 的子文件夹作为技能发布到市场。
-/// `category` 作为归类 tag 写入每个技能（默认「社区资源」）；`visibility` 默认 public。
+/// 把 `root` 下每个含 `SKILL.md` / `AGENT.md` 的子文件夹作为技能发布到市场。
+/// 三个分类维度可统一覆盖：`category`（逻辑分类，单选，覆盖各清单）、`tags`（自由标签，
+/// 多选，追加）、`labels`（受管标签名如「官方」「社区」，多选，追加）。`visibility` 默认 public。
 pub fn import(
     root: PathBuf,
     category: Option<String>,
+    tags: Vec<String>,
+    labels: Vec<String>,
     visibility: Option<String>,
     yes: bool,
 ) -> Result<()> {
@@ -264,10 +298,20 @@ pub fn import(
     if !root.is_dir() {
         bail!("{} 不是目录", root.display());
     }
-    let category = category
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| "社区资源".into());
+    // `--category` 是「逻辑分类」（单选），只能取 SKILL_CATEGORIES；早失败给出明确指引，
+    // 避免与旧版行为（曾把 category 当自由标签写入）混淆。
+    let category = category.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    if let Some(cat) = &category {
+        if !SKILL_CATEGORIES.contains(&cat.as_str()) {
+            bail!(
+                "--category 只能是 {}（逻辑分类，单选）。\n\
+                 若想按「社区/官方」归类请用 --label，按自由关键词请用 --tag。",
+                SKILL_CATEGORIES.join(" / ")
+            );
+        }
+    }
+    let tags: Vec<String> = tags.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let labels: Vec<String> = labels.into_iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
     let visibility = visibility.unwrap_or_else(|| "public".into());
 
     // 收集直接子目录里含说明书（SKILL.md 或 AGENT.md）的技能文件夹（按名称排序，结果稳定）。
@@ -292,12 +336,10 @@ pub fn import(
         }
     }
 
-    println!(
-        "发现 {} 个技能，将以 [{}] 可见性导入，归类标签「{}」：",
-        candidates.len(),
-        visibility,
-        category
-    );
+    println!("发现 {} 个技能，将以 [{}] 可见性导入：", candidates.len(), visibility);
+    println!("  分类(category): {}", category.as_deref().unwrap_or("<保留各清单>"));
+    println!("  标签(tags): {}", if tags.is_empty() { "<无>".into() } else { tags.join(", ") });
+    println!("  受管标签(labels): {}", if labels.is_empty() { "<无>".into() } else { labels.join(", ") });
     for p in &candidates {
         println!("  • {}", p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
     }
@@ -311,6 +353,11 @@ pub fn import(
         bail!("已取消");
     }
 
+    let ov = Overrides {
+        category: category.clone(),
+        tags: tags.clone(),
+        labels: labels.clone(),
+    };
     let mut ok = 0usize;
     let mut failed: Vec<String> = Vec::new();
     for dir in &candidates {
@@ -318,10 +365,10 @@ pub fn import(
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.display().to_string());
-        match import_one(&api, dir, &category, &visibility) {
+        match import_one(&api, dir, &ov, &visibility) {
             Ok(info) => {
                 ok += 1;
-                println!("  ✓ {}/{} v{} [{}]", info.owner, info.name, info.version, info.visibility);
+                println!("  ✓ {}/{} v{} [{}/{}]", info.owner, info.name, info.version, info.category, info.visibility);
             }
             Err(e) => {
                 failed.push(format!("{label}: {e:#}"));
@@ -340,23 +387,14 @@ pub fn import(
     Ok(())
 }
 
-/// 导入单个技能文件夹：打包 → 注入归类 tag → 上传元数据 + 压缩体。
+/// 导入单个技能文件夹：按覆盖项打包（改分类 / 追加标签）→ 上传元数据 + 压缩体。
 fn import_one(
     api: &HubClient,
     dir: &Path,
-    category: &str,
+    ov: &Overrides,
     visibility: &str,
 ) -> Result<SkillInfo> {
-    let mut b = build(dir)?;
-    // 注入归类 tag（去重，避免与已有标签重复）。
-    if !b
-        .manifest
-        .tags
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(category))
-    {
-        b.manifest.tags.push(category.to_string());
-    }
+    let b = build_with(dir, ov)?;
     let info = api.skill_upsert(&b.manifest, visibility, &b.skill_md, &b.sha256, b.size)?;
     if b.size > 0 {
         api.skill_archive_put(&info.owner, &info.name, b.archive)?;

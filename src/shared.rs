@@ -393,8 +393,12 @@ pub struct SkillManifest {
     pub category: String,
     #[serde(default)]
     pub description: String,
+    /// 自由标签（多选，如 `oa`、`工时`），用于市场搜索与展示的 `#hashtag`。
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 受管标签名（多选，如「官方」「社区」）。须为后台已存在的标签，发布时按名关联。
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// 该技能依赖的底层 MCP（`owner/name`），运行时用 `tsk run` 包装调用。
     #[serde(default)]
     pub mcp_dependencies: Vec<String>,
@@ -416,6 +420,7 @@ impl SkillManifest {
             category: default_category(),
             description: String::new(),
             tags: Vec::new(),
+            labels: Vec::new(),
             mcp_dependencies: Vec::new(),
             preferred_tools: Vec::new(),
         }

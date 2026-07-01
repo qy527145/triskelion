@@ -892,6 +892,38 @@ pub(super) fn labels_of(conn: &rusqlite::Connection, junction: &str, fk: &str, i
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// 按标签名把资源关联到受管标签（合并式：仅新增、去重，不删除既有关联，避免客户端发布
+/// 覆盖掉后台分配的标签）。名称须为已存在的受管标签（大小写/空白敏感，按 `labels.name`
+/// 精确匹配），未知名返回 400。返回该资源当前全部标签名（按名排序）。
+/// `junction`/`fk` 为内部常量（skill_labels/skill_id 等），非用户输入，无注入风险。
+pub(super) fn merge_resource_labels_by_name(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+    rid: i64,
+    names: &[String],
+) -> Result<Vec<String>, ApiError> {
+    for raw in names {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let lid: Option<i64> = conn
+            .query_row("SELECT id FROM labels WHERE name = ?1", [name], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
+        let lid = lid.ok_or_else(|| {
+            ApiError::bad_request(format!("受管标签「{name}」不存在，请先在管理后台创建"))
+        })?;
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO {junction}({fk}, label_id) VALUES (?1, ?2)"),
+            rusqlite::params![rid, lid],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(labels_of(conn, junction, fk, rid))
+}
+
 /// 全量映射：资源 id → 受管标签名列表。供列表接口一次性装配，避免 N+1。
 pub(super) fn all_resource_labels(
     conn: &rusqlite::Connection,

@@ -83,6 +83,8 @@ export interface SkillManifest {
   category: string;
   description: string;
   tags: string[];
+  /** 受管标签名（多选，如「官方」「社区」）。须为后台已存在的标签。 */
+  labels: string[];
   mcp_dependencies: string[];
   preferred_tools: string[];
 }
