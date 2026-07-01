@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Modal from "./Modal";
 import { api } from "../lib/api";
 import {
   docFilename,
+  labelBadgeClass,
   SKILL_CATEGORIES,
   type SkillCategory,
   type SkillInfo,
@@ -53,12 +54,23 @@ export default function CreateSkillModal({
   );
   const [description, setDescription] = useState(edit?.description ?? "");
   const [tags, setTags] = useState((edit?.tags ?? []).join(", "));
+  const [labels, setLabels] = useState<string[]>(edit?.labels ?? []);
+  const [labelOptions, setLabelOptions] = useState<string[]>([]);
   const [mcpDeps, setMcpDeps] = useState((edit?.mcp_dependencies ?? []).join(", "));
   const [preferred, setPreferred] = useState((edit?.preferred_tools ?? []).join(", "));
   const [skillMd, setSkillMd] = useState(edit?.skill_md ?? SKILL_TEMPLATE);
   const [visibility, setVisibility] = useState(edit?.visibility ?? "private");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // 受管标签清单：由后台维护，此处只能勾选已存在的（如「官方」「社区」）。
+  useEffect(() => {
+    api.listLabels().then(setLabelOptions).catch(() => setLabelOptions([]));
+  }, []);
+
+  function toggleLabel(name: string) {
+    setLabels((prev) => (prev.includes(name) ? prev.filter((l) => l !== name) : [...prev, name]));
+  }
 
   // 说明书文件名随分类而定：agent → AGENT.md，其余 → SKILL.md。
   const doc = docFilename(category);
@@ -74,6 +86,7 @@ export default function CreateSkillModal({
       category,
       description: description.trim(),
       tags: parseList(tags),
+      labels,
       mcp_dependencies: parseList(mcpDeps),
       preferred_tools: parseList(preferred),
     };
@@ -202,6 +215,31 @@ export default function CreateSkillModal({
             onChange={(e) => setPreferred(e.target.value)}
           />
         </div>
+        {labelOptions.length > 0 && (
+          <div>
+            <label className={labelCls}>受管标签（多选，如「官方」「社区」）</label>
+            <div className="flex flex-wrap gap-2">
+              {labelOptions.map((l) => {
+                const on = labels.includes(l);
+                return (
+                  <button
+                    key={l}
+                    type="button"
+                    onClick={() => toggleLabel(l)}
+                    className={`rounded-full border px-3 py-1 text-xs font-medium transition ${
+                      on
+                        ? labelBadgeClass(l)
+                        : "border-slate-200 bg-white text-slate-400 hover:border-slate-300"
+                    }`}
+                  >
+                    {on ? "✓ " : ""}
+                    {l}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
         <div>
           <label className={labelCls}>{doc}</label>
           <textarea

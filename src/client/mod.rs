@@ -68,9 +68,15 @@ enum Cmd {
     Import {
         /// 包含多个技能子文件夹的根目录
         dir: PathBuf,
-        /// 归类标签：作为 tag 写入每个导入的技能，便于市场筛选（默认「社区资源」）
+        /// 逻辑分类（单选，覆盖各清单）：skill / kb / toolchain / agent；省略则保留各自清单值
         #[arg(long)]
         category: Option<String>,
+        /// 自由标签（多选，追加）：可重复或逗号分隔，如 --tag oa --tag 工时 或 --tag oa,工时
+        #[arg(long, value_delimiter = ',')]
+        tag: Vec<String>,
+        /// 受管标签名（多选，追加）：须为后台已存在的标签，如 --label 社区；可重复或逗号分隔
+        #[arg(long, value_delimiter = ',')]
+        label: Vec<String>,
         /// 可见性：public（默认，直接上架市场）或 private
         #[arg(long)]
         visibility: Option<String>,
@@ -206,8 +212,8 @@ pub fn run() -> Result<()> {
         },
         Cmd::Pull { package, dir } => skill::pull(&package, dir),
         Cmd::Build { dir } => skill::cmd_build(dir),
-        Cmd::Import { dir, category, visibility, yes } => {
-            skill::import(dir, category, visibility, yes)
+        Cmd::Import { dir, category, tag, label, visibility, yes } => {
+            skill::import(dir, category, tag, label, visibility, yes)
         }
         Cmd::Secret { cmd } => match cmd {
             SecretCmd::Set { key, value } => cmd_secret_set(&key, &value),

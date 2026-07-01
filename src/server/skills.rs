@@ -222,6 +222,27 @@ pub async fn upsert(
         ],
     )
     .map_err(db_err)?;
+
+    // 受管标签（labels）：合并式关联（仅新增、去重），须为后台已存在的标签。
+    // 空则不动既有关联，避免客户端重发布覆盖掉后台分配的标签。
+    let skill_id: i64 = conn
+        .query_row(
+            "SELECT id FROM skills WHERE owner_id = ?1 AND name = ?2",
+            rusqlite::params![claims.sub, m.name],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let labels = if m.labels.is_empty() {
+        super::routes::labels_of(&conn, "skill_labels", "skill_id", skill_id)
+    } else {
+        super::routes::merge_resource_labels_by_name(
+            &conn,
+            "skill_labels",
+            "skill_id",
+            skill_id,
+            &m.labels,
+        )?
+    };
     drop(conn);
 
     Ok(Json(SkillInfo {
@@ -237,7 +258,7 @@ pub async fn upsert(
         skill_md: req.skill_md,
         archive_sha256,
         archive_size: archive_size as u64,
-        labels: Vec::new(),
+        labels,
         updated_at: now,
     }))
 }
