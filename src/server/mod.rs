@@ -109,8 +109,16 @@ pub fn run() -> Result<()> {
 }
 
 async fn shutdown_signal() {
+    // 第一次 Ctrl+C：触发 axum 优雅关闭（停止收新连接、等在途请求收尾）。
     let _ = tokio::signal::ctrl_c().await;
-    println!("\ntriskelion hub shutting down");
+    eprintln!("\ntriskelion hub 正在优雅关闭…（长连接未断时可再按一次 Ctrl+C 强制退出）");
+    // 优雅关闭可能因存在长连接而迟迟不结束：后台再等一次 Ctrl+C，立即强制退出。
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("强制退出");
+            std::process::exit(130);
+        }
+    });
 }
 
 /// 服务端数据目录：优先 `TRISKELION_SERVER_DATA_DIR`，兼容旧的 `TRISKELION_DATA_DIR`，
