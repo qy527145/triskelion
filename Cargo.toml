@@ -72,37 +72,39 @@ anyhow = "1"
 
 # client 侧
 clap = { version = "4", features = ["derive"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",
-    "rustls-tls",
+    "query",
+    "rustls",
+    "webpki-roots",
 ], optional = true }
 # 隐藏输入密码；password 特性走 console 宽字符 API，兼容 Windows 非 UTF-8 代码页
-dialoguer = { version = "0.11", features = ["password"], optional = true }
-dirs = { version = "5", optional = true }
+dialoguer = { version = "0.12", features = ["password"], optional = true }
+dirs = { version = "6.0.0", optional = true }
 # 技能包打包：tar 归档 + zstd 流式压缩（高压缩比，兼顾性能；zstdmt 启用多线程编码）
 tar = { version = "0.4", optional = true }
 zstd = { version = "0.13", features = ["zstdmt"], optional = true }
 # 向后兼容：解压旧版 gzip 压缩体（仅解码路径使用）
 flate2 = { version = "1", optional = true }
 # 压缩体内容寻址与完整性校验（client 打包 / server 校验）
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11.0", optional = true }
 # 客户端 Ctrl+C：注册中断处理，按下即干净退出（含 tsk run 子进程 / 交互提示）
 ctrlc = { version = "3", optional = true }
 
 # server 侧
-axum = { version = "0.7", optional = true }
+axum = { version = "0.8.9", optional = true }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "net",
     "signal",
 ], optional = true }
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-jsonwebtoken = { version = "9", optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+jsonwebtoken = { version = "10", optional = true }
 argon2 = { version = "0.5", optional = true }
-aes-gcm = { version = "0.10", optional = true }
-rand = { version = "0.8", optional = true }
+aes-gcm = { version = "0.11", optional = true }
+rand = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 # 内置 Web UI：把 web/dist 编译进二进制
 rust-embed = { version = "8", features = [
@@ -111,6 +113,6 @@ rust-embed = { version = "8", features = [
 ], optional = true }
 mime_guess = { version = "2", optional = true }
 # 调试期 CORS：放行跨源前端直连
-tower-http = { version = "0.5", features = ["cors"], optional = true }
+tower-http = { version = "0.7", features = ["cors"], optional = true }
 
 [dev-dependencies]
