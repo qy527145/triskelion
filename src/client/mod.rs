@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 
 use api::HubClient;
 use config::Config;
@@ -237,7 +237,9 @@ fn cmd_login(hub: Option<String>, username: Option<String>, password: Option<Str
     };
     let password = match password.or_else(|| std::env::var("TSK_PASSWORD").ok()) {
         Some(p) => p,
-        None => rpassword::prompt_password("密码: ")?,
+        // 用 dialoguer/console 输出提示（Windows 下走 WriteConsoleW 宽字符 API），
+        // 避免 rpassword 直写控制台字节在 GBK 等非 UTF-8 代码页下把中文提示显示为乱码。
+        None => Password::new().with_prompt("密码").interact()?,
     };
 
     let hub_client = HubClient::new(&hub, None);
