@@ -36,6 +36,8 @@ client = [
     # 向后兼容：旧版 .tar.gz 压缩体仍可解压
     "dep:flate2",
     "dep:sha2",
+    # Ctrl+C 中断：交互提示 / 长任务 / tsk run 子进程期间都能干净退出
+    "dep:ctrlc",
 ]
 # triskelion Hub 服务端侧能力
 server = [
@@ -85,6 +87,8 @@ zstd = { version = "0.13", features = ["zstdmt"], optional = true }
 flate2 = { version = "1", optional = true }
 # 压缩体内容寻址与完整性校验（client 打包 / server 校验）
 sha2 = { version = "0.10", optional = true }
+# 客户端 Ctrl+C：注册中断处理，按下即干净退出（含 tsk run 子进程 / 交互提示）
+ctrlc = { version = "3", optional = true }
 
 # server 侧
 axum = { version = "0.7", optional = true }

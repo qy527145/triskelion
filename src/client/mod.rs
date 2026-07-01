@@ -177,6 +177,7 @@ enum SkillCmd {
 }
 
 pub fn run() -> Result<()> {
+    install_interrupt_handler();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Login { hub, username, password } => cmd_login(hub, username, password),
@@ -220,6 +221,18 @@ pub fn run() -> Result<()> {
 fn client(cfg: &Config) -> Result<HubClient> {
     let (hub, token) = cfg.require_auth()?;
     Ok(HubClient::new(hub, Some(token)))
+}
+
+/// 注册 Ctrl+C 处理：默认情况下 dialoguer 会把终端切到 raw 模式、Windows 控制台也
+/// 可能吞掉信号，导致交互提示 / `tsk run` 子进程期间按 Ctrl+C 无法退出。这里统一
+/// 挂一个处理器，按下即打印提示并以退出码 130 干净结束（终端会把 Ctrl+C 同时发给
+/// 前台进程组，子 MCP 进程随之收到 SIGINT，不会被遗留）。
+fn install_interrupt_handler() {
+    // set_handler 仅需成功一次；重复注册的 Err 可忽略。
+    let _ = ctrlc::set_handler(|| {
+        eprintln!("\n已中断 (Ctrl+C)");
+        std::process::exit(130);
+    });
 }
 
 // ---------------------------------------------------------------------------
