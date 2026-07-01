@@ -3,19 +3,18 @@
 //!
 //! 策略（务求稳健，绝不因前端环境缺失而阻断 `cargo build`）：
 //! - 始终保证 `web/dist` 目录存在（rust-embed 要求嵌入目录存在）；
-//! - **自动准备依赖**：`bun` 可用但 `web/node_modules` 缺失时，自动 `bun install`
-//!   （无需手动 `cd web && bun install`）；受限网络见下方 env 说明；
-//! - **按时间戳增量**：仅当前端源码（web/src、index.html、package.json、
-//!   vite.config.ts、tsconfig.json、bun.lock 等）比 `web/dist` 产物更新时，
-//!   才运行 `bun run build`；前端未变则直接沿用已提交的 dist，工作区保持干净、
-//!   不会因每次 `cargo build` 重新生成带哈希的产物而变脏；
+//! - **永不 `bun install`**：仅当 `bun` 命令存在且 `web/node_modules` 已就绪时，
+//!   才可能运行 `bun run build`。因此任何 `cargo install`（crates.io 或 --git，
+//!   都不含 node_modules）必然直接沿用随包提交的 `web/dist`，终端用户零 bun 依赖、
+//!   零网络、零意外构建；
+//! - **按时间戳增量**：即便可构建，也仅当前端源码（web/src、index.html、
+//!   package.json、vite.config.ts、tsconfig.json、bun.lock 等）比 `web/dist` 产物更新时
+//!   才 `bun run build`；未变则跳过，工作区保持干净；
 //! - 覆盖开关：`TRISKELION_BUILD_WEB=1` 强制重建，`TRISKELION_SKIP_WEB_BUILD=1` 强制跳过；
 //! - 失败只告警，不 panic（此时沿用已有 dist 产物或空目录）。
 //!
-//! 受限网络（TLS 拦截 / 需镜像源）下让自动安装生效：
-//!   TRISKELION_BUN_INSTALL_ARGS="--registry https://registry.npmmirror.com" \
-//!   NODE_TLS_REJECT_UNAUTHORIZED=0 cargo build
-//! 也可写进 `.cargo/config.toml` 的 `[env]` 一劳永逸（见项目 README）。
+//! 开发者首次准备前端依赖：`cd web && bun install`（本环境受 TLS 拦截，
+//! 需 `NODE_TLS_REJECT_UNAUTHORIZED=0 bun install --registry https://registry.npmmirror.com`）。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,7 +50,6 @@ fn main() {
     println!("cargo:rerun-if-changed=web/dist");
     println!("cargo:rerun-if-env-changed=TRISKELION_BUILD_WEB");
     println!("cargo:rerun-if-env-changed=TRISKELION_SKIP_WEB_BUILD");
-    println!("cargo:rerun-if-env-changed=TRISKELION_BUN_INSTALL_ARGS");
 
     // 保证嵌入目录存在。
     let _ = std::fs::create_dir_all(&dist);
@@ -69,23 +67,19 @@ fn main() {
         return;
     }
 
+    // 永不 `bun install`：仅当 bun 命令存在且 node_modules 已就绪时才可能重建前端。
+    // 任何 `cargo install`（crates.io 或 --git）都不含 node_modules，故必然直接
+    // 沿用随包提交的 web/dist，绝不触发前端构建——保证终端用户零 bun 依赖、零网络。
     let has_bun = Command::new("bun").arg("--version").output().is_ok();
-    if !has_bun {
-        // 没有 bun：无法安装依赖也无法构建。有预构建产物则直接用，否则占位页。
+    let has_modules = web.join("node_modules").is_dir();
+    if !has_bun || !has_modules {
         if has_prebuilt(&dist) {
-            println!("cargo:warning=未检测到 bun，使用已有 web/dist，跳过前端构建");
+            println!("cargo:warning=使用已有 web/dist（bun={has_bun}, node_modules={has_modules}），跳过前端构建");
         } else {
-            println!("cargo:warning=未检测到 bun，跳过前端构建。如需内置 UI：安装 bun 后重新编译");
-        }
-        ensure_placeholder(&dist);
-        return;
-    }
-
-    // 依赖缺失则自动 `bun install`（不再要求用户手动准备 node_modules）。
-    if !web.join("node_modules").is_dir() && !ensure_deps(&web) {
-        // 安装失败：退回已有产物或占位页，仍不阻断 cargo build。
-        if has_prebuilt(&dist) {
-            println!("cargo:warning=bun install 失败，使用已有 web/dist，跳过前端构建");
+            println!(
+                "cargo:warning=跳过前端构建（bun={has_bun}, node_modules={has_modules}）。\
+                 如需重建内置 UI：cd web && bun install，然后重新编译"
+            );
         }
         ensure_placeholder(&dist);
         return;
@@ -162,35 +156,6 @@ fn extremum_mtime(path: &Path, newest: bool) -> Option<SystemTime> {
         }
     }
     acc
-}
-
-/// 确保前端依赖就绪：`node_modules` 缺失时自动 `bun install`。
-/// 受限网络（TLS 拦截 / 需镜像源）可通过环境变量注入额外参数，例如：
-///   TRISKELION_BUN_INSTALL_ARGS="--registry https://registry.npmmirror.com"
-///   NODE_TLS_REJECT_UNAUTHORIZED=0
-/// 子进程继承本进程环境，故上述 env 直接透传给 bun。返回是否安装成功。
-fn ensure_deps(web: &Path) -> bool {
-    println!("cargo:warning=web/node_modules 缺失，运行 `bun install`…");
-    let mut cmd = Command::new("bun");
-    cmd.arg("install").current_dir(web);
-    if let Ok(extra) = std::env::var("TRISKELION_BUN_INSTALL_ARGS") {
-        cmd.args(extra.split_whitespace());
-    }
-    match cmd.status() {
-        Ok(s) if s.success() => web.join("node_modules").is_dir(),
-        Ok(s) => {
-            println!(
-                "cargo:warning=bun install 失败（exit {s}）。受限网络可设置 \
-                 TRISKELION_BUN_INSTALL_ARGS=\"--registry https://registry.npmmirror.com\" \
-                 及 NODE_TLS_REJECT_UNAUTHORIZED=0 后重试"
-            );
-            false
-        }
-        Err(e) => {
-            println!("cargo:warning=无法运行 bun install（{e}）");
-            false
-        }
-    }
 }
 
 /// 若 dist 为空（既无构建产物又无 index.html），放一个占位页，避免运行期空白。
