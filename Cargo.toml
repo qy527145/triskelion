@@ -29,7 +29,6 @@ client = [
     "dep:clap",
     "dep:reqwest",
     "dep:dialoguer",
-    "dep:rpassword",
     "dep:dirs",
     # 技能包 build/pull：tar 归档 + zstd 压缩
     "dep:tar",
@@ -76,8 +75,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ], optional = true }
-dialoguer = { version = "0.11", optional = true }
-rpassword = { version = "7", optional = true }
+# 隐藏输入密码；password 特性走 console 宽字符 API，兼容 Windows 非 UTF-8 代码页
+dialoguer = { version = "0.11", features = ["password"], optional = true }
 dirs = { version = "5", optional = true }
 # 技能包打包：tar 归档 + zstd 流式压缩（高压缩比，兼顾性能；zstdmt 启用多线程编码）
 tar = { version = "0.4", optional = true }
