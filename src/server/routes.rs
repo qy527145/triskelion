@@ -33,32 +33,32 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/explore", get(explore))
         .route("/v1/labels", get(label_names))
         .route("/v1/mcp", get(mcp_list).post(mcp_upsert))
-        .route("/v1/mcp/:name", delete(mcp_delete))
-        .route("/v1/mcp/:name/rename", post(mcp_rename))
-        .route("/v1/mcp/:name/tools", post(mcp_set_tools))
-        .route("/v1/mcp/:owner/:name", get(mcp_get))
+        .route("/v1/mcp/{name}", delete(mcp_delete))
+        .route("/v1/mcp/{name}/rename", post(mcp_rename))
+        .route("/v1/mcp/{name}/tools", post(mcp_set_tools))
+        .route("/v1/mcp/{owner}/{name}", get(mcp_get))
         // 技能市场
         .route("/v1/skill/explore", get(skills::explore))
         .route("/v1/skill", get(skills::list_mine).post(skills::upsert))
         .route(
-            "/v1/skill/:owner/:name",
+            "/v1/skill/{owner}/{name}",
             get(skills::get).delete(skills::delete),
         )
-        .route("/v1/skill/:owner/:name/rename", post(skills::rename))
+        .route("/v1/skill/{owner}/{name}/rename", post(skills::rename))
         .route(
-            "/v1/skill/:owner/:name/archive",
+            "/v1/skill/{owner}/{name}/archive",
             get(skills::archive_get).put(skills::archive_put),
         )
         .route("/v1/secret", get(secret_list).put(secret_set))
-        .route("/v1/secret/:key", delete(secret_delete))
-        .route("/v1/run/:owner/:name/resolve", post(run_resolve))
-        .route("/v1/run/:owner/:name/call", post(run_call))
-        .route("/v1/run/:owner/:name/report", post(run_report))
+        .route("/v1/secret/{key}", delete(secret_delete))
+        .route("/v1/run/{owner}/{name}/resolve", post(run_resolve))
+        .route("/v1/run/{owner}/{name}/call", post(run_call))
+        .route("/v1/run/{owner}/{name}/report", post(run_report))
         // 管理后台（需 ADMIN_TOKEN）
         .route("/v1/admin/stats", get(admin::stats))
         .route("/v1/admin/users", get(admin::users).post(admin::user_create))
         .route(
-            "/v1/admin/users/:id",
+            "/v1/admin/users/{id}",
             patch(admin::user_update).delete(admin::user_delete),
         )
         .route(
@@ -66,7 +66,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin::groups).post(admin::group_create),
         )
         .route(
-            "/v1/admin/groups/:id",
+            "/v1/admin/groups/{id}",
             patch(admin::group_update).delete(admin::group_delete),
         )
         .route(
@@ -74,12 +74,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin::labels).post(admin::label_create),
         )
         .route(
-            "/v1/admin/labels/:id",
+            "/v1/admin/labels/{id}",
             patch(admin::label_update).delete(admin::label_delete),
         )
         .route("/v1/admin/skills", get(admin::skills_all))
         .route(
-            "/v1/admin/skills/:owner/:name",
+            "/v1/admin/skills/{owner}/{name}",
             patch(admin::skill_update).delete(admin::skill_delete),
         )
         // 批量配置技能 / MCP：可见性、可见分组、增删受管标签。
@@ -89,7 +89,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(admin::mcps_all).post(admin::mcp_register),
         )
         .route(
-            "/v1/admin/mcps/:owner/:name",
+            "/v1/admin/mcps/{owner}/{name}",
             patch(admin::mcp_update).delete(admin::mcp_delete),
         )
         // 外部系统（如 aiko_hub）批量分发用户变量。

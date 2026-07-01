@@ -34,6 +34,8 @@ pub struct AppState {
 
 /// 启动 Hub。自建多线程 tokio runtime 并阻塞，bin 侧保持同步 main。
 pub fn run() -> Result<()> {
+    // 网关连接上游 MCP 走 reqwest/rustls(ring)：首个 TLS 连接前须安装默认 CryptoProvider（幂等）。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let data_dir = server_data_dir();
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("创建数据目录 {}", data_dir.display()))?;
