@@ -202,6 +202,12 @@ export interface AdminMcp {
   updated_at: string;
 }
 
+/** 批量配置的结果：成功条数 + 逐条失败原因。 */
+export interface BatchResult {
+  updated: number;
+  failed: { owner: string; name: string; error: string }[];
+}
+
 export interface CallLog {
   caller: string;
   caller_id: number | null;

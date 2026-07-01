@@ -201,9 +201,11 @@ fn load_or_create_key(path: &std::path::Path, len: usize) -> Result<Vec<u8>> {
     {
         return Ok(bytes);
     }
-    use rand::RngCore;
+    use rand::TryRng;
     let mut buf = vec![0u8; len];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .map_err(|e| anyhow::anyhow!("生成随机密钥失败: {e}"))?;
     std::fs::write(path, &buf).with_context(|| format!("写入密钥 {}", path.display()))?;
     #[cfg(unix)]
     {

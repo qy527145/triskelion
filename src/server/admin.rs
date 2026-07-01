@@ -25,7 +25,7 @@ use base64::Engine;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use rand::RngCore;
+use rand::TryRng;
 
 use crate::archive::ZSTD_LEVEL;
 use crate::shared::{McpManifest, Protocol, Runtime, SKILL_CATEGORIES, ToolMeta};
@@ -1442,13 +1442,182 @@ pub async fn mcp_delete(
 }
 
 // ---------------------------------------------------------------------------
+// 批量配置：对一批技能 / MCP 一次性改可见性 / 可见分组 / 增删受管标签
+// ---------------------------------------------------------------------------
+
+/// 批量操作的资源定位：owner + name（与前端列表行一致，无需暴露内部 id）。
+#[derive(Deserialize)]
+pub struct BatchTarget {
+    owner: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+pub struct BatchPatch {
+    /// 资源类型：skill / mcp。决定操作哪张表。
+    kind: String,
+    /// 目标资源列表（owner/name）。
+    targets: Vec<BatchTarget>,
+    /// private / public；缺省则不改动可见性。
+    #[serde(default)]
+    visibility: Option<String>,
+    /// "all" 或分组 id 数组；缺省则不改动可见分组。
+    #[serde(default)]
+    group_visibility: Option<serde_json::Value>,
+    /// 追加的受管标签 id（合并式，去重，不影响未列出的标签）。
+    #[serde(default)]
+    add_label_ids: Vec<i64>,
+    /// 移除的受管标签 id。
+    #[serde(default)]
+    remove_label_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+pub struct BatchFailure {
+    owner: String,
+    name: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+pub struct BatchResult {
+    updated: usize,
+    failed: Vec<BatchFailure>,
+}
+
+/// 校验一组标签 id 均存在；任一不存在即报错。
+fn ensure_labels_exist(conn: &rusqlite::Connection, ids: &[i64]) -> Result<(), ApiError> {
+    for lid in ids {
+        let ok: bool = conn
+            .query_row("SELECT 1 FROM labels WHERE id = ?1", [lid], |_| Ok(true))
+            .optional()
+            .map_err(db_err)?
+            .unwrap_or(false);
+        if !ok {
+            return Err(ApiError::bad_request("指定的标签不存在"));
+        }
+    }
+    Ok(())
+}
+
+/// 批量配置技能 / MCP 的可见性、可见分组与受管标签。
+/// 标签为「增删式」（add/remove），可见性 / 可见分组为「设置式」，均可单独或组合下发。
+/// 逐条应用，单条失败记入 `failed` 不阻断其余（除非是标签不存在这类前置校验错误）。
+pub async fn batch_update(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<BatchPatch>,
+) -> Result<Json<BatchResult>, ApiError> {
+    require_admin(&state, &headers)?;
+    let (table, junction, fk) = match req.kind.as_str() {
+        "skill" => ("skills", "skill_labels", "skill_id"),
+        "mcp" => ("mcps", "mcp_labels", "mcp_id"),
+        _ => return Err(ApiError::bad_request("kind 只能是 skill 或 mcp")),
+    };
+    if req.targets.is_empty() {
+        return Err(ApiError::bad_request("targets 不能为空"));
+    }
+    if let Some(vis) = req.visibility.as_deref() {
+        check_visibility(vis)?;
+    }
+    // 归一化可见分组一次，供所有目标复用。
+    let group_vis = match &req.group_visibility {
+        Some(gv) => Some(normalize_group_vis(gv)?),
+        None => None,
+    };
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    // 标签存在性前置校验（一次性），避免逐条重复查询与部分写入不一致。
+    ensure_labels_exist(&conn, &req.add_label_ids)?;
+    ensure_labels_exist(&conn, &req.remove_label_ids)?;
+
+    let mut updated = 0usize;
+    let mut failed: Vec<BatchFailure> = Vec::new();
+    for t in &req.targets {
+        match batch_apply_one(
+            &conn, table, junction, fk, t, req.visibility.as_deref(), group_vis.as_deref(),
+            &req.add_label_ids, &req.remove_label_ids, &now,
+        ) {
+            Ok(()) => updated += 1,
+            Err(e) => failed.push(BatchFailure {
+                owner: t.owner.clone(),
+                name: t.name.clone(),
+                error: e.message,
+            }),
+        }
+    }
+    Ok(Json(BatchResult { updated, failed }))
+}
+
+/// 对单个资源应用批量补丁：解析 id → 改可见性/分组 → 增删标签。
+#[allow(clippy::too_many_arguments)]
+fn batch_apply_one(
+    conn: &rusqlite::Connection,
+    table: &str,
+    junction: &str,
+    fk: &str,
+    target: &BatchTarget,
+    visibility: Option<&str>,
+    group_vis: Option<&str>,
+    add_label_ids: &[i64],
+    remove_label_ids: &[i64],
+    now: &str,
+) -> Result<(), ApiError> {
+    // 解析 owner/name → 资源 id（junction 关联用）。
+    let rid: Option<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT r.id FROM {table} r JOIN users u ON u.id = r.owner_id
+                 WHERE u.username = ?1 AND r.name = ?2"
+            ),
+            rusqlite::params![target.owner, target.name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let rid = rid.ok_or_else(|| ApiError::not_found("资源不存在"))?;
+
+    if let Some(vis) = visibility {
+        conn.execute(
+            &format!("UPDATE {table} SET visibility = ?1, updated_at = ?2 WHERE id = ?3"),
+            rusqlite::params![vis, now, rid],
+        )
+        .map_err(db_err)?;
+    }
+    if let Some(gv) = group_vis {
+        conn.execute(
+            &format!("UPDATE {table} SET group_visibility = ?1, updated_at = ?2 WHERE id = ?3"),
+            rusqlite::params![gv, now, rid],
+        )
+        .map_err(db_err)?;
+    }
+    for lid in add_label_ids {
+        conn.execute(
+            &format!("INSERT OR IGNORE INTO {junction}({fk}, label_id) VALUES (?1, ?2)"),
+            rusqlite::params![rid, lid],
+        )
+        .map_err(db_err)?;
+    }
+    for lid in remove_label_ids {
+        conn.execute(
+            &format!("DELETE FROM {junction} WHERE {fk} = ?1 AND label_id = ?2"),
+            rusqlite::params![rid, lid],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 外部系统注入：注册 MCP / 批量分发用户变量（供 aiko_hub 等上游推送）
 // ---------------------------------------------------------------------------
 
 /// 生成一个随机不可登录的口令哈希，供自动创建的占位用户使用。
 fn random_password_hash() -> Result<String, ApiError> {
     let mut buf = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut buf)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
     auth::hash_password(&hex).map_err(|e| ApiError::internal(e.to_string()))
 }

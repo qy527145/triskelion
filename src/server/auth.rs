@@ -5,7 +5,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use axum::http::HeaderMap;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use rand::rngs::OsRng;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
@@ -22,7 +22,13 @@ pub struct Claims {
 }
 
 pub fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
+    // 用 rand 0.10 的系统随机源自行生成推荐长度（16 字节）的盐，再走 password_hash 的
+    // base64 编码，避免依赖 password_hash 内部旧版 rand_core（0.6）的 OsRng。
+    let mut salt_bytes = [0u8; 16];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut salt_bytes)
+        .map_err(|e| anyhow!("生成随机盐失败: {e}"))?;
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| anyhow!("盐编码失败: {e}"))?;
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())

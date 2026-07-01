@@ -5,6 +5,7 @@ import type {
   AdminSkill,
   AdminStats,
   AdminUser,
+  BatchResult,
   CallsQuery,
   CallsResp,
   GroupVisibility,
@@ -317,6 +318,19 @@ export const admin = {
       token,
       { method: "DELETE" },
     ),
+
+  /** 批量配置技能 / MCP：可见性、可见分组、增删受管标签。 */
+  batchUpdate: (
+    token: string,
+    body: {
+      kind: "skill" | "mcp";
+      targets: { owner: string; name: string }[];
+      visibility?: string;
+      group_visibility?: GroupVisibility;
+      add_label_ids?: number[];
+      remove_label_ids?: number[];
+    },
+  ) => adminReq<BatchResult>("/v1/admin/batch", token, { method: "POST", body }),
 
   /** 导出全量资源包，触发浏览器下载 .tskpack。 */
   exportPack: async (token: string): Promise<void> => {

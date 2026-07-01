@@ -24,17 +24,32 @@ import { DownloadIcon, LogoutIcon, PlusIcon, Spinner, TrashIcon } from "./icons"
 
 const TOKEN_KEY = "tsk_admin_token";
 
-const TABS = [
-  { id: "overview", label: "概览" },
-  { id: "skills", label: "技能" },
-  { id: "mcps", label: "MCP 服务" },
-  { id: "users", label: "用户" },
-  { id: "groups", label: "分组" },
-  { id: "labels", label: "标签" },
-  { id: "calls", label: "调用日志" },
-  { id: "migrate", label: "数据迁移" },
+/** 侧边导航按「资源 / 成员 / 运维」分组，把相关页面组织在一起。 */
+const NAV_SECTIONS = [
+  {
+    section: "资源管理",
+    tabs: [
+      { id: "resources", label: "资源" },
+      { id: "labels", label: "标签" },
+    ],
+  },
+  {
+    section: "成员管理",
+    tabs: [
+      { id: "users", label: "用户" },
+      { id: "groups", label: "分组" },
+    ],
+  },
+  {
+    section: "运维",
+    tabs: [
+      { id: "overview", label: "概览" },
+      { id: "calls", label: "调用日志" },
+      { id: "migrate", label: "数据迁移" },
+    ],
+  },
 ] as const;
-type AdminTab = (typeof TABS)[number]["id"];
+type AdminTab = (typeof NAV_SECTIONS)[number]["tabs"][number]["id"];
 
 export default function AdminPanel() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
@@ -132,7 +147,7 @@ function TokenGate({ onAuthed }: { onAuthed: (token: string) => void }) {
 // ---------------------------------------------------------------------------
 
 function Dashboard({ token, onLogout }: { token: string; onLogout: () => void }) {
-  const [tab, setTab] = useState<AdminTab>("overview");
+  const [tab, setTab] = useState<AdminTab>("resources");
   const [toast, setToast] = useState("");
   const notify = useCallback((m: string) => {
     setToast(m);
@@ -160,26 +175,32 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
         <p className="mt-2 text-slate-400">技能、MCP 服务、用户、工具调用审计与全量资源包迁移。</p>
 
         <div className="mt-7 flex gap-6">
-          <nav className="flex w-44 flex-none flex-col gap-1 self-start rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
-            {TABS.map((t) => (
-              <button
-                key={t.id}
-                onClick={() => setTab(t.id)}
-                className={`rounded-xl px-3.5 py-2.5 text-left text-sm font-medium transition ${
-                  tab === t.id
-                    ? "bg-indigo-50 font-semibold text-indigo-600"
-                    : "text-slate-600 hover:bg-slate-100"
-                }`}
-              >
-                {t.label}
-              </button>
+          <nav className="flex w-44 flex-none flex-col gap-4 self-start rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+            {NAV_SECTIONS.map((sec) => (
+              <div key={sec.section} className="flex flex-col gap-1">
+                <div className="px-3 pt-1 text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+                  {sec.section}
+                </div>
+                {sec.tabs.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setTab(t.id)}
+                    className={`rounded-xl px-3.5 py-2.5 text-left text-sm font-medium transition ${
+                      tab === t.id
+                        ? "bg-indigo-50 font-semibold text-indigo-600"
+                        : "text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
             ))}
           </nav>
 
           <div className="min-w-0 flex-1">
             {tab === "overview" && <Overview token={token} />}
-            {tab === "skills" && <SkillsTable token={token} notify={notify} />}
-            {tab === "mcps" && <McpsTable token={token} notify={notify} />}
+            {tab === "resources" && <ResourcesManager token={token} notify={notify} />}
             {tab === "users" && <UsersTable token={token} notify={notify} />}
             {tab === "groups" && <GroupsTable token={token} notify={notify} />}
             {tab === "labels" && <LabelsTable token={token} notify={notify} />}
@@ -339,14 +360,14 @@ function Badge({ kind, children }: { kind: "public" | "private" | "ok" | "err"; 
   );
 }
 
-function Table({ head, children }: { head: string[]; children: React.ReactNode }) {
+function Table({ head, children }: { head: React.ReactNode[]; children: React.ReactNode }) {
   return (
     <Panel className="overflow-x-auto p-0">
       <table className="w-full text-left text-sm">
         <thead>
           <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-400">
-            {head.map((h) => (
-              <th key={h} className="px-5 py-3 font-medium">
+            {head.map((h, i) => (
+              <th key={i} className="px-5 py-3 font-medium">
                 {h}
               </th>
             ))}
@@ -596,22 +617,117 @@ function ModalError({ error }: { error: string }) {
 
 
 
-function SkillsTable({ token, notify }: { token: string; notify: (m: string) => void }) {
-  const { data, loading, error, reload } = useAdminData<AdminSkill[]>(
-    () => admin.skills(token),
-    [token],
-  );
+// ---------------------------------------------------------------------------
+// 资源管理：技能 + MCP 统一视图（搜索 / 过滤 / 分页 / 多选 / 批量配置）
+// ---------------------------------------------------------------------------
+
+type ResourceKind = "skill" | "mcp";
+const RESOURCES_PAGE_SIZE = 12;
+
+/** 资源行的统一视图：技能与 MCP 归一为同一组字段，供表格与批量操作复用。 */
+interface ResourceRow {
+  kind: ResourceKind;
+  owner: string;
+  name: string;
+  visibility: string;
+  group_visibility: string;
+  labels: { id: number; name: string }[];
+  meta: string; // 技能=分类，MCP=运行时/协议
+  updated_at: string;
+  raw: AdminSkill | AdminMcp;
+}
+
+function toRow(kind: ResourceKind, r: AdminSkill | AdminMcp): ResourceRow {
+  const common = {
+    kind,
+    owner: r.owner,
+    name: r.name,
+    visibility: r.visibility,
+    group_visibility: r.group_visibility,
+    labels: r.labels,
+    updated_at: r.updated_at,
+    raw: r,
+  };
+  if (kind === "skill") {
+    const s = r as AdminSkill;
+    return { ...common, meta: s.category };
+  }
+  const m = r as AdminMcp;
+  return { ...common, meta: `${m.runtime} · ${m.protocol}` };
+}
+
+function ResourcesManager({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const [kind, setKind] = useState<ResourceKind>("skill");
   const groups = useGroups(token);
   const labels = useLabels(token);
-  const [edit, setEdit] = useState<AdminSkill | null>(null);
-  const [content, setContent] = useState<AdminSkill | null>(null);
-  if (loading || error) return <StateLine loading={loading} error={error} />;
-  const rows = data!;
 
-  async function del(s: AdminSkill) {
-    if (!confirm(`删除技能「${s.owner}/${s.name}」？此操作不可恢复。`)) return;
+  const { data, loading, error, reload } = useAdminData<ResourceRow[]>(
+    () =>
+      kind === "skill"
+        ? admin.skills(token).then((rs) => rs.map((r) => toRow("skill", r)))
+        : admin.mcps(token).then((rs) => rs.map((r) => toRow("mcp", r))),
+    [token, kind],
+  );
+
+  // 过滤条件。
+  const [q, setQ] = useState("");
+  const [visFilter, setVisFilter] = useState("");
+  const [labelFilter, setLabelFilter] = useState<number | "">("");
+  const [page, setPage] = useState(0);
+  // 选中集合：key = owner/name。
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  // 弹窗。
+  const [batch, setBatch] = useState(false);
+  const [visEdit, setVisEdit] = useState<ResourceRow | null>(null);
+  const [content, setContent] = useState<ResourceRow | null>(null);
+
+  // 切换类型 / 过滤时复位分页与选择。
+  useEffect(() => {
+    setPage(0);
+    setSelected(new Set());
+  }, [kind, q, visFilter, labelFilter]);
+
+  const all = data ?? [];
+  const filtered = all.filter((r) => {
+    if (q) {
+      const needle = q.toLowerCase();
+      if (!r.name.toLowerCase().includes(needle) && !r.owner.toLowerCase().includes(needle))
+        return false;
+    }
+    if (visFilter && r.visibility !== visFilter) return false;
+    if (labelFilter !== "" && !r.labels.some((l) => l.id === labelFilter)) return false;
+    return true;
+  });
+  const lastPage = Math.max(0, Math.ceil(filtered.length / RESOURCES_PAGE_SIZE) - 1);
+  const pageRows = filtered.slice(page * RESOURCES_PAGE_SIZE, (page + 1) * RESOURCES_PAGE_SIZE);
+
+  const key = (r: ResourceRow) => `${r.owner}/${r.name}`;
+  const pageAllSelected = pageRows.length > 0 && pageRows.every((r) => selected.has(key(r)));
+  const toggleOne = (r: ResourceRow) =>
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (next.has(key(r))) next.delete(key(r));
+      else next.add(key(r));
+      return next;
+    });
+  const togglePage = () =>
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (pageAllSelected) pageRows.forEach((r) => next.delete(key(r)));
+      else pageRows.forEach((r) => next.add(key(r)));
+      return next;
+    });
+
+  const selectedTargets = all
+    .filter((r) => selected.has(key(r)))
+    .map((r) => ({ owner: r.owner, name: r.name }));
+
+  async function delOne(r: ResourceRow) {
+    const kindLabel = r.kind === "skill" ? "技能" : "MCP";
+    if (!confirm(`删除${kindLabel}「${r.owner}/${r.name}」？此操作不可恢复。`)) return;
     try {
-      await admin.deleteSkill(token, s.owner, s.name);
+      if (r.kind === "skill") await admin.deleteSkill(token, r.owner, r.name);
+      else await admin.deleteMcp(token, r.owner, r.name);
       notify("已删除");
       reload();
     } catch (e) {
@@ -619,68 +735,232 @@ function SkillsTable({ token, notify }: { token: string; notify: (m: string) => 
     }
   }
 
+  async function batchDelete() {
+    const kindLabel = kind === "skill" ? "技能" : "MCP";
+    if (!confirm(`删除选中的 ${selectedTargets.length} 个${kindLabel}？此操作不可恢复。`)) return;
+    const results = await Promise.allSettled(
+      selectedTargets.map((t) =>
+        kind === "skill"
+          ? admin.deleteSkill(token, t.owner, t.name)
+          : admin.deleteMcp(token, t.owner, t.name),
+      ),
+    );
+    const ok = results.filter((r) => r.status === "fulfilled").length;
+    const fail = results.length - ok;
+    notify(fail ? `删除 ${ok} 个，失败 ${fail} 个` : `已删除 ${ok} 个`);
+    setSelected(new Set());
+    reload();
+  }
+
   return (
-    <div>
-      {rows.length === 0 ? (
-        <Panel>暂无技能。</Panel>
-      ) : (
-        <Table head={["技能", "分类", "可见性", "可见分组", "标签", "压缩体", "更新于", "操作"]}>
-          {rows.map((s) => (
-            <tr key={s.owner + "/" + s.name} className="text-slate-700">
-              <td className="px-5 py-3">
-                <div className="font-semibold text-slate-800">{s.name}</div>
-                <div className="text-xs text-slate-400">@{s.owner}</div>
-              </td>
-              <td className="px-5 py-3 text-slate-500">{s.category}</td>
-              <td className="px-5 py-3">
-                <Badge kind={s.visibility === "public" ? "public" : "private"}>{s.visibility}</Badge>
-              </td>
-              <td className="px-5 py-3 text-xs text-slate-500">
-                {s.visibility === "public" ? groupVisLabel(s.group_visibility, groups) : "—"}
-              </td>
-              <td className="px-5 py-3">
-                <LabelBadges labels={s.labels} />
-              </td>
-              <td className="px-5 py-3 text-slate-500">
-                {s.has_archive ? `📦 ${humanSize(s.archive_size)}` : "纯文本"}
-              </td>
-              <td className="px-5 py-3 text-xs text-slate-400">{s.updated_at}</td>
-              <td className="px-5 py-3">
-                <RowActions>
-                  <MiniButton onClick={() => setContent(s)}>编辑</MiniButton>
-                  <MiniButton onClick={() => setEdit(s)}>配置</MiniButton>
-                  <MiniButton tone="rose" onClick={() => del(s)}>
-                    <TrashIcon width={13} height={13} />
-                  </MiniButton>
-                </RowActions>
-              </td>
-            </tr>
+    <div className="space-y-4">
+      {/* 类型切换 + 搜索 + 过滤 */}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+          {(["skill", "mcp"] as ResourceKind[]).map((k) => (
+            <button
+              key={k}
+              onClick={() => setKind(k)}
+              className={`rounded-lg px-4 py-1.5 text-sm font-semibold transition ${
+                kind === k ? "bg-indigo-500 text-white" : "text-slate-500 hover:bg-slate-100"
+              }`}
+            >
+              {k === "skill" ? "技能" : "MCP 服务"}
+            </button>
           ))}
-        </Table>
+        </div>
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="搜索名称 / 作者…"
+          className={`${inputCls} max-w-[220px]`}
+        />
+        <select
+          value={visFilter}
+          onChange={(e) => setVisFilter(e.target.value)}
+          className={`${selectCls} max-w-[150px]`}
+          style={caretBg}
+        >
+          <option value="">全部可见性</option>
+          <option value="public">public</option>
+          <option value="private">private</option>
+        </select>
+        <select
+          value={labelFilter}
+          onChange={(e) => setLabelFilter(e.target.value ? Number(e.target.value) : "")}
+          className={`${selectCls} max-w-[160px]`}
+          style={caretBg}
+        >
+          <option value="">全部标签</option>
+          {labels.map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.name}
+            </option>
+          ))}
+        </select>
+        <div className="flex-1" />
+        <span className="text-sm text-slate-400">
+          共 <span className="font-semibold text-slate-600">{filtered.length}</span> 个
+        </span>
+      </div>
+
+      {/* 批量操作条 */}
+      {selected.size > 0 && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-indigo-200 bg-indigo-50/70 px-4 py-2.5">
+          <span className="text-sm font-semibold text-indigo-700">已选 {selected.size} 个</span>
+          <div className="flex-1" />
+          <MiniButton onClick={() => setBatch(true)}>批量配置</MiniButton>
+          <MiniButton tone="rose" onClick={batchDelete}>
+            批量删除
+          </MiniButton>
+          <button
+            onClick={() => setSelected(new Set())}
+            className="text-xs font-medium text-slate-400 hover:text-slate-600"
+          >
+            取消选择
+          </button>
+        </div>
       )}
-      {edit && (
-        <VisibilityModal
-          kind="skill"
+
+      {loading || error ? (
+        <StateLine loading={loading} error={error} />
+      ) : filtered.length === 0 ? (
+        <Panel>没有匹配的资源。</Panel>
+      ) : (
+        <>
+          <Table
+            head={[
+              <input
+                key="chk"
+                type="checkbox"
+                checked={pageAllSelected}
+                onChange={togglePage}
+                className="cursor-pointer"
+              />,
+              kind === "skill" ? "技能" : "MCP",
+              kind === "skill" ? "分类" : "运行时",
+              "可见性",
+              "可见分组",
+              "标签",
+              "更新于",
+              "操作",
+            ]}
+          >
+            {pageRows.map((r) => (
+              <tr key={key(r)} className="text-slate-700">
+                <td className="px-5 py-3">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(key(r))}
+                    onChange={() => toggleOne(r)}
+                    className="cursor-pointer"
+                  />
+                </td>
+                <td className="px-5 py-3">
+                  <div className="font-semibold text-slate-800">{r.name}</div>
+                  <div className="text-xs text-slate-400">@{r.owner}</div>
+                </td>
+                <td className="px-5 py-3 text-slate-500">{r.meta}</td>
+                <td className="px-5 py-3">
+                  <Badge kind={r.visibility === "public" ? "public" : "private"}>
+                    {r.visibility}
+                  </Badge>
+                </td>
+                <td className="px-5 py-3 text-xs text-slate-500">
+                  {r.visibility === "public" ? groupVisLabel(r.group_visibility, groups) : "—"}
+                </td>
+                <td className="px-5 py-3">
+                  <LabelBadges labels={r.labels} />
+                </td>
+                <td className="px-5 py-3 text-xs text-slate-400">{r.updated_at}</td>
+                <td className="px-5 py-3">
+                  <RowActions>
+                    <MiniButton onClick={() => setContent(r)}>编辑</MiniButton>
+                    <MiniButton onClick={() => setVisEdit(r)}>配置</MiniButton>
+                    <MiniButton tone="rose" onClick={() => delOne(r)}>
+                      <TrashIcon width={13} height={13} />
+                    </MiniButton>
+                  </RowActions>
+                </td>
+              </tr>
+            ))}
+          </Table>
+
+          {lastPage > 0 && (
+            <div className="flex items-center justify-end gap-2">
+              <span className="mr-2 text-sm text-slate-400">
+                第 {page + 1} / {lastPage + 1} 页
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page <= 0}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                上一页
+              </button>
+              <button
+                onClick={() => setPage((p) => Math.min(lastPage, p + 1))}
+                disabled={page >= lastPage}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                下一页
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      {batch && (
+        <BatchModal
+          kind={kind}
           token={token}
-          owner={edit.owner}
-          name={edit.name}
-          visibility={edit.visibility}
-          groupVisibilityRaw={edit.group_visibility}
+          targets={selectedTargets}
           groups={groups}
           labels={labels}
-          currentLabelIds={edit.labels.map((l) => l.id)}
-          onClose={() => setEdit(null)}
+          onClose={() => setBatch(false)}
+          onSaved={(msg) => {
+            setBatch(false);
+            setSelected(new Set());
+            notify(msg);
+            reload();
+          }}
+        />
+      )}
+      {visEdit && (
+        <VisibilityModal
+          kind={visEdit.kind}
+          token={token}
+          owner={visEdit.owner}
+          name={visEdit.name}
+          visibility={visEdit.visibility}
+          groupVisibilityRaw={visEdit.group_visibility}
+          groups={groups}
+          labels={labels}
+          currentLabelIds={visEdit.labels.map((l) => l.id)}
+          onClose={() => setVisEdit(null)}
           onSaved={() => {
-            setEdit(null);
+            setVisEdit(null);
             notify("已更新");
             reload();
           }}
         />
       )}
-      {content && (
+      {content && content.kind === "skill" && (
         <AdminSkillEditModal
           token={token}
-          skill={content}
+          skill={content.raw as AdminSkill}
+          onClose={() => setContent(null)}
+          onSaved={() => {
+            setContent(null);
+            notify("已更新");
+            reload();
+          }}
+        />
+      )}
+      {content && content.kind === "mcp" && (
+        <AdminMcpEditModal
+          token={token}
+          mcp={content.raw as AdminMcp}
           onClose={() => setContent(null)}
           onSaved={() => {
             setContent(null);
@@ -693,98 +973,173 @@ function SkillsTable({ token, notify }: { token: string; notify: (m: string) => 
   );
 }
 
-function McpsTable({ token, notify }: { token: string; notify: (m: string) => void }) {
-  const { data, loading, error, reload } = useAdminData<AdminMcp[]>(
-    () => admin.mcps(token),
-    [token],
-  );
-  const groups = useGroups(token);
-  const labels = useLabels(token);
-  const [edit, setEdit] = useState<AdminMcp | null>(null);
-  const [content, setContent] = useState<AdminMcp | null>(null);
-  if (loading || error) return <StateLine loading={loading} error={error} />;
-  const rows = data!;
+/** 批量配置：对选中资源统一改可见性 / 可见分组 / 增删标签。各项可独立开关。 */
+function BatchModal({
+  kind,
+  token,
+  targets,
+  groups,
+  labels,
+  onClose,
+  onSaved,
+}: {
+  kind: ResourceKind;
+  token: string;
+  targets: { owner: string; name: string }[];
+  groups: AdminGroup[];
+  labels: AdminLabel[];
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [visOn, setVisOn] = useState(false);
+  const [visibility, setVisibility] = useState("public");
+  const [gvOn, setGvOn] = useState(false);
+  const [gv, setGv] = useState<GroupVisibility>("all");
+  const [addLabelIds, setAddLabelIds] = useState<number[]>([]);
+  const [removeLabelIds, setRemoveLabelIds] = useState<number[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
-  async function del(m: AdminMcp) {
-    if (!confirm(`删除 MCP「${m.owner}/${m.name}」？此操作不可恢复。`)) return;
+  const toggle = (arr: number[], id: number) =>
+    arr.includes(id) ? arr.filter((x) => x !== id) : [...arr, id];
+
+  const nothingToDo =
+    !visOn && !gvOn && addLabelIds.length === 0 && removeLabelIds.length === 0;
+
+  async function save() {
+    if (nothingToDo) {
+      setError("请至少选择一项要修改的配置");
+      return;
+    }
+    setBusy(true);
+    setError("");
     try {
-      await admin.deleteMcp(token, m.owner, m.name);
-      notify("已删除");
-      reload();
+      const res = await admin.batchUpdate(token, {
+        kind,
+        targets,
+        visibility: visOn ? visibility : undefined,
+        group_visibility: gvOn ? gv : undefined,
+        add_label_ids: addLabelIds,
+        remove_label_ids: removeLabelIds,
+      });
+      const failMsg = res.failed.length ? `，失败 ${res.failed.length} 个` : "";
+      onSaved(`已更新 ${res.updated} 个${failMsg}`);
     } catch (e) {
-      notify((e as Error).message);
+      setError((e as Error).message);
+      setBusy(false);
     }
   }
 
   return (
-    <div>
-      {rows.length === 0 ? (
-        <Panel>暂无 MCP。</Panel>
-      ) : (
-        <Table head={["MCP", "可见性", "可见分组", "标签", "运行时", "协议", "更新于", "操作"]}>
-          {rows.map((m) => (
-            <tr key={m.owner + "/" + m.name} className="text-slate-700">
-              <td className="px-5 py-3">
-                <div className="font-semibold text-slate-800">{m.name}</div>
-                <div className="text-xs text-slate-400">@{m.owner}</div>
-              </td>
-              <td className="px-5 py-3">
-                <Badge kind={m.visibility === "public" ? "public" : "private"}>{m.visibility}</Badge>
-              </td>
-              <td className="px-5 py-3 text-xs text-slate-500">
-                {m.visibility === "public" ? groupVisLabel(m.group_visibility, groups) : "—"}
-              </td>
-              <td className="px-5 py-3">
-                <LabelBadges labels={m.labels} />
-              </td>
-              <td className="px-5 py-3 text-slate-500">{m.runtime}</td>
-              <td className="px-5 py-3 text-slate-500">{m.protocol}</td>
-              <td className="px-5 py-3 text-xs text-slate-400">{m.updated_at}</td>
-              <td className="px-5 py-3">
-                <RowActions>
-                  <MiniButton onClick={() => setContent(m)}>编辑</MiniButton>
-                  <MiniButton onClick={() => setEdit(m)}>配置</MiniButton>
-                  <MiniButton tone="rose" onClick={() => del(m)}>
-                    <TrashIcon width={13} height={13} />
-                  </MiniButton>
-                </RowActions>
-              </td>
-            </tr>
-          ))}
-        </Table>
-      )}
-      {edit && (
-        <VisibilityModal
-          kind="mcp"
-          token={token}
-          owner={edit.owner}
-          name={edit.name}
-          visibility={edit.visibility}
-          groupVisibilityRaw={edit.group_visibility}
-          groups={groups}
-          labels={labels}
-          currentLabelIds={edit.labels.map((l) => l.id)}
-          onClose={() => setEdit(null)}
-          onSaved={() => {
-            setEdit(null);
-            notify("已更新");
-            reload();
-          }}
-        />
-      )}
-      {content && (
-        <AdminMcpEditModal
-          token={token}
-          mcp={content}
-          onClose={() => setContent(null)}
-          onSaved={() => {
-            setContent(null);
-            notify("已更新");
-            reload();
-          }}
-        />
-      )}
-    </div>
+    <Modal
+      title="批量配置"
+      subtitle={`对选中的 ${targets.length} 个${kind === "skill" ? "技能" : "MCP"}生效`}
+      onClose={onClose}
+      footer={<ModalFooter busy={busy} onClose={onClose} onSave={save} />}
+    >
+      <div className="space-y-5">
+        {/* 可见性 */}
+        <div className="rounded-xl border border-slate-200 p-4">
+          <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+            <input type="checkbox" checked={visOn} onChange={(e) => setVisOn(e.target.checked)} />
+            设置可见性
+          </label>
+          {visOn && (
+            <div className="mt-3 flex gap-4 text-sm">
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  checked={visibility === "public"}
+                  onChange={() => setVisibility("public")}
+                />
+                public（上架市场）
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  checked={visibility === "private"}
+                  onChange={() => setVisibility("private")}
+                />
+                private（仅作者）
+              </label>
+            </div>
+          )}
+        </div>
+
+        {/* 可见分组 */}
+        <div className="rounded-xl border border-slate-200 p-4">
+          <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+            <input type="checkbox" checked={gvOn} onChange={(e) => setGvOn(e.target.checked)} />
+            设置可见分组
+          </label>
+          {gvOn && (
+            <div className="mt-3">
+              <GroupVisibilityEditor value={gv} groups={groups} onChange={setGv} />
+            </div>
+          )}
+        </div>
+
+        {/* 标签增删 */}
+        <div className="rounded-xl border border-slate-200 p-4">
+          <div className="text-sm font-semibold text-slate-700">标签</div>
+          {labels.length === 0 ? (
+            <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+              还没有标签，请先在「标签」中创建。
+            </p>
+          ) : (
+            <div className="mt-3 space-y-3">
+              <div>
+                <div className="mb-1.5 text-xs text-slate-400">添加这些标签</div>
+                <div className="flex flex-wrap gap-2">
+                  {labels.map((l) => {
+                    const on = addLabelIds.includes(l.id);
+                    return (
+                      <button
+                        key={l.id}
+                        type="button"
+                        onClick={() => setAddLabelIds((c) => toggle(c, l.id))}
+                        className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                          on
+                            ? "border-emerald-300 bg-emerald-50 text-emerald-600"
+                            : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                        }`}
+                      >
+                        {on ? "+ " : ""}
+                        {l.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              <div>
+                <div className="mb-1.5 text-xs text-slate-400">移除这些标签</div>
+                <div className="flex flex-wrap gap-2">
+                  {labels.map((l) => {
+                    const on = removeLabelIds.includes(l.id);
+                    return (
+                      <button
+                        key={l.id}
+                        type="button"
+                        onClick={() => setRemoveLabelIds((c) => toggle(c, l.id))}
+                        className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                          on
+                            ? "border-rose-300 bg-rose-50 text-rose-500"
+                            : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                        }`}
+                      >
+                        {on ? "− " : ""}
+                        {l.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+        <ModalError error={error} />
+      </div>
+    </Modal>
   );
 }
 

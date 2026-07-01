@@ -82,6 +82,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/admin/skills/:owner/:name",
             patch(admin::skill_update).delete(admin::skill_delete),
         )
+        // 批量配置技能 / MCP：可见性、可见分组、增删受管标签。
+        .route("/v1/admin/batch", post(admin::batch_update))
         .route(
             "/v1/admin/mcps",
             get(admin::mcps_all).post(admin::mcp_register),
