@@ -182,7 +182,7 @@ pub fn build_with(dir: &Path, ov: &Overrides) -> Result<Build> {
         .with_context(|| format!("读取 {}", skill_md_path.display()))?;
 
     if manifest.description.trim().is_empty() {
-        manifest.description = extract_description(&skill_md);
+        manifest.description = crate::shared::extract_description(&skill_md);
     }
 
     // 收集要打包的文件（相对路径）。
@@ -552,6 +552,10 @@ fn unpack_archive(bytes: &[u8], target: &Path) -> Result<()> {
             // 兜底：可能是未压缩的裸 tar，尝试直接解包。
             tar::Archive::new(bytes).unpack(target)?;
         }
+        Format::Zip => {
+            // 服务端会把上传的 zip 归一化为 tar.zst 后再落盘，正常拉取路径不会遇到裸 zip。
+            bail!("不支持直接解压 zip 压缩体（服务端应已归一化为 tar.zst）");
+        }
     }
     Ok(())
 }
@@ -629,60 +633,6 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
         }
     }
     Ok(())
-}
-
-fn first_meaningful_line(md: &str) -> String {
-    for line in md.lines() {
-        let t = line.trim().trim_start_matches('#').trim();
-        if !t.is_empty() && !t.starts_with('>') {
-            return t.chars().take(160).collect();
-        }
-    }
-    String::new()
-}
-
-/// 从 SKILL.md 提取一句话描述：优先解析 YAML frontmatter 的 `description:` 字段
-/// （Anthropic 风格技能包惯用 `--- name/description ---` 头），否则退回首个有意义的正文行。
-fn extract_description(md: &str) -> String {
-    if let Some(d) = frontmatter_field(md, "description") {
-        return clip(&d, 240);
-    }
-    first_meaningful_line(md)
-}
-
-/// 解析以 `---` 围起的 YAML frontmatter，取指定标量字段的值（仅支持单行标量，足够覆盖
-/// `name:` / `description:` 这类常见头字段）。非 frontmatter 文档返回 None。
-fn frontmatter_field(md: &str, key: &str) -> Option<String> {
-    let mut lines = md.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-    let prefix = format!("{key}:");
-    for line in lines {
-        let t = line.trim_end();
-        let trimmed = t.trim();
-        if trimmed == "---" || trimmed == "..." {
-            break;
-        }
-        if let Some(rest) = t.strip_prefix(&prefix) {
-            let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// 按字符数（非字节）截断，避免切坏多字节字符；超长时补省略号。
-fn clip(s: &str, n: usize) -> String {
-    let t = s.trim();
-    if t.chars().count() <= n {
-        return t.to_string();
-    }
-    let mut out: String = t.chars().take(n).collect();
-    out.push('…');
-    out
 }
 
 fn split_package(package: &str, cfg: &Config) -> Result<(String, String)> {

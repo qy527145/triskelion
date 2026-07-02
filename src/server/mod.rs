@@ -11,6 +11,7 @@ mod db;
 mod error;
 mod routes;
 mod skills;
+mod skillpack;
 mod web;
 
 use std::path::PathBuf;

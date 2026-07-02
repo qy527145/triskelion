@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/mcp/{owner}/{name}", get(mcp_get))
         // 技能市场
         .route("/v1/skill/explore", get(skills::explore))
+        .route("/v1/skill/inspect", post(skills::inspect))
         .route("/v1/skill", get(skills::list_mine).post(skills::upsert))
         .route(
             "/v1/skill/{owner}/{name}",

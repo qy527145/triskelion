@@ -14,6 +14,7 @@ import type {
   McpManifest,
   SecretInfo,
   SkillInfo,
+  SkillInspectResp,
   SkillManifest,
 } from "./types";
 
@@ -94,6 +95,40 @@ async function req<T>(path: string, opts: ReqOpts = {}): Promise<T> {
   return data as T;
 }
 
+/**
+ * 上传原始二进制体（如压缩包），带 Bearer 鉴权，响应体按 JSON 解析。
+ * 与 `req` 的区别：body 直接是字节流，不做 JSON 序列化、不设 application/json。
+ */
+async function reqRaw<T>(path: string, body: BodyInit): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
+  const token = getToken();
+  if (token) headers["Authorization"] = "Bearer " + token;
+
+  let res: Response;
+  try {
+    res = await fetch(rel(path), { method: "POST", headers, body });
+  } catch (e) {
+    throw new ApiError(0, "无法连接 Hub：" + (e as Error).message);
+  }
+
+  if (res.status === 204) return null as T;
+  const text = await res.text();
+  let data: unknown = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { error: text };
+  }
+  if (!res.ok) {
+    const msg =
+      (data && typeof data === "object" && "error" in data
+        ? (data as { error: string }).error
+        : null) ?? res.statusText;
+    throw new ApiError(res.status, msg);
+  }
+  return data as T;
+}
+
 export interface AuthResp {
   token: string;
   username: string;
@@ -151,12 +186,24 @@ export const api = {
     req<SkillInfo>("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name), {
       auth: true,
     }),
-  upsertSkill: (manifest: SkillManifest, visibility: string, skill_md: string) =>
+  upsertSkill: (
+    manifest: SkillManifest,
+    visibility: string,
+    skill_md: string,
+    archive_sha256 = "",
+    archive_size = 0,
+  ) =>
     req<SkillInfo>("/v1/skill", {
       method: "POST",
       auth: true,
-      body: { manifest, visibility, skill_md, archive_sha256: "", archive_size: 0 },
+      body: { manifest, visibility, skill_md, archive_sha256, archive_size },
     }),
+  /**
+   * 拖入压缩包创建技能：上传原始压缩包字节（zip / tar.zst / tar.gz / 裸 tar），
+   * 服务端解包归一化后回吐清单 + 说明书 + 已落盘的压缩体 sha256/size，供表单预填确认。
+   */
+  inspectSkillArchive: (file: Blob) =>
+    reqRaw<SkillInspectResp>("/v1/skill/inspect", file),
   renameSkill: (owner: string, name: string, newName: string) =>
     req<SkillInfo>(
       "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/rename",

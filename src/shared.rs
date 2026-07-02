@@ -382,6 +382,61 @@ pub fn doc_filename(category: &str) -> &'static str {
     }
 }
 
+/// 从说明书（SKILL.md / AGENT.md）提取一句话描述：优先解析 YAML frontmatter 的
+/// `description:` 字段（Anthropic 风格技能包惯用 `--- name/description ---` 头），
+/// 否则退回首个有意义的正文行。`tsk build` 与 Web 端「拖入压缩包创建技能」共用此逻辑。
+pub fn extract_description(md: &str) -> String {
+    if let Some(d) = frontmatter_field(md, "description") {
+        return clip(&d, 240);
+    }
+    first_meaningful_line(md)
+}
+
+/// 解析以 `---` 围起的 YAML frontmatter，取指定标量字段的值（仅支持单行标量，足够覆盖
+/// `name:` / `description:` 这类常见头字段）。非 frontmatter 文档返回 None。
+pub fn frontmatter_field(md: &str, key: &str) -> Option<String> {
+    let mut lines = md.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    let prefix = format!("{key}:");
+    for line in lines {
+        let t = line.trim_end();
+        let trimmed = t.trim();
+        if trimmed == "---" || trimmed == "..." {
+            break;
+        }
+        if let Some(rest) = t.strip_prefix(&prefix) {
+            let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn first_meaningful_line(md: &str) -> String {
+    for line in md.lines() {
+        let t = line.trim().trim_start_matches('#').trim();
+        if !t.is_empty() && !t.starts_with('>') {
+            return t.chars().take(160).collect();
+        }
+    }
+    String::new()
+}
+
+/// 按字符数（非字节）截断，避免切坏多字节字符；超长时补省略号。
+fn clip(s: &str, n: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= n {
+        return t.to_string();
+    }
+    let mut out: String = t.chars().take(n).collect();
+    out.push('…');
+    out
+}
+
 /// 技能包清单，对应本地 `tsk-skill.json`。SKILL.md 不在此处，单独承载。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SkillManifest {
@@ -441,6 +496,23 @@ pub struct SkillUpsertReq {
     pub archive_sha256: String,
     #[serde(default)]
     pub archive_size: u64,
+}
+
+/// 「拖入压缩包创建技能」的解析结果：服务端解包（zip / tar.zst / tar.gz / 裸 tar）、
+/// 剥离单层根目录、读取 tsk-skill.json 与说明书后回吐，供 Web 端预填表单确认。
+/// 归一化后的 tar.zst 压缩体已按 sha256 落盘，用户确认时以 `archive_sha256` 关联即可。
+#[derive(Serialize, Deserialize)]
+pub struct SkillInspectResp {
+    /// 从压缩包解析出的清单（无 tsk-skill.json 时按目录名/说明书推断，name 可能为空待用户填写）。
+    pub manifest: SkillManifest,
+    /// 说明书（SKILL.md / AGENT.md）全文。
+    pub skill_md: String,
+    /// 归一化 tar.zst 压缩体的 sha256（已落盘，确认创建时回填给 upsert）。
+    pub archive_sha256: String,
+    /// 归一化 tar.zst 压缩体字节数。
+    pub archive_size: u64,
+    /// 压缩包内的文件数（供前端展示）。
+    pub file_count: usize,
 }
 
 /// 技能元信息（市场/详情返回）。

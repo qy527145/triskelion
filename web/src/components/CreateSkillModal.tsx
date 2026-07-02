@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Modal from "./Modal";
-import { api } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import {
   docFilename,
+  humanSize,
   labelBadgeClass,
   SKILL_CATEGORIES,
   type SkillCategory,
@@ -63,10 +64,67 @@ export default function CreateSkillModal({
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // 拖入压缩包创建：服务端解包归一化后，回吐的压缩体 sha256/size（提交时随元数据一并落库）。
+  const [archiveSha, setArchiveSha] = useState("");
+  const [archiveSize, setArchiveSize] = useState(0);
+  const [archiveName, setArchiveName] = useState("");
+  const [fileCount, setFileCount] = useState(0);
+  const [dragActive, setDragActive] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // 受管标签清单：由后台维护，此处只能勾选已存在的（如「官方」「社区」）。
   useEffect(() => {
     api.listLabels().then(setLabelOptions).catch(() => setLabelOptions([]));
   }, []);
+
+  // 拖入 / 选择压缩包：上传给服务端解包，用解析结果预填表单，供用户核对后创建。
+  async function ingestArchive(file: File) {
+    setErr("");
+    setInspecting(true);
+    try {
+      const r = await api.inspectSkillArchive(file);
+      const m = r.manifest;
+      if (m.name) setName(m.name);
+      if (m.version) setVersion(m.version);
+      setCategory((m.category as SkillCategory) ?? "skill");
+      if (m.description) setDescription(m.description);
+      setTags((m.tags ?? []).join(", "));
+      setMcpDeps((m.mcp_dependencies ?? []).join(", "));
+      setPreferred((m.preferred_tools ?? []).join(", "));
+      // 仅勾选后台已存在的受管标签，避免提交时因未知标签被拒。
+      setLabels((m.labels ?? []).filter((l) => labelOptions.includes(l)));
+      if (r.skill_md) setSkillMd(r.skill_md);
+      setArchiveSha(r.archive_sha256);
+      setArchiveSize(r.archive_size);
+      setFileCount(r.file_count);
+      setArchiveName(file.name);
+    } catch (e) {
+      setArchiveSha("");
+      setArchiveName("");
+      setErr(
+        e instanceof ApiError
+          ? `解析压缩包失败：${e.message}`
+          : `解析压缩包失败：${(e as Error).message}`,
+      );
+    } finally {
+      setInspecting(false);
+    }
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragActive(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) void ingestArchive(file);
+  }
+
+  function clearArchive() {
+    setArchiveSha("");
+    setArchiveSize(0);
+    setArchiveName("");
+    setFileCount(0);
+  }
 
   function toggleLabel(name: string) {
     setLabels((prev) => (prev.includes(name) ? prev.filter((l) => l !== name) : [...prev, name]));
@@ -96,7 +154,8 @@ export default function CreateSkillModal({
       if (editing && edit && name.trim() !== edit.name) {
         await api.renameSkill(edit.owner, edit.name, name.trim());
       }
-      await api.upsertSkill(manifest, visibility, skillMd);
+      // 拖入了压缩包则带上其 sha256/size 关联数据体；否则留空，服务端保留既有压缩体。
+      await api.upsertSkill(manifest, visibility, skillMd, archiveSha, archiveSize);
       onSaved(name.trim());
     } catch (e) {
       setErr((e as Error).message);
@@ -107,11 +166,11 @@ export default function CreateSkillModal({
 
   return (
     <Modal
-      title={editing ? "编辑技能" : "新建技能（纯文本）"}
+      title={editing ? "编辑技能" : "新建技能"}
       subtitle={
         editing
-          ? `修改技能的基础信息与 ${doc}。已上传的压缩体保持不变。`
-          : "在 Web 端直接创建一份裸说明书技能。需要打包大文件夹时请用 tsk skill publish。"
+          ? `修改技能的基础信息与 ${doc}。拖入压缩包可替换数据体，否则保持不变。`
+          : "拖入压缩包（zip / tar.zst）自动解析，或直接填写创建一份裸说明书技能。"
       }
       onClose={onClose}
       wide
@@ -134,6 +193,62 @@ export default function CreateSkillModal({
       }
     >
       <div className="space-y-4">
+        {/* 拖入压缩包：上传→服务端解包→预填下方表单。支持 zip / tar.zst / tar.gz / 裸 tar。 */}
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={() => setDragActive(false)}
+          onDrop={onDrop}
+          onClick={() => fileInputRef.current?.click()}
+          className={`cursor-pointer rounded-xl border-2 border-dashed px-4 py-5 text-center text-sm transition ${
+            dragActive
+              ? "border-indigo-400 bg-indigo-50/60"
+              : archiveSha
+                ? "border-emerald-300 bg-emerald-50/50"
+                : "border-slate-300 bg-slate-50 hover:border-indigo-300 hover:bg-slate-100/60"
+          }`}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".zip,.tar,.zst,.tzst,.gz,.tgz"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void ingestArchive(f);
+              e.target.value = "";
+            }}
+          />
+          {inspecting ? (
+            <p className="text-slate-500">解析压缩包中…</p>
+          ) : archiveSha ? (
+            <div className="flex items-center justify-center gap-2 text-emerald-700">
+              <span className="font-semibold">📦 {archiveName}</span>
+              <span className="text-xs text-emerald-600">
+                {fileCount} 个文件 · {humanSize(archiveSize)} · 已解析
+              </span>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  clearArchive();
+                }}
+                className="ml-1 rounded-lg border border-emerald-200 px-2 py-0.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"
+              >
+                移除
+              </button>
+            </div>
+          ) : (
+            <>
+              <p className="font-medium text-slate-600">拖入压缩包，或点击选择</p>
+              <p className="mt-1 text-xs text-slate-400">
+                支持 .zip / .tar.zst / .tar.gz；自动读取 tsk-skill.json 与 SKILL.md 预填下方表单
+              </p>
+            </>
+          )}
+        </div>
         <div className="grid grid-cols-3 gap-3">
           <div className="col-span-2">
             <label className={labelCls}>技能名 (slug)</label>
