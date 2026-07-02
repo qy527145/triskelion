@@ -106,6 +106,15 @@ export interface SkillInfo {
   updated_at: string;
 }
 
+/** 「拖入压缩包创建技能」的服务端解析结果：清单 + 说明书 + 已落盘的归一化压缩体信息。 */
+export interface SkillInspectResp {
+  manifest: SkillManifest;
+  skill_md: string;
+  archive_sha256: string;
+  archive_size: number;
+  file_count: number;
+}
+
 export function humanSize(n: number): string {
   if (!n) return "—";
   const u = ["B", "KB", "MB", "GB"];

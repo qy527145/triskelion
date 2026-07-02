@@ -60,6 +60,9 @@ server = [
     # 管理后台「全量资源包」导入/导出：tar 归档 + zstd 压缩
     "dep:tar",
     "dep:zstd",
+    # Web 端「拖入压缩包创建技能」：解 zip、兼容历史 gzip 压缩体
+    "dep:zip",
+    "dep:flate2",
     # 调试期：允许浏览器/Tauri webview 跨源直连本 Hub（CORS）
     "dep:tower-http",
     # 默认数据目录 ~/.triskelion 需要解析用户主目录
@@ -124,6 +127,8 @@ rust-embed = { version = "8", features = [
     "mime-guess",
 ], optional = true }
 mime_guess = { version = "2", optional = true }
+# Web 端「拖入压缩包创建技能」：读取用户上传的 zip（仅解包，deflate/store 覆盖绝大多数系统压缩产物）
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 # 调试期 CORS：放行跨源前端直连
 tower-http = { version = "0.7", features = ["cors"], optional = true }
 

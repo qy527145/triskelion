@@ -18,6 +18,8 @@ pub enum Format {
     Zstd,
     /// gzip（魔数 0x1F 8B）——历史遗留压缩体。
     Gzip,
+    /// ZIP（魔数 `PK\x03\x04`）——用户在 Web 端拖入的系统压缩包。
+    Zip,
     /// 无法识别。
     Unknown,
 }
@@ -28,6 +30,8 @@ pub fn detect(bytes: &[u8]) -> Format {
         Format::Zstd
     } else if bytes.len() >= 2 && bytes[..2] == [0x1F, 0x8B] {
         Format::Gzip
+    } else if bytes.len() >= 4 && bytes[..4] == [0x50, 0x4B, 0x03, 0x04] {
+        Format::Zip
     } else {
         Format::Unknown
     }
@@ -38,6 +42,8 @@ pub fn blob_extension(bytes: &[u8]) -> &'static str {
     match detect(bytes) {
         Format::Zstd => "tar.zst",
         Format::Gzip => "tar.gz",
+        // ZIP 仅出现在上传解包途中，落盘前都会重打成 tar.zst；兜底给个可辨识扩展名。
+        Format::Zip => "zip",
         Format::Unknown => "bin",
     }
 }

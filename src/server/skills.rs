@@ -14,7 +14,7 @@ use axum::Json;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
-use crate::shared::{SkillInfo, SkillRenameReq, SkillUpsertReq, SKILL_CATEGORIES};
+use crate::shared::{SkillInfo, SkillInspectResp, SkillRenameReq, SkillUpsertReq, SKILL_CATEGORIES};
 
 use super::auth;
 use super::error::ApiError;
@@ -362,6 +362,43 @@ pub async fn rename(
     }
     drop(conn);
     Ok(Json(load_skill(&state, &owner, &new_name)?.0))
+}
+
+/// 拖入压缩包创建技能——解析预览。仅需登录（不校验 owner，创建走 upsert）。
+///
+/// 接收原始压缩包字节（zip / tar.zst / tar.gz / 裸 tar），在阻塞线程里解包并归一化：
+/// 剥离单层根目录、读取 tsk-skill.json 与说明书、重打成平台原生 tar.zst 按 sha256 落盘。
+/// 回吐解析出的清单 + 说明书 + 压缩体 sha256/size，供 Web 端预填表单确认后再 upsert。
+pub async fn inspect(
+    State(state): S,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<SkillInspectResp>, ApiError> {
+    auth::authenticate(&state.jwt_secret, &headers)?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("压缩包为空"));
+    }
+    // 解包 + 重压缩是 CPU 密集型，移出异步线程。
+    let extracted = tokio::task::spawn_blocking(move || super::skillpack::extract_skill(&body))
+        .await
+        .map_err(|e| ApiError::internal(format!("解包任务失败: {e}")))??;
+
+    // 归一化后的 tar.zst 按内容寻址落盘（同内容复用；后续 upsert 以 sha 关联）。
+    let sha = sha256_hex(&extracted.archive);
+    let size = extracted.archive.len() as u64;
+    if find_blob(&state, &sha).is_none() {
+        let path = blob_write_path(&state, &sha, &extracted.archive);
+        std::fs::write(&path, &extracted.archive)
+            .map_err(|e| ApiError::internal(format!("写入压缩体失败: {e}")))?;
+    }
+
+    Ok(Json(SkillInspectResp {
+        manifest: extracted.manifest,
+        skill_md: extracted.skill_md,
+        archive_sha256: sha,
+        archive_size: size,
+        file_count: extracted.file_count,
+    }))
 }
 
 /// 上传技能压缩体（tar.zst 原始字节，亦兼容旧版 gzip）。仅 owner。服务端计算 sha256 落盘并写回记录。
