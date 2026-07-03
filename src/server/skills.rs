@@ -14,7 +14,10 @@ use axum::Json;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
-use crate::shared::{SkillInfo, SkillInspectResp, SkillRenameReq, SkillUpsertReq, SKILL_CATEGORIES};
+use crate::shared::{
+    ReactReq, ReactResp, SkillInfo, SkillInspectResp, SkillRenameReq, SkillUpsertReq, TransferReq,
+    SKILL_CATEGORIES,
+};
 
 use super::auth;
 use super::error::ApiError;
@@ -80,11 +83,16 @@ pub async fn explore(
         .unwrap_or_default();
     let viewer_name = viewer.as_ref().map(|c| c.username.clone());
     let label_map = super::routes::all_resource_labels(&conn, "skill_labels", "skill_id");
+    let count_map = super::routes::all_reaction_counts(&conn, "skill_reactions", "skill_id");
+    let mine_map = viewer
+        .as_ref()
+        .map(|c| super::routes::user_reaction_map(&conn, "skill_reactions", "skill_id", c.sub))
+        .unwrap_or_default();
     let mut stmt = conn
         .prepare(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
                     s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
-                    s.group_visibility, s.id
+                    s.downloads, s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
              WHERE s.visibility = 'public'
                AND (lower(s.name) LIKE ?1 OR lower(s.description) LIKE ?1
@@ -96,7 +104,7 @@ pub async fn explore(
         .map_err(db_err)?;
     let rows = stmt
         .query_map(rusqlite::params![pattern, category, tag], |r| {
-            Ok((row_to_tuple(r)?, r.get::<_, String>(12)?, r.get::<_, i64>(13)?))
+            Ok((row_to_tuple(r)?, r.get::<_, String>(13)?, r.get::<_, i64>(14)?))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
@@ -114,6 +122,8 @@ pub async fn explore(
         }
         let mut info = tuple_to_info(tuple)?;
         info.labels = labels;
+        (info.likes, info.favorites) = count_map.get(&id).copied().unwrap_or_default();
+        (info.liked, info.favorited) = mine_map.get(&id).copied().unwrap_or_default();
         out.push(info);
     }
     Ok(Json(out))
@@ -124,17 +134,19 @@ pub async fn list_mine(State(state): S, headers: HeaderMap) -> Result<Json<Vec<S
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
     let conn = state.db.lock().unwrap();
     let label_map = super::routes::all_resource_labels(&conn, "skill_labels", "skill_id");
+    let count_map = super::routes::all_reaction_counts(&conn, "skill_reactions", "skill_id");
+    let mine_map = super::routes::user_reaction_map(&conn, "skill_reactions", "skill_id", claims.sub);
     let mut stmt = conn
         .prepare(
             "SELECT ?1, s.name, s.category, s.visibility, s.version, s.description,
                     s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
-                    s.id
+                    s.downloads, s.id
              FROM skills s WHERE s.owner_id = ?2 ORDER BY s.updated_at DESC, s.name",
         )
         .map_err(db_err)?;
     let rows = stmt
         .query_map(rusqlite::params![claims.username, claims.sub], |r| {
-            Ok((row_to_tuple(r)?, r.get::<_, i64>(12)?))
+            Ok((row_to_tuple(r)?, r.get::<_, i64>(13)?))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
@@ -142,6 +154,8 @@ pub async fn list_mine(State(state): S, headers: HeaderMap) -> Result<Json<Vec<S
         let (tuple, id) = row.map_err(db_err)?;
         let mut info = tuple_to_info(tuple)?;
         info.labels = label_map.get(&id).cloned().unwrap_or_default();
+        (info.likes, info.favorites) = count_map.get(&id).copied().unwrap_or_default();
+        (info.liked, info.favorited) = mine_map.get(&id).copied().unwrap_or_default();
         out.push(info);
     }
     Ok(Json(out))
@@ -225,11 +239,11 @@ pub async fn upsert(
 
     // 受管标签（labels）：合并式关联（仅新增、去重），须为后台已存在的标签。
     // 空则不动既有关联，避免客户端重发布覆盖掉后台分配的标签。
-    let skill_id: i64 = conn
+    let (skill_id, downloads): (i64, i64) = conn
         .query_row(
-            "SELECT id FROM skills WHERE owner_id = ?1 AND name = ?2",
+            "SELECT id, downloads FROM skills WHERE owner_id = ?1 AND name = ?2",
             rusqlite::params![claims.sub, m.name],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(db_err)?;
     let labels = if m.labels.is_empty() {
@@ -243,6 +257,13 @@ pub async fn upsert(
             &m.labels,
         )?
     };
+    let (likes, favorites, liked, favorited) = super::routes::reaction_summary(
+        &conn,
+        "skill_reactions",
+        "skill_id",
+        skill_id,
+        Some(claims.sub),
+    );
     drop(conn);
 
     Ok(Json(SkillInfo {
@@ -259,6 +280,11 @@ pub async fn upsert(
         archive_sha256,
         archive_size: archive_size as u64,
         labels,
+        likes,
+        favorites,
+        downloads,
+        liked,
+        favorited,
         updated_at: now,
     }))
 }
@@ -269,9 +295,134 @@ pub async fn get(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<SkillInfo>, ApiError> {
-    let (info, group_vis) = load_skill(&state, &owner, &name)?;
+    let (mut info, group_vis, id) = load_skill(&state, &owner, &name)?;
     ensure_skill_access(&state, &headers, &info, &group_vis)?;
+    if let Some(claims) = auth::authenticate_opt(&state.jwt_secret, &headers) {
+        let conn = state.db.lock().unwrap();
+        let (_, _, liked, favorited) = super::routes::reaction_summary(
+            &conn,
+            "skill_reactions",
+            "skill_id",
+            id,
+            Some(claims.sub),
+        );
+        info.liked = liked;
+        info.favorited = favorited;
+    }
     Ok(Json(info))
+}
+
+/// 点赞 / 收藏一个技能（或取消）。资源须对当前用户可见。
+pub async fn react(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<ReactReq>,
+) -> Result<Json<ReactResp>, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let (info, group_vis, id) = load_skill(&state, &owner, &name)?;
+    ensure_skill_access(&state, &headers, &info, &group_vis)?;
+    let conn = state.db.lock().unwrap();
+    let resp = super::routes::set_reaction(
+        &conn,
+        "skill_reactions",
+        "skill_id",
+        id,
+        claims.sub,
+        &req.kind,
+        req.on,
+    )?;
+    Ok(Json(resp))
+}
+
+/// 把自己的技能转移给另一个用户。目标账号必须存在，且不能与其既有技能重名。
+pub async fn transfer(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<TransferReq>,
+) -> Result<StatusCode, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    if claims.username != owner {
+        return Err(ApiError::unauthorized("只能转移自己的技能"));
+    }
+    let new_owner = req.new_owner.trim().to_string();
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let target = super::routes::user_id_by_name(&conn, &new_owner)?
+        .ok_or_else(|| ApiError::not_found("目标用户不存在"))?;
+    if target == claims.sub {
+        return Err(ApiError::bad_request("不能转移给自己"));
+    }
+    let taken: bool = conn
+        .query_row(
+            "SELECT 1 FROM skills WHERE owner_id = ?1 AND name = ?2",
+            rusqlite::params![target, name],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if taken {
+        return Err(ApiError::conflict("对方已有同名技能，请先重命名"));
+    }
+    let n = conn
+        .execute(
+            "UPDATE skills SET owner_id = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![target, now, claims.sub, name],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该技能"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 当前用户收藏的技能（供 `/v1/favorites` 汇总），按收藏时间倒序。
+/// 已失去可见性的（对方转私有 / 分组收紧）自动过滤。
+pub(super) fn favorites_of(
+    state: &AppState,
+    claims: &auth::Claims,
+) -> Result<Vec<SkillInfo>, ApiError> {
+    let conn = state.db.lock().unwrap();
+    let viewer_groups = super::routes::groups_of_user(&conn, claims.sub);
+    let label_map = super::routes::all_resource_labels(&conn, "skill_labels", "skill_id");
+    let count_map = super::routes::all_reaction_counts(&conn, "skill_reactions", "skill_id");
+    let mine_map = super::routes::user_reaction_map(&conn, "skill_reactions", "skill_id", claims.sub);
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
+                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
+                    s.downloads, s.group_visibility, s.id
+             FROM skill_reactions r
+             JOIN skills s ON s.id = r.skill_id
+             JOIN users u ON u.id = s.owner_id
+             WHERE r.user_id = ?1 AND r.kind = 'favorite'
+             ORDER BY r.created_at DESC, s.name",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([claims.sub], |r| {
+            Ok((row_to_tuple(r)?, r.get::<_, String>(13)?, r.get::<_, i64>(14)?))
+        })
+        .map_err(db_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (tuple, group_vis, id) = row.map_err(db_err)?;
+        let is_owner = tuple.0 == claims.username;
+        if !is_owner
+            && (tuple.3 != "public"
+                || !super::routes::group_can_see(&group_vis, &viewer_groups, false))
+        {
+            continue;
+        }
+        let mut info = tuple_to_info(tuple)?;
+        info.labels = label_map.get(&id).cloned().unwrap_or_default();
+        (info.likes, info.favorites) = count_map.get(&id).copied().unwrap_or_default();
+        (info.liked, info.favorited) = mine_map.get(&id).copied().unwrap_or_default();
+        out.push(info);
+    }
+    Ok(out)
 }
 
 pub async fn delete(
@@ -447,7 +598,7 @@ pub async fn archive_get(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (info, group_vis) = load_skill(&state, &owner, &name)?;
+    let (info, group_vis, id) = load_skill(&state, &owner, &name)?;
     ensure_skill_access(&state, &headers, &info, &group_vis)?;
     if info.archive_sha256.is_empty() {
         return Err(ApiError::not_found("该技能没有压缩体（纯文本裸说明书包）"));
@@ -456,6 +607,14 @@ pub async fn archive_get(
         .ok_or_else(|| ApiError::not_found("压缩体文件缺失"))?;
     let bytes = std::fs::read(&path)
         .map_err(|e| ApiError::internal(format!("读取压缩体失败: {e}")))?;
+    // 下载量 +1（尽力而为，失败不影响下载本身）。
+    {
+        let conn = state.db.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE skills SET downloads = downloads + 1 WHERE id = ?1",
+            [id],
+        );
+    }
     // 依据实际压缩格式给出正确的扩展名与 MIME（升级后为 zstd，历史包仍为 gzip）。
     let (ext, mime) = match crate::archive::detect(&bytes) {
         crate::archive::Format::Gzip => ("tar.gz", "application/gzip"),
@@ -537,6 +696,7 @@ type SkillRow = (
     String, // archive_sha256
     i64,    // archive_size
     String, // updated_at
+    i64,    // downloads
 );
 
 fn row_to_tuple(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRow> {
@@ -553,11 +713,12 @@ fn row_to_tuple(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillRow> {
         r.get(9)?,
         r.get(10)?,
         r.get(11)?,
+        r.get(12)?,
     ))
 }
 
 fn tuple_to_info(t: SkillRow) -> Result<SkillInfo, ApiError> {
-    let (owner, name, category, visibility, version, description, tags_json, skill_md, meta_json, sha, size, updated_at) =
+    let (owner, name, category, visibility, version, description, tags_json, skill_md, meta_json, sha, size, updated_at, downloads) =
         t;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let meta: SkillMeta = serde_json::from_str(&meta_json).unwrap_or_default();
@@ -575,31 +736,40 @@ fn tuple_to_info(t: SkillRow) -> Result<SkillInfo, ApiError> {
         archive_sha256: sha,
         archive_size: size as u64,
         labels: Vec::new(),
+        likes: 0,
+        favorites: 0,
+        downloads,
+        liked: false,
+        favorited: false,
         updated_at,
     })
 }
 
-fn load_skill(state: &AppState, owner: &str, name: &str) -> Result<(SkillInfo, String), ApiError> {
+fn load_skill(state: &AppState, owner: &str, name: &str) -> Result<(SkillInfo, String, i64), ApiError> {
     let conn = state.db.lock().unwrap();
     let row: Option<(SkillRow, String, i64)> = conn
         .query_row(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
                     s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
-                    s.group_visibility, s.id
+                    s.downloads, s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
              WHERE u.username = ?1 AND s.name = ?2",
             rusqlite::params![owner, name],
-            |r| Ok((row_to_tuple(r)?, r.get::<_, String>(12)?, r.get::<_, i64>(13)?)),
+            |r| Ok((row_to_tuple(r)?, r.get::<_, String>(13)?, r.get::<_, i64>(14)?)),
         )
         .optional()
         .map_err(db_err)?;
     let (row, group_vis, id) =
         row.ok_or_else(|| ApiError::not_found(format!("未找到技能: {owner}/{name}")))?;
     let labels = super::routes::labels_of(&conn, "skill_labels", "skill_id", id);
+    let (likes, favorites, _, _) =
+        super::routes::reaction_summary(&conn, "skill_reactions", "skill_id", id, None);
     drop(conn);
     let mut info = tuple_to_info(row)?;
     info.labels = labels;
-    Ok((info, group_vis))
+    info.likes = likes;
+    info.favorites = favorites;
+    Ok((info, group_vis, id))
 }
 
 /// 非 owner 访问技能时的可见性 + 分组校验。不可见统一报 not_found（避免泄漏存在性）。

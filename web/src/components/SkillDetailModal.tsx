@@ -1,5 +1,6 @@
 import Modal from "./Modal";
 import Markdown from "./Markdown";
+import ReactionBar from "./ReactionBar";
 import { api } from "../lib/api";
 import { categoryLabel, docFilename, humanSize, type SkillInfo } from "../lib/types";
 import { DownloadIcon } from "./icons";
@@ -25,6 +26,15 @@ export default function SkillDetailModal({ s, onClose }: { s: SkillInfo; onClose
     >
       <div className="space-y-1">
         <Row label="分类">{categoryLabel(s.category)}</Row>
+        <Row label="互动">
+          <ReactionBar
+            likes={s.likes}
+            favorites={s.favorites}
+            downloads={s.downloads}
+            liked={s.liked}
+            favorited={s.favorited}
+          />
+        </Row>
         <Row label="描述">{s.description || <span className="text-slate-400">—</span>}</Row>
         <Row label="标签">
           {s.tags.length ? (

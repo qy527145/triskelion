@@ -101,6 +101,23 @@ pub fn init(conn: &Connection) -> Result<()> {
             PRIMARY KEY (mcp_id, label_id)
         );
 
+        -- 资源互动：点赞 / 收藏（用户 ↔ 资源多对多，kind 取 'like' / 'favorite'），
+        -- 随用户 / 资源删除级联清理。下载量走 skills.downloads 计数列（见下方迁移）。
+        CREATE TABLE IF NOT EXISTS skill_reactions (
+            user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            skill_id   INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, skill_id, kind)
+        );
+        CREATE TABLE IF NOT EXISTS mcp_reactions (
+            user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            mcp_id     INTEGER NOT NULL REFERENCES mcps(id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, mcp_id, kind)
+        );
+
         -- 工具调用审计：每次经 Hub 网关代调用 MCP 工具时记录一行，供管理后台统计
         -- 24h/累计调用量、热门工具与最近错误。caller 为发起者用户名快照。
         CREATE TABLE IF NOT EXISTS tool_calls (
@@ -139,6 +156,11 @@ pub fn init(conn: &Connection) -> Result<()> {
     // 迁移：调用审计补上「结果摘要」列（成功调用的结果概要 / 失败可留空，旧库补列）。
     let _ = conn.execute(
         "ALTER TABLE tool_calls ADD COLUMN result TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    // 迁移：技能下载量计数列（旧库补列，已存在则忽略）。
+    let _ = conn.execute(
+        "ALTER TABLE skills ADD COLUMN downloads INTEGER NOT NULL DEFAULT 0",
         [],
     );
 

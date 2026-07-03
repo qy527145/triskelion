@@ -8,9 +8,10 @@ import CreateSkillModal from "./components/CreateSkillModal";
 import DetailModal from "./components/DetailModal";
 import SkillDetailModal from "./components/SkillDetailModal";
 import SecretModal from "./components/SecretModal";
+import TransferModal from "./components/TransferModal";
 import { SearchIcon, PlusIcon, KeyIcon, TrashIcon, Spinner } from "./components/icons";
 import { api, clearAuth, getUser } from "./lib/api";
-import type { McpInfo, SecretInfo, SkillInfo } from "./lib/types";
+import type { FavoritesResp, McpInfo, ReactKind, SecretInfo, SkillInfo } from "./lib/types";
 import { SKILL_CATEGORIES } from "./lib/types";
 
 const isSkillTab = (t: Tab) => t === "skill-market" || t === "skill-mine";
@@ -20,6 +21,7 @@ const isMarket = (t: Tab) => t === "skill-market" || t === "mcp-market";
 const PERSONAL: { id: Tab; label: string }[] = [
   { id: "skill-mine", label: "我的技能" },
   { id: "mcp-mine", label: "我的 MCP" },
+  { id: "favorites", label: "我的收藏" },
   { id: "secrets", label: "我的变量" },
 ];
 
@@ -30,6 +32,7 @@ export default function App() {
   const [items, setItems] = useState<McpInfo[]>([]);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [secrets, setSecrets] = useState<SecretInfo[]>([]);
+  const [favs, setFavs] = useState<FavoritesResp>({ skills: [], mcps: [] });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -44,6 +47,9 @@ export default function App() {
   const [detail, setDetail] = useState<McpInfo | null>(null);
   const [skillDetail, setSkillDetail] = useState<SkillInfo | null>(null);
   const [secretEdit, setSecretEdit] = useState<{ key: string | null } | null>(null);
+  const [transfer, setTransfer] = useState<{ kind: "skill" | "mcp"; owner: string; name: string } | null>(
+    null,
+  );
   const [toast, setToast] = useState("");
 
   const notify = useCallback((msg: string) => {
@@ -57,6 +63,8 @@ export default function App() {
     try {
       if (tab === "secrets") {
         setSecrets(await api.listSecrets());
+      } else if (tab === "favorites") {
+        setFavs(await api.favorites());
       } else if (tab === "skill-market") {
         setSkills(await api.skillExplore(search, category, undefined, label));
       } else if (tab === "skill-mine") {
@@ -83,7 +91,7 @@ export default function App() {
   }, []);
 
   function switchTab(t: Tab) {
-    if ((t === "skill-mine" || t === "mcp-mine" || t === "secrets") && !user) {
+    if (isPersonal(t) && !user) {
       setShowLogin(true);
       return;
     }
@@ -137,6 +145,38 @@ export default function App() {
     }
   }
 
+  /** 点赞 / 收藏切换：就地更新列表里的计数与标记（含收藏页），无需整页刷新。 */
+  async function reactSkill(s: SkillInfo, kind: ReactKind) {
+    if (!user) {
+      setShowLogin(true);
+      return;
+    }
+    const on = kind === "like" ? !s.liked : !s.favorited;
+    try {
+      const r = await api.reactSkill(s.owner, s.name, kind, on);
+      const patch = (x: SkillInfo) => (x.owner === s.owner && x.name === s.name ? { ...x, ...r } : x);
+      setSkills((cur) => cur.map(patch));
+      setFavs((cur) => ({ ...cur, skills: cur.skills.map(patch) }));
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+  async function reactMcp(m: McpInfo, kind: ReactKind) {
+    if (!user) {
+      setShowLogin(true);
+      return;
+    }
+    const on = kind === "like" ? !m.liked : !m.favorited;
+    try {
+      const r = await api.reactMcp(m.owner, m.name, kind, on);
+      const patch = (x: McpInfo) => (x.owner === m.owner && x.name === m.name ? { ...x, ...r } : x);
+      setItems((cur) => cur.map(patch));
+      setFavs((cur) => ({ ...cur, mcps: cur.mcps.map(patch) }));
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
+
   const meta: Record<Tab, { title: string; subtitle: string }> = {
     "skill-market": {
       title: "技能市场",
@@ -154,6 +194,10 @@ export default function App() {
     "mcp-mine": {
       title: "我的 MCP",
       subtitle: "你注册的全部 MCP（含私有）。设为 public 即上架市场。",
+    },
+    favorites: {
+      title: "我的收藏",
+      subtitle: "你收藏的技能与 MCP。点卡片上的星标即可收藏 / 取消。",
     },
     secrets: {
       title: "我的变量",
@@ -309,6 +353,47 @@ export default function App() {
                 ))}
               </div>
             )
+          ) : tab === "favorites" ? (
+            favs.skills.length === 0 && favs.mcps.length === 0 ? (
+              <Empty big="还没有收藏">在市场里点卡片上的星标即可收藏技能或 MCP。</Empty>
+            ) : (
+              <div className="space-y-8">
+                {favs.skills.length > 0 && (
+                  <div>
+                    <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-slate-400">
+                      技能（{favs.skills.length}）
+                    </h2>
+                    <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5 tsk-rise">
+                      {favs.skills.map((s) => (
+                        <SkillCard
+                          key={s.owner + "/" + s.name}
+                          s={s}
+                          onDetail={() => setSkillDetail(s)}
+                          onReact={(kind) => reactSkill(s, kind)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {favs.mcps.length > 0 && (
+                  <div>
+                    <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-slate-400">
+                      MCP（{favs.mcps.length}）
+                    </h2>
+                    <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-5 tsk-rise">
+                      {favs.mcps.map((m) => (
+                        <McpCard
+                          key={m.owner + "/" + m.name}
+                          m={m}
+                          onDetail={() => setDetail(m)}
+                          onReact={(kind) => reactMcp(m, kind)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
           ) : isSkillTab(tab) ? (
             skills.length === 0 ? (
               tab === "skill-market" ? (
@@ -326,6 +411,8 @@ export default function App() {
                     onDetail={() => setSkillDetail(s)}
                     onEdit={() => setSkillModal({ edit: s })}
                     onDelete={() => deleteSkill(s)}
+                    onTransfer={() => setTransfer({ kind: "skill", owner: s.owner, name: s.name })}
+                    onReact={(kind) => reactSkill(s, kind)}
                   />
                 ))}
               </div>
@@ -346,6 +433,8 @@ export default function App() {
                   onDetail={() => setDetail(m)}
                   onEdit={() => setMcpModal({ edit: m })}
                   onDelete={() => deleteMcp(m)}
+                  onTransfer={() => setTransfer({ kind: "mcp", owner: m.owner, name: m.name })}
+                  onReact={(kind) => reactMcp(m, kind)}
                 />
               ))}
             </div>
@@ -390,6 +479,19 @@ export default function App() {
         />
       )}
       {skillDetail && <SkillDetailModal s={skillDetail} onClose={() => setSkillDetail(null)} />}
+      {transfer && (
+        <TransferModal
+          kind={transfer.kind}
+          owner={transfer.owner}
+          name={transfer.name}
+          onClose={() => setTransfer(null)}
+          onDone={(msg) => {
+            setTransfer(null);
+            notify(msg);
+            load();
+          }}
+        />
+      )}
       {secretEdit && (
         <SecretModal
           editKey={secretEdit.key}

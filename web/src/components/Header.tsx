@@ -2,10 +2,10 @@ import { initials } from "../lib/color";
 import { LogoutIcon } from "./icons";
 import Brand from "./Brand";
 
-export type Tab = "skill-market" | "mcp-market" | "skill-mine" | "mcp-mine" | "secrets";
+export type Tab = "skill-market" | "mcp-market" | "skill-mine" | "mcp-mine" | "favorites" | "secrets";
 
 /** 个人中心下的子页签。 */
-export const PERSONAL_TABS: Tab[] = ["skill-mine", "mcp-mine", "secrets"];
+export const PERSONAL_TABS: Tab[] = ["skill-mine", "mcp-mine", "favorites", "secrets"];
 export const isPersonal = (t: Tab) => PERSONAL_TABS.includes(t);
 
 const MARKET_TABS: { id: Tab; label: string }[] = [

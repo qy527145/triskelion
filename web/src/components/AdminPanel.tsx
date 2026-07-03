@@ -633,6 +633,10 @@ interface ResourceRow {
   group_visibility: string;
   labels: { id: number; name: string }[];
   meta: string; // 技能=分类，MCP=运行时/协议
+  likes: number;
+  favorites: number;
+  /** 下载次数（技能专属；MCP 为 null）。 */
+  downloads: number | null;
   updated_at: string;
   raw: AdminSkill | AdminMcp;
 }
@@ -645,15 +649,17 @@ function toRow(kind: ResourceKind, r: AdminSkill | AdminMcp): ResourceRow {
     visibility: r.visibility,
     group_visibility: r.group_visibility,
     labels: r.labels,
+    likes: r.likes,
+    favorites: r.favorites,
     updated_at: r.updated_at,
     raw: r,
   };
   if (kind === "skill") {
     const s = r as AdminSkill;
-    return { ...common, meta: s.category };
+    return { ...common, meta: s.category, downloads: s.downloads };
   }
   const m = r as AdminMcp;
-  return { ...common, meta: `${m.runtime} · ${m.protocol}` };
+  return { ...common, meta: `${m.runtime} · ${m.protocol}`, downloads: null };
 }
 
 function ResourcesManager({ token, notify }: { token: string; notify: (m: string) => void }) {
@@ -678,6 +684,7 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
   const [selected, setSelected] = useState<Set<string>>(new Set());
   // 弹窗。
   const [batch, setBatch] = useState(false);
+  const [batchTransfer, setBatchTransfer] = useState(false);
   const [visEdit, setVisEdit] = useState<ResourceRow | null>(null);
   const [content, setContent] = useState<ResourceRow | null>(null);
 
@@ -810,6 +817,7 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
           <span className="text-sm font-semibold text-indigo-700">已选 {selected.size} 个</span>
           <div className="flex-1" />
           <MiniButton onClick={() => setBatch(true)}>批量配置</MiniButton>
+          <MiniButton onClick={() => setBatchTransfer(true)}>批量转移</MiniButton>
           <MiniButton tone="rose" onClick={batchDelete}>
             批量删除
           </MiniButton>
@@ -842,6 +850,7 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
               "可见性",
               "可见分组",
               "标签",
+              "互动",
               "更新于",
               "操作",
             ]}
@@ -871,6 +880,10 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
                 </td>
                 <td className="px-5 py-3">
                   <LabelBadges labels={r.labels} />
+                </td>
+                <td className="whitespace-nowrap px-5 py-3 text-xs text-slate-500">
+                  ♥ {r.likes} · ★ {r.favorites}
+                  {r.downloads != null && <> · ⬇ {r.downloads}</>}
                 </td>
                 <td className="px-5 py-3 text-xs text-slate-400">{r.updated_at}</td>
                 <td className="px-5 py-3">
@@ -920,6 +933,20 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
           onClose={() => setBatch(false)}
           onSaved={(msg) => {
             setBatch(false);
+            setSelected(new Set());
+            notify(msg);
+            reload();
+          }}
+        />
+      )}
+      {batchTransfer && (
+        <BatchTransferModal
+          kind={kind}
+          token={token}
+          targets={selectedTargets}
+          onClose={() => setBatchTransfer(false)}
+          onSaved={(msg) => {
+            setBatchTransfer(false);
             setSelected(new Set());
             notify(msg);
             reload();
@@ -1137,6 +1164,87 @@ function BatchModal({
             </div>
           )}
         </div>
+        <ModalError error={error} />
+      </div>
+    </Modal>
+  );
+}
+
+/** 批量转移：把选中的技能 / MCP 统一转给另一个用户。重名的逐条报错，不阻断其余。 */
+function BatchTransferModal({
+  kind,
+  token,
+  targets,
+  onClose,
+  onSaved,
+}: {
+  kind: ResourceKind;
+  token: string;
+  targets: { owner: string; name: string }[];
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [target, setTarget] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [failed, setFailed] = useState<{ owner: string; name: string; error: string }[]>([]);
+  const kindLabel = kind === "skill" ? "技能" : "MCP";
+
+  async function save() {
+    const t = target.trim();
+    if (!t) {
+      setError("请输入接收方用户名");
+      return;
+    }
+    if (!confirm(`确认把选中的 ${targets.length} 个${kindLabel}转移给「${t}」？`)) return;
+    setBusy(true);
+    setError("");
+    setFailed([]);
+    try {
+      const res = await admin.transferResources(token, { kind, targets, to_username: t });
+      if (res.failed.length) {
+        setFailed(res.failed);
+        setError(`已转移 ${res.updated} 个，失败 ${res.failed.length} 个`);
+        setBusy(false);
+      } else {
+        onSaved(`已把 ${res.updated} 个${kindLabel}转移给 ${t}`);
+      }
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title="批量转移"
+      subtitle={`把选中的 ${targets.length} 个${kindLabel}转移给另一个用户`}
+      onClose={onClose}
+      footer={<ModalFooter busy={busy} onClose={onClose} onSave={save} />}
+    >
+      <div className="space-y-4">
+        <Field label="接收方用户名">
+          <input
+            autoFocus
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && save()}
+            placeholder="必须是已存在的用户"
+            className={inputCls}
+          />
+        </Field>
+        <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+          转移后资源归接收方所有；与接收方既有资源重名的会失败并保留在原账号名下。
+        </p>
+        {failed.length > 0 && (
+          <ul className="max-h-40 list-inside list-disc overflow-auto rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-500">
+            {failed.map((f, i) => (
+              <li key={i}>
+                {f.owner}/{f.name}：{f.error}
+              </li>
+            ))}
+          </ul>
+        )}
         <ModalError error={error} />
       </div>
     </Modal>
@@ -1551,6 +1659,7 @@ function UsersTable({ token, notify }: { token: string; notify: (m: string) => v
   );
   const groups = useGroups(token);
   const [modal, setModal] = useState<{ edit: AdminUser | null } | null>(null);
+  const [transferFrom, setTransferFrom] = useState<AdminUser | null>(null);
   if (loading || error) return <StateLine loading={loading} error={error} />;
   const rows = data!;
 
@@ -1574,7 +1683,7 @@ function UsersTable({ token, notify }: { token: string; notify: (m: string) => v
     <div className="space-y-4">
       <Toolbar
         title="用户"
-        hint="创建用户、调整分组归属、重置密码或删除。"
+        hint="创建用户、调整分组归属、重置密码、转移名下资源或删除。"
         action={
           <PrimaryButton onClick={() => setModal({ edit: null })}>
             <PlusIcon width={16} height={16} /> 新建用户
@@ -1608,6 +1717,7 @@ function UsersTable({ token, notify }: { token: string; notify: (m: string) => v
             <td className="px-5 py-3">
               <RowActions>
                 <MiniButton onClick={() => setModal({ edit: u })}>编辑</MiniButton>
+                <MiniButton onClick={() => setTransferFrom(u)}>转移资源</MiniButton>
                 <MiniButton tone="rose" onClick={() => del(u)}>
                   <TrashIcon width={13} height={13} />
                 </MiniButton>
@@ -1629,7 +1739,103 @@ function UsersTable({ token, notify }: { token: string; notify: (m: string) => v
           }}
         />
       )}
+      {transferFrom && (
+        <UserTransferModal
+          token={token}
+          from={transferFrom}
+          onClose={() => setTransferFrom(null)}
+          onSaved={(msg) => {
+            setTransferFrom(null);
+            notify(msg);
+            reload();
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+/** 整户转移：把某用户名下全部技能与 MCP 转给另一个用户（注销前的资产交接）。 */
+function UserTransferModal({
+  token,
+  from,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  from: AdminUser;
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
+  const [target, setTarget] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [skipped, setSkipped] = useState<string[]>([]);
+
+  async function save() {
+    const t = target.trim();
+    if (!t) {
+      setError("请输入接收方用户名");
+      return;
+    }
+    if (
+      !confirm(
+        `确认把「${from.username}」名下的 ${from.skills} 个技能、${from.mcps} 个 MCP 全部转移给「${t}」？\n加密凭据属个人机密，不会转移。`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    setSkipped([]);
+    try {
+      const res = await admin.transferUser(token, from.id, t);
+      if (res.skipped.length) {
+        setSkipped(res.skipped);
+        setError(
+          `已转移技能 ${res.skills_moved} 个、MCP ${res.mcps_moved} 个；${res.skipped.length} 个因重名跳过`,
+        );
+        setBusy(false);
+      } else {
+        onSaved(`已把 ${from.username} 的技能 ${res.skills_moved} 个、MCP ${res.mcps_moved} 个转移给 ${t}`);
+      }
+    } catch (e) {
+      setError((e as Error).message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title="转移用户资源"
+      subtitle={`把 ${from.username} 名下全部技能与 MCP 转给另一个用户`}
+      onClose={onClose}
+      footer={<ModalFooter busy={busy} onClose={onClose} onSave={save} />}
+    >
+      <div className="space-y-4">
+        <Field label="接收方用户名">
+          <input
+            autoFocus
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && save()}
+            placeholder="必须是已存在的用户"
+            className={inputCls}
+          />
+        </Field>
+        <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-600">
+          适用于用户注销前的资产交接：技能与 MCP 归属整体变更；与接收方重名的资源会跳过并保留在原账号名下；
+          加密凭据不随迁。
+        </p>
+        {skipped.length > 0 && (
+          <ul className="max-h-40 list-inside list-disc overflow-auto rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-500">
+            {skipped.map((s, i) => (
+              <li key={i}>{s}</li>
+            ))}
+          </ul>
+        )}
+        <ModalError error={error} />
+      </div>
+    </Modal>
   );
 }
 

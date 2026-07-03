@@ -36,6 +36,10 @@ export interface McpInfo {
   manifest: McpManifest;
   tools?: ToolMeta[];
   labels?: string[];
+  likes: number;
+  favorites: number;
+  liked: boolean;
+  favorited: boolean;
   updated_at: string;
 }
 
@@ -103,7 +107,28 @@ export interface SkillInfo {
   archive_sha256: string;
   archive_size: number;
   labels?: string[];
+  likes: number;
+  favorites: number;
+  downloads: number;
+  liked: boolean;
+  favorited: boolean;
   updated_at: string;
+}
+
+/** 点赞 / 收藏切换后的最新状态（计数 + 查看者标记）。 */
+export interface ReactResp {
+  likes: number;
+  favorites: number;
+  liked: boolean;
+  favorited: boolean;
+}
+
+export type ReactKind = "like" | "favorite";
+
+/** 当前用户收藏的全部资源（技能 + MCP）。 */
+export interface FavoritesResp {
+  skills: SkillInfo[];
+  mcps: McpInfo[];
 }
 
 /** 「拖入压缩包创建技能」的服务端解析结果：清单 + 说明书 + 已落盘的归一化压缩体信息。 */
@@ -195,6 +220,9 @@ export interface AdminSkill {
   archive_size: number;
   has_archive: boolean;
   labels: GroupBrief[];
+  likes: number;
+  favorites: number;
+  downloads: number;
   updated_at: string;
 }
 
@@ -208,7 +236,16 @@ export interface AdminMcp {
   protocol: string;
   manifest: McpManifest;
   labels: GroupBrief[];
+  likes: number;
+  favorites: number;
   updated_at: string;
+}
+
+/** 整户资源转移的结果：迁移条数 + 因重名跳过的资源。 */
+export interface UserTransferResult {
+  skills_moved: number;
+  mcps_moved: number;
+  skipped: string[];
 }
 
 /** 批量配置的结果：成功条数 + 逐条失败原因。 */

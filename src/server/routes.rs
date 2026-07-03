@@ -9,8 +9,9 @@ use axum::{Json, Router};
 use rusqlite::OptionalExtension;
 
 use crate::shared::{
-    AuthReq, AuthResp, CallReq, McpInfo, McpManifest, McpRenameReq, McpUpsertReq, ReportCallReq,
-    ResolveResp, SecretInfo, SecretSetReq, SetToolsReq, ToolMeta, stitch,
+    AuthReq, AuthResp, CallReq, McpInfo, McpManifest, McpRenameReq, McpUpsertReq, ReactReq,
+    ReactResp, ReportCallReq, ResolveResp, SecretInfo, SecretSetReq, SetToolsReq, ToolMeta,
+    TransferReq, stitch,
 };
 
 use super::auth;
@@ -35,8 +36,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/mcp", get(mcp_list).post(mcp_upsert))
         .route("/v1/mcp/{name}", delete(mcp_delete))
         .route("/v1/mcp/{name}/rename", post(mcp_rename))
+        .route("/v1/mcp/{name}/transfer", post(mcp_transfer))
         .route("/v1/mcp/{name}/tools", post(mcp_set_tools))
         .route("/v1/mcp/{owner}/{name}", get(mcp_get))
+        .route("/v1/mcp/{owner}/{name}/react", post(mcp_react))
+        // 当前用户收藏的全部资源（技能 + MCP）
+        .route("/v1/favorites", get(favorites))
         // 技能市场
         .route("/v1/skill/explore", get(skills::explore))
         .route("/v1/skill/inspect", post(skills::inspect))
@@ -46,6 +51,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(skills::get).delete(skills::delete),
         )
         .route("/v1/skill/{owner}/{name}/rename", post(skills::rename))
+        .route("/v1/skill/{owner}/{name}/react", post(skills::react))
+        .route("/v1/skill/{owner}/{name}/transfer", post(skills::transfer))
         .route(
             "/v1/skill/{owner}/{name}/archive",
             get(skills::archive_get).put(skills::archive_put),
@@ -85,6 +92,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         // 批量配置技能 / MCP：可见性、可见分组、增删受管标签。
         .route("/v1/admin/batch", post(admin::batch_update))
+        // 资源转移：批量转移选中资源 / 整户转移某用户名下全部资源。
+        .route("/v1/admin/transfer", post(admin::transfer_resources))
+        .route("/v1/admin/users/{id}/transfer", post(admin::user_transfer))
         .route(
             "/v1/admin/mcps",
             get(admin::mcps_all).post(admin::mcp_register),
@@ -262,6 +272,11 @@ async fn explore(
         .unwrap_or_default();
     let viewer_name = viewer.as_ref().map(|c| c.username.clone());
     let label_map = all_resource_labels(&conn, "mcp_labels", "mcp_id");
+    let count_map = all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
+    let mine_map = viewer
+        .as_ref()
+        .map(|c| user_reaction_map(&conn, "mcp_reactions", "mcp_id", c.sub))
+        .unwrap_or_default();
     let mut stmt = conn
         .prepare(
             "SELECT m.id, u.username, m.name, m.visibility, m.version, m.manifest, m.tools,
@@ -303,6 +318,8 @@ async fn explore(
         }
         let manifest: McpManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| ApiError::internal(format!("manifest 解析失败: {e}")))?;
+        let (likes, favorites) = count_map.get(&id).copied().unwrap_or_default();
+        let (liked, favorited) = mine_map.get(&id).copied().unwrap_or_default();
         out.push(McpInfo {
             owner,
             name,
@@ -311,6 +328,10 @@ async fn explore(
             manifest,
             tools: parse_tools(&tools_json),
             labels,
+            likes,
+            favorites,
+            liked,
+            favorited,
             updated_at,
         });
     }
@@ -364,13 +385,15 @@ async fn mcp_upsert(
     )
     .map_err(db_err)?;
     // tools 不随 manifest 改动（插入默认 '[]'，更新时保留旧值），单独读出用于响应。
-    let tools_json: String = conn
+    let (mid, tools_json): (i64, String) = conn
         .query_row(
-            "SELECT tools FROM mcps WHERE owner_id = ?1 AND name = ?2",
+            "SELECT id, tools FROM mcps WHERE owner_id = ?1 AND name = ?2",
             rusqlite::params![claims.sub, manifest.name],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(db_err)?;
+    let (likes, favorites, liked, favorited) =
+        reaction_summary(&conn, "mcp_reactions", "mcp_id", mid, Some(claims.sub));
     drop(conn);
     Ok(Json(McpInfo {
         owner: claims.username,
@@ -380,6 +403,10 @@ async fn mcp_upsert(
         manifest,
         tools: parse_tools(&tools_json),
         labels: Vec::new(),
+        likes,
+        favorites,
+        liked,
+        favorited,
         updated_at: now,
     }))
 }
@@ -388,6 +415,8 @@ async fn mcp_list(State(state): S, headers: HeaderMap) -> Result<Json<Vec<McpInf
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
     let conn = state.db.lock().unwrap();
     let label_map = all_resource_labels(&conn, "mcp_labels", "mcp_id");
+    let count_map = all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
+    let mine_map = user_reaction_map(&conn, "mcp_reactions", "mcp_id", claims.sub);
     let mut stmt = conn
         .prepare(
             "SELECT id, name, visibility, version, manifest, tools, updated_at
@@ -413,6 +442,8 @@ async fn mcp_list(State(state): S, headers: HeaderMap) -> Result<Json<Vec<McpInf
             row.map_err(db_err)?;
         let manifest: McpManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| ApiError::internal(format!("manifest 解析失败: {e}")))?;
+        let (likes, favorites) = count_map.get(&id).copied().unwrap_or_default();
+        let (liked, favorited) = mine_map.get(&id).copied().unwrap_or_default();
         out.push(McpInfo {
             owner: claims.username.clone(),
             name,
@@ -421,6 +452,10 @@ async fn mcp_list(State(state): S, headers: HeaderMap) -> Result<Json<Vec<McpInf
             manifest,
             tools: parse_tools(&tools_json),
             labels: label_map.get(&id).cloned().unwrap_or_default(),
+            likes,
+            favorites,
+            liked,
+            favorited,
             updated_at,
         });
     }
@@ -460,15 +495,15 @@ async fn mcp_rename(
     }
     let now = now_string();
     let conn = state.db.lock().unwrap();
-    let row: Option<(String, String, String, String)> = conn
+    let row: Option<(i64, String, String, String, String)> = conn
         .query_row(
-            "SELECT visibility, version, manifest, tools FROM mcps WHERE owner_id = ?1 AND name = ?2",
+            "SELECT id, visibility, version, manifest, tools FROM mcps WHERE owner_id = ?1 AND name = ?2",
             rusqlite::params![claims.sub, name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(db_err)?;
-    let (visibility, version, manifest_json, tools_json) =
+    let (mid, visibility, version, manifest_json, tools_json) =
         row.ok_or_else(|| ApiError::not_found("未找到该 MCP"))?;
 
     if new_name != name {
@@ -497,6 +532,8 @@ async fn mcp_rename(
         rusqlite::params![new_name, new_json, now, claims.sub, name],
     )
     .map_err(db_err)?;
+    let (likes, favorites, liked, favorited) =
+        reaction_summary(&conn, "mcp_reactions", "mcp_id", mid, Some(claims.sub));
     drop(conn);
 
     Ok(Json(McpInfo {
@@ -507,6 +544,10 @@ async fn mcp_rename(
         manifest,
         tools: parse_tools(&tools_json),
         labels: Vec::new(),
+        likes,
+        favorites,
+        liked,
+        favorited,
         updated_at: now,
     }))
 }
@@ -541,9 +582,141 @@ async fn mcp_get(
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<McpInfo>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let (info, group_vis) = load_mcp(&state, &owner, &name)?;
+    let (mut info, group_vis, id) = load_mcp(&state, &owner, &name)?;
     ensure_mcp_access(&state, &info, &group_vis, &claims)?;
+    let conn = state.db.lock().unwrap();
+    let (_, _, liked, favorited) =
+        reaction_summary(&conn, "mcp_reactions", "mcp_id", id, Some(claims.sub));
+    drop(conn);
+    info.liked = liked;
+    info.favorited = favorited;
     Ok(Json(info))
+}
+
+/// 点赞 / 收藏一个 MCP（或取消）。资源须对当前用户可见。
+async fn mcp_react(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+    Json(req): Json<ReactReq>,
+) -> Result<Json<ReactResp>, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let (info, group_vis, id) = load_mcp(&state, &owner, &name)?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
+    let conn = state.db.lock().unwrap();
+    let resp = set_reaction(&conn, "mcp_reactions", "mcp_id", id, claims.sub, &req.kind, req.on)?;
+    Ok(Json(resp))
+}
+
+/// 把自己的 MCP 转移给另一个用户。目标账号必须存在，且不能与其既有 MCP 重名。
+async fn mcp_transfer(
+    State(state): S,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(req): Json<TransferReq>,
+) -> Result<StatusCode, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let new_owner = req.new_owner.trim().to_string();
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let target = user_id_by_name(&conn, &new_owner)?
+        .ok_or_else(|| ApiError::not_found("目标用户不存在"))?;
+    if target == claims.sub {
+        return Err(ApiError::bad_request("不能转移给自己"));
+    }
+    let taken: bool = conn
+        .query_row(
+            "SELECT 1 FROM mcps WHERE owner_id = ?1 AND name = ?2",
+            rusqlite::params![target, name],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if taken {
+        return Err(ApiError::conflict("对方已有同名 MCP，请先重命名"));
+    }
+    let n = conn
+        .execute(
+            "UPDATE mcps SET owner_id = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
+            rusqlite::params![target, now, claims.sub, name],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("未找到该 MCP"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 当前用户收藏的全部资源（技能 + MCP），按收藏时间倒序。
+/// 已失去可见性的（对方转私有 / 分组收紧）自动过滤，不在列表中出现。
+async fn favorites(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let skills = skills::favorites_of(&state, &claims)?;
+    let conn = state.db.lock().unwrap();
+    let viewer_groups = groups_of_user(&conn, claims.sub);
+    let label_map = all_resource_labels(&conn, "mcp_labels", "mcp_id");
+    let count_map = all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
+    let mine_map = user_reaction_map(&conn, "mcp_reactions", "mcp_id", claims.sub);
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, u.username, m.name, m.visibility, m.version, m.manifest, m.tools,
+                    m.updated_at, m.group_visibility
+             FROM mcp_reactions r
+             JOIN mcps m ON m.id = r.mcp_id
+             JOIN users u ON u.id = m.owner_id
+             WHERE r.user_id = ?1 AND r.kind = 'favorite'
+             ORDER BY r.created_at DESC, m.name",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([claims.sub], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(db_err)?;
+    let mut mcps = Vec::new();
+    for row in rows {
+        let (id, owner, name, visibility, version, manifest_json, tools_json, updated_at, group_vis) =
+            row.map_err(db_err)?;
+        let is_owner = owner == claims.username;
+        if !is_owner
+            && (visibility != "public" || !group_can_see(&group_vis, &viewer_groups, false))
+        {
+            continue;
+        }
+        let Ok(manifest) = serde_json::from_str::<McpManifest>(&manifest_json) else {
+            continue;
+        };
+        let (likes, fav_count) = count_map.get(&id).copied().unwrap_or_default();
+        let (liked, favorited) = mine_map.get(&id).copied().unwrap_or_default();
+        mcps.push(McpInfo {
+            owner,
+            name,
+            visibility,
+            version,
+            manifest,
+            tools: parse_tools(&tools_json),
+            labels: label_map.get(&id).cloned().unwrap_or_default(),
+            likes,
+            favorites: fav_count,
+            liked,
+            favorited,
+            updated_at,
+        });
+    }
+    drop(stmt);
+    drop(conn);
+    Ok(Json(serde_json::json!({ "skills": skills, "mcps": mcps })))
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +805,7 @@ async fn run_resolve(
 ) -> Result<Json<ResolveResp>, ApiError> {
     // 鉴权可选：未登录也能解析公开 MCP（返回原始 manifest，线上变量为空）。
     let viewer = auth::authenticate_opt(&state.jwt_secret, &headers);
-    let (info, group_vis) = load_mcp(&state, &owner, &name)?;
+    let (info, group_vis, _) = load_mcp(&state, &owner, &name)?;
     let is_owner = viewer.as_ref().map(|c| c.username == owner).unwrap_or(false);
     if !is_owner {
         if info.visibility != "public" {
@@ -675,7 +848,7 @@ async fn run_call(
     Json(req): Json<CallReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let (info, group_vis) = load_mcp(&state, &owner, &name)?;
+    let (info, group_vis, _) = load_mcp(&state, &owner, &name)?;
     ensure_mcp_access(&state, &info, &group_vis, &claims)?;
     if req.tool.is_empty() {
         return Err(ApiError::bad_request("缺少 tool 字段"));
@@ -730,7 +903,7 @@ async fn run_report(
         return Err(ApiError::bad_request("缺少 tool 字段"));
     }
     // 校验该 MCP 确实存在且调用者可见，避免被用来伪造任意审计行。
-    let (info, group_vis) = load_mcp(&state, &owner, &name)?;
+    let (info, group_vis, _) = load_mcp(&state, &owner, &name)?;
     ensure_mcp_access(&state, &info, &group_vis, &claims)?;
     log_tool_call(
         &state,
@@ -789,7 +962,7 @@ fn stitch_for_user(
 // helpers
 // ---------------------------------------------------------------------------
 
-fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, String), ApiError> {
+fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, String, i64), ApiError> {
     let conn = state.db.lock().unwrap();
     let row: Option<(i64, String, String, String, String, String, String)> = conn
         .query_row(
@@ -804,6 +977,7 @@ fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, Strin
     let (id, visibility, version, manifest_json, tools_json, updated_at, group_vis) =
         row.ok_or_else(|| ApiError::not_found(format!("未找到 MCP: {owner}/{name}")))?;
     let labels = labels_of(&conn, "mcp_labels", "mcp_id", id);
+    let (likes, favorites, _, _) = reaction_summary(&conn, "mcp_reactions", "mcp_id", id, None);
     drop(conn);
     let manifest: McpManifest = serde_json::from_str(&manifest_json)
         .map_err(|e| ApiError::internal(format!("manifest 解析失败: {e}")))?;
@@ -816,9 +990,14 @@ fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, Strin
             manifest,
             tools: parse_tools(&tools_json),
             labels,
+            likes,
+            favorites,
+            liked: false,
+            favorited: false,
             updated_at,
         },
         group_vis,
+        id,
     ))
 }
 
@@ -945,6 +1124,154 @@ pub(super) fn all_resource_labels(
         }
     }
     map
+}
+
+// ---------------------------------------------------------------------------
+// 点赞 / 收藏（reactions）
+// ---------------------------------------------------------------------------
+
+/// 全量映射：资源 id → (点赞数, 收藏数)。供列表接口一次性装配，避免 N+1。
+/// `junction`/`fk` 为内部常量（skill_reactions/skill_id 等），非用户输入，无注入风险。
+pub(super) fn all_reaction_counts(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+) -> std::collections::HashMap<i64, (i64, i64)> {
+    let mut map: std::collections::HashMap<i64, (i64, i64)> = std::collections::HashMap::new();
+    let sql = format!("SELECT {fk}, kind, COUNT(*) FROM {junction} GROUP BY {fk}, kind");
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        }) {
+            for (id, kind, n) in rows.flatten() {
+                let e = map.entry(id).or_default();
+                match kind.as_str() {
+                    "like" => e.0 = n,
+                    "favorite" => e.1 = n,
+                    _ => {}
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 某用户的互动状态全量映射：资源 id → (已点赞, 已收藏)。
+pub(super) fn user_reaction_map(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+    user_id: i64,
+) -> std::collections::HashMap<i64, (bool, bool)> {
+    let mut map: std::collections::HashMap<i64, (bool, bool)> = std::collections::HashMap::new();
+    let sql = format!("SELECT {fk}, kind FROM {junction} WHERE user_id = ?1");
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([user_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for (id, kind) in rows.flatten() {
+                let e = map.entry(id).or_default();
+                match kind.as_str() {
+                    "like" => e.0 = true,
+                    "favorite" => e.1 = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 单个资源的互动汇总：(点赞数, 收藏数, 查看者已点赞, 查看者已收藏)。
+pub(super) fn reaction_summary(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+    rid: i64,
+    viewer: Option<i64>,
+) -> (i64, i64, bool, bool) {
+    let mut out = (0i64, 0i64, false, false);
+    let sql = format!("SELECT kind, COUNT(*) FROM {junction} WHERE {fk} = ?1 GROUP BY kind");
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(rows) = stmt.query_map([rid], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        }) {
+            for (kind, n) in rows.flatten() {
+                match kind.as_str() {
+                    "like" => out.0 = n,
+                    "favorite" => out.1 = n,
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(uid) = viewer {
+        let sql = format!("SELECT kind FROM {junction} WHERE {fk} = ?1 AND user_id = ?2");
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![rid, uid], |r| r.get::<_, String>(0)) {
+                for kind in rows.flatten() {
+                    match kind.as_str() {
+                        "like" => out.2 = true,
+                        "favorite" => out.3 = true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 设置 / 取消某用户对资源的点赞或收藏，随后回吐该资源的最新互动汇总。
+pub(super) fn set_reaction(
+    conn: &rusqlite::Connection,
+    junction: &str,
+    fk: &str,
+    rid: i64,
+    user_id: i64,
+    kind: &str,
+    on: bool,
+) -> Result<ReactResp, ApiError> {
+    if kind != "like" && kind != "favorite" {
+        return Err(ApiError::bad_request("kind 只能是 like 或 favorite"));
+    }
+    if on {
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {junction}(user_id, {fk}, kind, created_at) VALUES (?1, ?2, ?3, ?4)"
+            ),
+            rusqlite::params![user_id, rid, kind, now_string()],
+        )
+        .map_err(db_err)?;
+    } else {
+        conn.execute(
+            &format!("DELETE FROM {junction} WHERE user_id = ?1 AND {fk} = ?2 AND kind = ?3"),
+            rusqlite::params![user_id, rid, kind],
+        )
+        .map_err(db_err)?;
+    }
+    let (likes, favorites, liked, favorited) =
+        reaction_summary(conn, junction, fk, rid, Some(user_id));
+    Ok(ReactResp {
+        likes,
+        favorites,
+        liked,
+        favorited,
+    })
+}
+
+/// 按用户名查用户 id（供资源转移解析目标账号）。
+pub(super) fn user_id_by_name(
+    conn: &rusqlite::Connection,
+    username: &str,
+) -> Result<Option<i64>, ApiError> {
+    conn.query_row(
+        "SELECT id FROM users WHERE username = ?1",
+        [username],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(db_err)
 }
 
 pub(super) fn db_err(e: rusqlite::Error) -> ApiError {

@@ -325,6 +325,16 @@ pub struct McpInfo {
     /// 受管标签名（管理后台分配，如「官方」「社区」），用于市场标注与筛选。
     #[serde(default)]
     pub labels: Vec<String>,
+    /// 点赞 / 收藏总数。
+    #[serde(default)]
+    pub likes: i64,
+    #[serde(default)]
+    pub favorites: i64,
+    /// 当前查看者是否已点赞 / 收藏（未登录恒 false）。
+    #[serde(default)]
+    pub liked: bool,
+    #[serde(default)]
+    pub favorited: bool,
     pub updated_at: String,
 }
 
@@ -539,10 +549,44 @@ pub struct SkillInfo {
     /// 受管标签名（管理后台分配，如「官方」「社区」），用于市场标注与筛选。
     #[serde(default)]
     pub labels: Vec<String>,
+    /// 点赞 / 收藏总数与压缩体累计下载次数。
+    #[serde(default)]
+    pub likes: i64,
+    #[serde(default)]
+    pub favorites: i64,
+    #[serde(default)]
+    pub downloads: i64,
+    /// 当前查看者是否已点赞 / 收藏（未登录恒 false）。
+    #[serde(default)]
+    pub liked: bool,
+    #[serde(default)]
+    pub favorited: bool,
     pub updated_at: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SkillRenameReq {
     pub new_name: String,
+}
+
+/// 点赞 / 收藏切换请求：kind 取 "like" / "favorite"，on 表示设置或取消。
+#[derive(Serialize, Deserialize)]
+pub struct ReactReq {
+    pub kind: String,
+    pub on: bool,
+}
+
+/// 点赞 / 收藏切换后的最新状态（计数 + 查看者标记），供前端就地刷新。
+#[derive(Serialize, Deserialize)]
+pub struct ReactResp {
+    pub likes: i64,
+    pub favorites: i64,
+    pub liked: bool,
+    pub favorited: bool,
+}
+
+/// 资源转移请求：把技能 / MCP 的归属转给另一个用户（按用户名）。
+#[derive(Serialize, Deserialize)]
+pub struct TransferReq {
+    pub new_owner: String,
 }

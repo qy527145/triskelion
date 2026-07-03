@@ -1,5 +1,6 @@
 import Modal from "./Modal";
 import ToolTester from "./ToolTester";
+import ReactionBar from "./ReactionBar";
 import { requiredVars, type McpInfo } from "../lib/types";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -32,6 +33,9 @@ export default function DetailModal({
       <div className="space-y-1">
         <Row label="拓扑">
           {m.manifest.runtime} / {m.manifest.protocol}
+        </Row>
+        <Row label="互动">
+          <ReactionBar likes={m.likes} favorites={m.favorites} liked={m.liked} favorited={m.favorited} />
         </Row>
         <Row label={m.manifest.runtime === "local" ? "命令" : "地址"}>{target || "—"}</Row>
         <Row label="所需变量">

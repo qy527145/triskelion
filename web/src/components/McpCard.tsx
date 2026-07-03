@@ -1,7 +1,8 @@
-import type { McpInfo } from "../lib/types";
+import type { McpInfo, ReactKind } from "../lib/types";
 import { labelBadgeClass } from "../lib/types";
 import { colorFor, initials } from "../lib/color";
-import { ArrowIcon, TrashIcon } from "./icons";
+import ReactionBar from "./ReactionBar";
+import { ArrowIcon, SendIcon, TrashIcon } from "./icons";
 
 export default function McpCard({
   m,
@@ -9,12 +10,17 @@ export default function McpCard({
   onDetail,
   onEdit,
   onDelete,
+  onTransfer,
+  onReact,
 }: {
   m: McpInfo;
   mine?: boolean;
   onDetail: () => void;
   onEdit?: () => void;
   onDelete?: () => void;
+  onTransfer?: () => void;
+  /** 点赞 / 收藏切换（未登录时缺省，互动栏只读）。 */
+  onReact?: (kind: ReactKind) => void;
 }) {
   const color = colorFor(m.name + m.owner);
   const isPublic = m.visibility === "public";
@@ -58,15 +64,24 @@ export default function McpCard({
       </p>
 
       <div className="mt-4 flex items-center justify-between">
-        <span
-          className={`rounded-lg border px-2.5 py-1 text-xs ${
-            isPublic
-              ? "border-emerald-200 bg-emerald-50 text-emerald-600"
-              : "border-amber-200 bg-amber-50 text-amber-600"
-          }`}
-        >
-          {m.visibility}
-        </span>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <ReactionBar
+            likes={m.likes}
+            favorites={m.favorites}
+            liked={m.liked}
+            favorited={m.favorited}
+            onReact={onReact}
+          />
+          <span
+            className={`rounded-lg border px-2.5 py-1 text-xs ${
+              isPublic
+                ? "border-emerald-200 bg-emerald-50 text-emerald-600"
+                : "border-amber-200 bg-amber-50 text-amber-600"
+            }`}
+          >
+            {m.visibility}
+          </span>
+        </div>
         {mine ? (
           <div className="flex gap-2">
             <button
@@ -80,6 +95,13 @@ export default function McpCard({
               className="rounded-lg border border-indigo-200 px-3 py-1.5 text-xs font-semibold text-indigo-500 transition hover:bg-indigo-50"
             >
               编辑
+            </button>
+            <button
+              onClick={onTransfer}
+              title="转移给其他用户"
+              className="flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-50"
+            >
+              <SendIcon width={13} height={13} />
             </button>
             <button
               onClick={onDelete}

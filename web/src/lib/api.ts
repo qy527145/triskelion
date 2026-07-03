@@ -8,14 +8,18 @@ import type {
   BatchResult,
   CallsQuery,
   CallsResp,
+  FavoritesResp,
   GroupVisibility,
   ImportSummary,
   McpInfo,
   McpManifest,
+  ReactKind,
+  ReactResp,
   SecretInfo,
   SkillInfo,
   SkillInspectResp,
   SkillManifest,
+  UserTransferResult,
 } from "./types";
 
 const TOKEN_KEY = "tsk_token";
@@ -158,6 +162,19 @@ export const api = {
     }),
   deleteMcp: (name: string) =>
     req<null>("/v1/mcp/" + encodeURIComponent(name), { method: "DELETE", auth: true }),
+  /** 点赞 / 收藏一个 MCP（或取消），返回最新计数与查看者标记。 */
+  reactMcp: (owner: string, name: string, kind: ReactKind, on: boolean) =>
+    req<ReactResp>(
+      "/v1/mcp/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/react",
+      { method: "POST", auth: true, body: { kind, on } },
+    ),
+  /** 把自己的 MCP 转移给另一个用户。 */
+  transferMcp: (name: string, newOwner: string) =>
+    req<null>("/v1/mcp/" + encodeURIComponent(name) + "/transfer", {
+      method: "POST",
+      auth: true,
+      body: { new_owner: newOwner },
+    }),
 
   callTool: (owner: string, name: string, tool: string, args: unknown) =>
     req<unknown>(
@@ -214,6 +231,20 @@ export const api = {
       method: "DELETE",
       auth: true,
     }),
+  /** 点赞 / 收藏一个技能（或取消），返回最新计数与查看者标记。 */
+  reactSkill: (owner: string, name: string, kind: ReactKind, on: boolean) =>
+    req<ReactResp>(
+      "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/react",
+      { method: "POST", auth: true, body: { kind, on } },
+    ),
+  /** 把自己的技能转移给另一个用户。 */
+  transferSkill: (owner: string, name: string, newOwner: string) =>
+    req<null>(
+      "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/transfer",
+      { method: "POST", auth: true, body: { new_owner: newOwner } },
+    ),
+  /** 当前用户收藏的全部资源（技能 + MCP）。 */
+  favorites: () => req<FavoritesResp>("/v1/favorites", { auth: true }),
   skillArchiveUrl: (owner: string, name: string) =>
     rel("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/archive"),
 
@@ -378,6 +409,23 @@ export const admin = {
       remove_label_ids?: number[];
     },
   ) => adminReq<BatchResult>("/v1/admin/batch", token, { method: "POST", body }),
+
+  /** 批量把选中的技能 / MCP 转移给另一个用户。 */
+  transferResources: (
+    token: string,
+    body: {
+      kind: "skill" | "mcp";
+      targets: { owner: string; name: string }[];
+      to_username: string;
+    },
+  ) => adminReq<BatchResult>("/v1/admin/transfer", token, { method: "POST", body }),
+
+  /** 整户转移：把某用户名下全部技能与 MCP 转给另一个用户（注销前的资产交接）。 */
+  transferUser: (token: string, id: number, to_username: string) =>
+    adminReq<UserTransferResult>("/v1/admin/users/" + id + "/transfer", token, {
+      method: "POST",
+      body: { to_username },
+    }),
 
   /** 导出全量资源包，触发浏览器下载 .tskpack。 */
   exportPack: async (token: string): Promise<void> => {

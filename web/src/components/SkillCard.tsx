@@ -1,7 +1,8 @@
-import type { SkillInfo } from "../lib/types";
+import type { ReactKind, SkillInfo } from "../lib/types";
 import { categoryLabel, humanSize, labelBadgeClass } from "../lib/types";
 import { colorFor, initials } from "../lib/color";
-import { ArrowIcon, BookIcon, BotIcon, SparkIcon, TrashIcon, WrenchIcon } from "./icons";
+import ReactionBar from "./ReactionBar";
+import { ArrowIcon, BookIcon, BotIcon, SendIcon, SparkIcon, TrashIcon, WrenchIcon } from "./icons";
 
 function CategoryIcon({ category, ...p }: { category: string } & React.SVGProps<SVGSVGElement>) {
   if (category === "kb") return <BookIcon {...p} />;
@@ -23,12 +24,17 @@ export default function SkillCard({
   onDetail,
   onEdit,
   onDelete,
+  onTransfer,
+  onReact,
 }: {
   s: SkillInfo;
   mine?: boolean;
   onDetail: () => void;
   onEdit?: () => void;
   onDelete?: () => void;
+  onTransfer?: () => void;
+  /** 点赞 / 收藏切换（未登录时缺省，互动栏只读）。 */
+  onReact?: (kind: ReactKind) => void;
 }) {
   const color = colorFor(s.name + s.owner);
   const isPublic = s.visibility === "public";
@@ -88,11 +94,21 @@ export default function SkillCard({
       )}
 
       <div className="mt-4 flex items-center justify-between">
-        <span className="text-xs text-slate-400">
-          {s.archive_size > 0 ? `📦 ${humanSize(s.archive_size)}` : "纯文本"}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <ReactionBar
+            likes={s.likes}
+            favorites={s.favorites}
+            downloads={s.downloads}
+            liked={s.liked}
+            favorited={s.favorited}
+            onReact={onReact}
+          />
+          <span className="text-xs text-slate-400">
+            {s.archive_size > 0 ? `📦 ${humanSize(s.archive_size)}` : "纯文本"}
+          </span>
           {mine && (
             <span
-              className={`ml-2 rounded-md border px-1.5 py-0.5 ${
+              className={`rounded-md border px-1.5 py-0.5 text-xs ${
                 isPublic
                   ? "border-emerald-200 bg-emerald-50 text-emerald-600"
                   : "border-amber-200 bg-amber-50 text-amber-600"
@@ -101,7 +117,7 @@ export default function SkillCard({
               {s.visibility}
             </span>
           )}
-        </span>
+        </div>
         {mine ? (
           <div className="flex gap-2">
             <button
@@ -115,6 +131,13 @@ export default function SkillCard({
               className="rounded-lg border border-indigo-200 px-3 py-1.5 text-xs font-semibold text-indigo-500 transition hover:bg-indigo-50"
             >
               编辑
+            </button>
+            <button
+              onClick={onTransfer}
+              title="转移给其他用户"
+              className="flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-50"
+            >
+              <SendIcon width={13} height={13} />
             </button>
             <button
               onClick={onDelete}

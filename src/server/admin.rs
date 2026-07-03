@@ -327,6 +327,9 @@ pub struct AdminSkill {
     archive_size: i64,
     has_archive: bool,
     labels: Vec<LabelBrief>,
+    likes: i64,
+    favorites: i64,
+    downloads: i64,
     updated_at: String,
 }
 
@@ -387,11 +390,12 @@ pub async fn skills_all(
     require_admin(&state, &headers)?;
     let conn = state.db.lock().unwrap();
     let mut label_map = all_label_briefs(&conn, "skill_labels", "skill_id");
+    let count_map = super::routes::all_reaction_counts(&conn, "skill_reactions", "skill_id");
     let mut stmt = conn
         .prepare(
             "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
                     s.archive_size, s.archive_sha256, s.updated_at, s.group_visibility, s.id,
-                    s.tags, s.skill_md, s.metadata
+                    s.tags, s.skill_md, s.metadata, s.downloads
              FROM skills s JOIN users u ON u.id = s.owner_id
              ORDER BY s.updated_at DESC, s.name",
         )
@@ -420,6 +424,9 @@ pub async fn skills_all(
                     mcp_dependencies: meta.mcp_dependencies,
                     preferred_tools: meta.preferred_tools,
                     labels: Vec::new(),
+                    likes: 0,
+                    favorites: 0,
+                    downloads: r.get(14)?,
                 },
                 r.get::<_, i64>(10)?,
             ))
@@ -429,6 +436,7 @@ pub async fn skills_all(
     for row in rows {
         let (mut s, id) = row.map_err(db_err)?;
         s.labels = label_map.remove(&id).unwrap_or_default();
+        (s.likes, s.favorites) = count_map.get(&id).copied().unwrap_or_default();
         out.push(s);
     }
     Ok(Json(out))
@@ -445,6 +453,8 @@ pub struct AdminMcp {
     protocol: String,
     manifest: McpManifest,
     labels: Vec<LabelBrief>,
+    likes: i64,
+    favorites: i64,
     updated_at: String,
 }
 
@@ -452,6 +462,7 @@ pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Ad
     require_admin(&state, &headers)?;
     let conn = state.db.lock().unwrap();
     let mut label_map = all_label_briefs(&conn, "mcp_labels", "mcp_id");
+    let count_map = super::routes::all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
     let mut stmt = conn
         .prepare(
             "SELECT u.username, m.name, m.visibility, m.version, m.manifest, m.updated_at,
@@ -504,6 +515,8 @@ pub async fn mcps_all(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Ad
             protocol: manifest.protocol.as_str().to_string(),
             manifest,
             labels: label_map.remove(&id).unwrap_or_default(),
+            likes: count_map.get(&id).copied().unwrap_or_default().0,
+            favorites: count_map.get(&id).copied().unwrap_or_default().1,
             updated_at,
         });
     }
@@ -1609,6 +1622,184 @@ fn batch_apply_one(
 }
 
 // ---------------------------------------------------------------------------
+// 资源转移：批量转移选中资源 / 整户转移（用户注销时把名下资源转给他人）
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct AdminTransferReq {
+    /// 资源类型：skill / mcp。
+    kind: String,
+    /// 目标资源列表（owner/name）。
+    targets: Vec<BatchTarget>,
+    /// 接收方用户名（必须已存在）。
+    to_username: String,
+}
+
+/// 批量把选中的技能 / MCP 转移给另一个用户。逐条应用：与接收方既有资源重名、
+/// 或已属于接收方的记入 `failed`，不阻断其余。
+pub async fn transfer_resources(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<AdminTransferReq>,
+) -> Result<Json<BatchResult>, ApiError> {
+    require_admin(&state, &headers)?;
+    let table = match req.kind.as_str() {
+        "skill" => "skills",
+        "mcp" => "mcps",
+        _ => return Err(ApiError::bad_request("kind 只能是 skill 或 mcp")),
+    };
+    if req.targets.is_empty() {
+        return Err(ApiError::bad_request("targets 不能为空"));
+    }
+    let to_username = req.to_username.trim().to_string();
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let target_uid = super::routes::user_id_by_name(&conn, &to_username)?
+        .ok_or_else(|| ApiError::not_found("目标用户不存在"))?;
+
+    let mut updated = 0usize;
+    let mut failed: Vec<BatchFailure> = Vec::new();
+    for t in &req.targets {
+        match transfer_one(&conn, table, t, target_uid, &now) {
+            Ok(()) => updated += 1,
+            Err(e) => failed.push(BatchFailure {
+                owner: t.owner.clone(),
+                name: t.name.clone(),
+                error: e.message,
+            }),
+        }
+    }
+    Ok(Json(BatchResult { updated, failed }))
+}
+
+/// 把单个资源转给 target_uid：解析当前 owner → 查重名 → 改 owner_id。
+fn transfer_one(
+    conn: &rusqlite::Connection,
+    table: &str,
+    target: &BatchTarget,
+    target_uid: i64,
+    now: &str,
+) -> Result<(), ApiError> {
+    let from_uid: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            [&target.owner],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let from_uid = from_uid.ok_or_else(|| ApiError::not_found("资源归属用户不存在"))?;
+    if from_uid == target_uid {
+        return Err(ApiError::bad_request("已属于该用户"));
+    }
+    let taken: bool = conn
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE owner_id = ?1 AND name = ?2"),
+            rusqlite::params![target_uid, target.name],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if taken {
+        return Err(ApiError::conflict("接收方已有同名资源"));
+    }
+    let n = conn
+        .execute(
+            &format!("UPDATE {table} SET owner_id = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4"),
+            rusqlite::params![target_uid, now, from_uid, target.name],
+        )
+        .map_err(db_err)?;
+    if n == 0 {
+        return Err(ApiError::not_found("资源不存在"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct UserTransferReq {
+    /// 接收方用户名（必须已存在）。
+    to_username: String,
+}
+
+#[derive(Serialize)]
+pub struct UserTransferResult {
+    skills_moved: usize,
+    mcps_moved: usize,
+    /// 因与接收方重名而跳过的资源（留在原账号名下）。
+    skipped: Vec<String>,
+}
+
+/// 整户转移：把某用户名下全部技能与 MCP 转给另一个用户（用户注销前的资产交接）。
+/// 与接收方重名的资源跳过并记入 `skipped`；加密凭据不随迁（属个人机密）。
+pub async fn user_transfer(
+    State(state): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<UserTransferReq>,
+) -> Result<Json<UserTransferResult>, ApiError> {
+    require_admin(&state, &headers)?;
+    let to_username = req.to_username.trim().to_string();
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM users WHERE id = ?1", [id], |_| Ok(true))
+        .optional()
+        .map_err(db_err)?
+        .unwrap_or(false);
+    if !exists {
+        return Err(ApiError::not_found("未找到该用户"));
+    }
+    let target_uid = super::routes::user_id_by_name(&conn, &to_username)?
+        .ok_or_else(|| ApiError::not_found("目标用户不存在"))?;
+    if target_uid == id {
+        return Err(ApiError::bad_request("不能转移给该用户自己"));
+    }
+
+    let mut skipped = Vec::new();
+    let mut move_all = |table: &str, kind: &str| -> Result<usize, ApiError> {
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT name FROM {table} WHERE owner_id = ?1 ORDER BY name"))
+                .map_err(db_err)?;
+            let rows = stmt.query_map([id], |r| r.get::<_, String>(0)).map_err(db_err)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)?
+        };
+        let mut moved = 0usize;
+        for name in names {
+            let taken: bool = conn
+                .query_row(
+                    &format!("SELECT 1 FROM {table} WHERE owner_id = ?1 AND name = ?2"),
+                    rusqlite::params![target_uid, name],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(db_err)?
+                .unwrap_or(false);
+            if taken {
+                skipped.push(format!("{kind} {name}（接收方已有同名资源）"));
+                continue;
+            }
+            conn.execute(
+                &format!("UPDATE {table} SET owner_id = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4"),
+                rusqlite::params![target_uid, now, id, name],
+            )
+            .map_err(db_err)?;
+            moved += 1;
+        }
+        Ok(moved)
+    };
+    let skills_moved = move_all("skills", "技能")?;
+    let mcps_moved = move_all("mcps", "MCP")?;
+
+    Ok(Json(UserTransferResult {
+        skills_moved,
+        mcps_moved,
+        skipped,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // 外部系统注入：注册 MCP / 批量分发用户变量（供 aiko_hub 等上游推送）
 // ---------------------------------------------------------------------------
 
@@ -1979,6 +2170,9 @@ struct PackSkill {
     metadata: serde_json::Value,
     archive_sha256: String,
     archive_size: i64,
+    /// 压缩体累计下载次数（旧资源包缺省为 0）。
+    #[serde(default)]
+    downloads: i64,
     updated_at: String,
 }
 
@@ -2221,7 +2415,7 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
             .prepare(
                 "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
                         s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
-                        s.group_visibility, s.id
+                        s.group_visibility, s.id, s.downloads
                  FROM skills s JOIN users u ON u.id = s.owner_id ORDER BY s.id",
             )
             .map_err(db_err)?;
@@ -2242,6 +2436,7 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
                     metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::json!({})),
                     archive_sha256: r.get(9)?,
                     archive_size: r.get(10)?,
+                    downloads: r.get(14)?,
                     updated_at: r.get(11)?,
                     group_visibility: r.get(12)?,
                     labels: skill_label_map.get(&id).cloned().unwrap_or_default(),
@@ -2458,14 +2653,15 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
         };
         tx.execute(
             "INSERT INTO skills(owner_id, name, category, visibility, group_visibility, version, description,
-                                tags, skill_md, metadata, archive_sha256, archive_size, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                tags, skill_md, metadata, archive_sha256, archive_size, downloads, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(owner_id, name) DO UPDATE SET category=excluded.category,
                  visibility=excluded.visibility, group_visibility=excluded.group_visibility,
                  version=excluded.version,
                  description=excluded.description, tags=excluded.tags, skill_md=excluded.skill_md,
                  metadata=excluded.metadata, archive_sha256=excluded.archive_sha256,
-                 archive_size=excluded.archive_size, updated_at=excluded.updated_at",
+                 archive_size=excluded.archive_size, downloads=excluded.downloads,
+                 updated_at=excluded.updated_at",
             rusqlite::params![
                 oid,
                 s.name,
@@ -2479,6 +2675,7 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
                 s.metadata.to_string(),
                 s.archive_sha256,
                 s.archive_size,
+                s.downloads,
                 s.updated_at
             ],
         )
