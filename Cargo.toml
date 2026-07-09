@@ -1,6 +1,6 @@
 [package]
 name = "triskelion"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Triskelion — unified resource gateway and open marketplace for LLM agent tools"
 license = "Apache-2.0"
