@@ -772,7 +772,7 @@ fn valid_version(s: &str) -> bool {
 }
 
 /// 某技能的全部已发布版本（版本号感知排序，新→旧）。
-fn versions_of(conn: &rusqlite::Connection, skill_id: i64) -> Vec<SkillVersionInfo> {
+pub(super) fn versions_of(conn: &rusqlite::Connection, skill_id: i64) -> Vec<SkillVersionInfo> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT version, archive_sha256, archive_size, created_at
          FROM skill_versions WHERE skill_id = ?1",
@@ -826,7 +826,7 @@ fn apply_version(
 }
 
 /// 若 blob 已不被任何技能（head 快照或版本副本）引用，则删除文件（尽力而为）。
-fn gc_blob_if_unreferenced(state: &AppState, conn: &rusqlite::Connection, sha: &str) {
+pub(super) fn gc_blob_if_unreferenced(state: &AppState, conn: &rusqlite::Connection, sha: &str) {
     if sha.is_empty() {
         return;
     }

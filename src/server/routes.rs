@@ -91,6 +91,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/admin/skills/{owner}/{name}",
             patch(admin::skill_update).delete(admin::skill_delete),
         )
+        .route(
+            "/v1/admin/skills/{owner}/{name}/versions",
+            get(admin::skill_versions),
+        )
+        .route(
+            "/v1/admin/skills/{owner}/{name}/versions/{version}",
+            delete(admin::skill_version_delete),
+        )
         // 批量配置技能 / MCP：可见性、可见分组、增删受管标签。
         .route("/v1/admin/batch", post(admin::batch_update))
         // 资源转移：批量转移选中资源 / 整户转移某用户名下全部资源。

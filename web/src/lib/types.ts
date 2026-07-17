@@ -127,6 +127,12 @@ export interface SkillVersionInfo {
   created_at: string;
 }
 
+/** 管理后台删除一个版本后的最新状态：新的最新版本号 + 剩余版本列表。 */
+export interface SkillVersionDeleteResp {
+  head: string;
+  versions: SkillVersionInfo[];
+}
+
 /** 点赞 / 收藏切换后的最新状态（计数 + 查看者标记）。 */
 export interface ReactResp {
   likes: number;

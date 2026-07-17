@@ -17,6 +17,7 @@ import type {
   Protocol,
   Runtime,
   SkillCategory,
+  SkillVersionInfo,
 } from "../lib/types";
 import Modal from "./Modal";
 import Brand from "./Brand";
@@ -977,6 +978,7 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
           token={token}
           skill={content.raw as AdminSkill}
           onClose={() => setContent(null)}
+          onChanged={reload}
           onSaved={() => {
             setContent(null);
             notify("已更新");
@@ -1387,11 +1389,14 @@ function AdminSkillEditModal({
   skill,
   onClose,
   onSaved,
+  onChanged,
 }: {
   token: string;
   skill: AdminSkill;
   onClose: () => void;
   onSaved: () => void;
+  /** 版本删除等就地变更后通知外层刷新列表（弹窗保持打开）。 */
+  onChanged?: () => void;
 }) {
   const [version, setVersion] = useState(skill.version);
   const [category, setCategory] = useState<SkillCategory>(skill.category as SkillCategory);
@@ -1402,9 +1407,46 @@ function AdminSkillEditModal({
   const [skillMd, setSkillMd] = useState(skill.skill_md);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // 版本历史：null=加载中；head 为当前最新版本号（删除最新版后服务端会回退并回传新值）。
+  const [versions, setVersions] = useState<SkillVersionInfo[] | null>(null);
+  const [head, setHead] = useState(skill.version);
+  const [busyVer, setBusyVer] = useState<string | null>(null);
 
   // 说明书文件名随分类而定：agent → AGENT.md，其余 → SKILL.md。
   const doc = docFilename(category);
+
+  useEffect(() => {
+    let alive = true;
+    admin
+      .skillVersions(token, skill.owner, skill.name)
+      .then((list) => alive && setVersions(list))
+      .catch(() => alive && setVersions([]));
+    return () => {
+      alive = false;
+    };
+  }, [token, skill.owner, skill.name]);
+
+  async function removeVersion(v: SkillVersionInfo) {
+    const isHead = v.version === head;
+    const msg = isHead
+      ? `删除最新版 v${v.version}？\n删除后次新版本将自动成为最新版（市场默认安装随之回退）。`
+      : `删除版本 v${v.version}？\n该版本副本与压缩体将被清理，客户端将无法再安装此版本，不可恢复。`;
+    if (!confirm(msg)) return;
+    setBusyVer(v.version);
+    setError("");
+    try {
+      const r = await admin.deleteSkillVersion(token, skill.owner, skill.name, v.version);
+      setVersions(r.versions);
+      setHead(r.head);
+      // 版本输入框若未被手工改过（仍为旧最新版/被删版本），同步到新最新版，
+      // 避免「保存」把已删除的版本号写回去。
+      setVersion((cur) => (cur === head || cur === v.version ? r.head : cur));
+      onChanged?.();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+    setBusyVer(null);
+  }
 
   async function save() {
     if (!skillMd.trim()) {
@@ -1464,6 +1506,42 @@ function AdminSkillEditModal({
               {skill.has_archive ? `📦 ${humanSize(skill.archive_size)}` : "纯文本"}
             </div>
           </div>
+        </div>
+        <div>
+          <label className={adminLabelCls}>
+            版本历史（删除最新版将自动回退到次新版本；仅剩一个版本时不可删除）
+          </label>
+          {versions === null ? (
+            <div className="px-1 py-1 text-xs text-slate-400">加载中…</div>
+          ) : versions.length === 0 ? (
+            <div className="px-1 py-1 text-xs text-slate-400">无版本记录</div>
+          ) : (
+            <div className="divide-y divide-slate-100 rounded-lg border border-slate-200">
+              {versions.map((v) => (
+                <div key={v.version} className="flex items-center gap-3 px-3 py-1.5 text-xs">
+                  <code className="font-mono font-semibold text-slate-700">v{v.version}</code>
+                  {v.version === head && (
+                    <span className="rounded border border-emerald-200 bg-emerald-50 px-1.5 text-emerald-600">
+                      最新
+                    </span>
+                  )}
+                  <span className="text-slate-400">
+                    {v.archive_size > 0 ? humanSize(v.archive_size) : "纯文本"}
+                  </span>
+                  <span className="flex-1 text-slate-400">{v.created_at.replace(" UTC", "")}</span>
+                  <button
+                    onClick={() => removeVersion(v)}
+                    disabled={versions.length <= 1 || busyVer !== null}
+                    title={versions.length <= 1 ? "仅剩最后一个版本，如需下架请删除整个技能" : "删除该版本副本"}
+                    className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-rose-500 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {busyVer === v.version ? <Spinner /> : <TrashIcon width={12} height={12} />}
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div>
           <label className={adminLabelCls}>描述</label>

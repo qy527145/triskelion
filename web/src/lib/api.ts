@@ -19,6 +19,7 @@ import type {
   SkillInfo,
   SkillInspectResp,
   SkillManifest,
+  SkillVersionDeleteResp,
   SkillVersionInfo,
   UserTransferResult,
 } from "./types";
@@ -392,6 +393,31 @@ export const admin = {
   deleteSkill: (token: string, owner: string, name: string) =>
     adminReq<null>(
       "/v1/admin/skills/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name),
+      token,
+      { method: "DELETE" },
+    ),
+  /** 某技能已发布的全部版本副本（新→旧）。 */
+  skillVersions: (token: string, owner: string, name: string) =>
+    adminReq<SkillVersionInfo[]>(
+      "/v1/admin/skills/" +
+        encodeURIComponent(owner) +
+        "/" +
+        encodeURIComponent(name) +
+        "/versions",
+      token,
+    ),
+  /**
+   * 删除技能的指定版本副本。删除最新版会自动把次新版本提升为最新版；
+   * 仅剩最后一个版本时服务端拒绝。返回删除后的最新版本号与剩余版本列表。
+   */
+  deleteSkillVersion: (token: string, owner: string, name: string, version: string) =>
+    adminReq<SkillVersionDeleteResp>(
+      "/v1/admin/skills/" +
+        encodeURIComponent(owner) +
+        "/" +
+        encodeURIComponent(name) +
+        "/versions/" +
+        encodeURIComponent(version),
       token,
       { method: "DELETE" },
     ),

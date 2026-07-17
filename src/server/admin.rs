@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use rand::TryRng;
 
 use crate::archive::ZSTD_LEVEL;
-use crate::shared::{McpManifest, Protocol, Runtime, SKILL_CATEGORIES, ToolMeta};
+use crate::shared::{McpManifest, Protocol, Runtime, SkillVersionInfo, SKILL_CATEGORIES, ToolMeta};
 
 use super::auth;
 use super::crypto;
@@ -1374,6 +1374,110 @@ pub async fn skill_delete(
     } else {
         Err(ApiError::not_found("未找到该技能"))
     }
+}
+
+/// 管理后台：列出某技能已发布的全部版本副本（新→旧）。
+pub async fn skill_versions(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<Json<Vec<SkillVersionInfo>>, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let (sid, _) = admin_skill_head(&conn, &owner, &name)?;
+    Ok(Json(skills::versions_of(&conn, sid)))
+}
+
+/// 管理后台：删除技能的指定版本副本（含失引用 blob 的清理）。
+///
+/// - 删除的是最新版时，自动把剩余最高版本提升为最新版（`skills` 快照随之恢复该版本内容）；
+/// - 仅剩最后一个版本时拒绝——如需整体下架请直接删除技能。
+///
+/// 返回删除后的最新版本号与版本列表，供管理界面就地刷新。
+pub async fn skill_version_delete(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name, version)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let now = now_string();
+    let conn = state.db.lock().unwrap();
+    let (sid, head) = admin_skill_head(&conn, &owner, &name)?;
+    let sha: Option<String> = conn
+        .query_row(
+            "SELECT archive_sha256 FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+            rusqlite::params![sid, version],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some(sha) = sha else {
+        return Err(ApiError::not_found(format!("未找到版本 {version}")));
+    };
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM skill_versions WHERE skill_id = ?1",
+            [sid],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    if count <= 1 {
+        return Err(ApiError::bad_request(
+            "仅剩最后一个版本，不能单独删除；如需下架请直接删除整个技能",
+        ));
+    }
+    conn.execute(
+        "DELETE FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+        rusqlite::params![sid, version],
+    )
+    .map_err(db_err)?;
+
+    // 删除的是最新版 → 把剩余最高版本的副本内容恢复为 head 快照。
+    if version == head {
+        let remaining = skills::versions_of(&conn, sid);
+        if let Some(top) = remaining.first() {
+            conn.execute(
+                "UPDATE skills SET version = v.version, skill_md = v.skill_md, metadata = v.metadata,
+                        archive_sha256 = v.archive_sha256, archive_size = v.archive_size, updated_at = ?1
+                 FROM (SELECT version, skill_md, metadata, archive_sha256, archive_size
+                       FROM skill_versions WHERE skill_id = ?2 AND version = ?3) AS v
+                 WHERE skills.id = ?2",
+                rusqlite::params![now, sid, top.version],
+            )
+            .map_err(db_err)?;
+        }
+    }
+
+    // GC 必须在 head 回退之后：删除最新版时，回退前 skills 快照仍引用被删版本的
+    // blob，先 GC 会误判「仍被引用」而漏清。
+    if !sha.is_empty() {
+        skills::gc_blob_if_unreferenced(&state, &conn, &sha);
+    }
+
+    let head_now: String = conn
+        .query_row("SELECT version FROM skills WHERE id = ?1", [sid], |r| r.get(0))
+        .map_err(db_err)?;
+    Ok(Json(serde_json::json!({
+        "head": head_now,
+        "versions": skills::versions_of(&conn, sid),
+    })))
+}
+
+/// 按 owner 用户名 + 技能名取 (skill_id, 最新版本号)。
+fn admin_skill_head(
+    conn: &rusqlite::Connection,
+    owner: &str,
+    name: &str,
+) -> Result<(i64, String), ApiError> {
+    conn.query_row(
+        "SELECT s.id, s.version FROM skills s JOIN users u ON u.id = s.owner_id
+         WHERE u.username = ?1 AND s.name = ?2",
+        rusqlite::params![owner, name],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(db_err)?
+    .ok_or_else(|| ApiError::not_found("未找到该技能"))
 }
 
 pub async fn mcp_update(
