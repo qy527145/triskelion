@@ -19,6 +19,7 @@ import type {
   SkillInfo,
   SkillInspectResp,
   SkillManifest,
+  SkillVersionInfo,
   UserTransferResult,
 } from "./types";
 
@@ -199,10 +200,22 @@ export const api = {
     return req<SkillInfo[]>("/v1/skill/explore" + (qs ? "?" + qs : ""));
   },
   listMySkills: () => req<SkillInfo[]>("/v1/skill", { auth: true }),
-  getSkill: (owner: string, name: string) =>
-    req<SkillInfo>("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name), {
-      auth: true,
-    }),
+  /** 技能详情。`version` 指定历史版本（缺省最新版）；响应 versions 列出全部版本（新→旧）。 */
+  getSkill: (owner: string, name: string, version?: string) =>
+    req<SkillInfo>(
+      "/v1/skill/" +
+        encodeURIComponent(owner) +
+        "/" +
+        encodeURIComponent(name) +
+        (version ? "?version=" + encodeURIComponent(version) : ""),
+      { auth: true },
+    ),
+  /** 技能已发布的全部版本副本（新→旧）。 */
+  skillVersions: (owner: string, name: string) =>
+    req<SkillVersionInfo[]>(
+      "/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/versions",
+      { auth: true },
+    ),
   upsertSkill: (
     manifest: SkillManifest,
     visibility: string,
@@ -245,8 +258,16 @@ export const api = {
     ),
   /** 当前用户收藏的全部资源（技能 + MCP）。 */
   favorites: () => req<FavoritesResp>("/v1/favorites", { auth: true }),
-  skillArchiveUrl: (owner: string, name: string) =>
-    rel("/v1/skill/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/archive"),
+  /** 压缩体下载地址。`version` 指定历史版本（缺省最新版）。 */
+  skillArchiveUrl: (owner: string, name: string, version?: string) =>
+    rel(
+      "/v1/skill/" +
+        encodeURIComponent(owner) +
+        "/" +
+        encodeURIComponent(name) +
+        "/archive" +
+        (version ? "?version=" + encodeURIComponent(version) : ""),
+    ),
 
   /** 公开受管标签名清单（供市场筛选）。 */
   listLabels: () => req<string[]>("/v1/labels"),

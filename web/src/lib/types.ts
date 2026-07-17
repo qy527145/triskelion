@@ -112,7 +112,19 @@ export interface SkillInfo {
   downloads: number;
   liked: boolean;
   favorited: boolean;
+  /** 已发布的全部版本号（新→旧）。仅详情接口填充，列表接口为空。 */
+  versions?: string[];
   updated_at: string;
+}
+
+/** 技能的一个已发布版本副本（版本列表接口返回，新→旧）。 */
+export interface SkillVersionInfo {
+  version: string;
+  /** 压缩体 sha256（空表示该版本为纯文本裸说明书包）。 */
+  archive_sha256: string;
+  archive_size: number;
+  /** 该版本最近一次发布（含覆盖）时间。 */
+  created_at: string;
 }
 
 /** 点赞 / 收藏切换后的最新状态（计数 + 查看者标记）。 */

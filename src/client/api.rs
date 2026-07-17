@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::shared::{
     AuthReq, AuthResp, McpInfo, McpManifest, McpUpsertReq, ReportCallReq, ResolveResp, SecretInfo,
-    SecretSetReq, SetToolsReq, SkillInfo, SkillManifest, SkillUpsertReq, ToolMeta,
+    SecretSetReq, SetToolsReq, SkillInfo, SkillManifest, SkillUpsertReq, SkillVersionInfo, ToolMeta,
 };
 
 /// 带 HTTP 状态码的客户端错误，status==0 表示传输层失败。
@@ -277,9 +277,25 @@ impl HubClient {
     }
 
     /// 技能详情（public 任何人可读；private 需 owner token）。
-    pub fn skill_get(&self, owner: &str, name: &str) -> Result<SkillInfo, HubError> {
+    /// `version` 指定历史版本（None 为最新版），响应的 `versions` 列出全部可用版本。
+    pub fn skill_get(
+        &self,
+        owner: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<SkillInfo, HubError> {
+        let mut rb = self.auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}"))));
+        if let Some(v) = version.filter(|v| !v.is_empty()) {
+            rb = rb.query(&[("version", v)]);
+        }
+        let resp = rb.send().map_err(HubError::transport)?;
+        Self::parse(resp)
+    }
+
+    /// 列出技能已发布的全部版本副本（新→旧）。
+    pub fn skill_versions(&self, owner: &str, name: &str) -> Result<Vec<SkillVersionInfo>, HubError> {
         let resp = self
-            .auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}"))))
+            .auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}/versions"))))
             .send()
             .map_err(HubError::transport)?;
         Self::parse(resp)
@@ -308,24 +324,37 @@ impl HubClient {
         Self::parse(resp)
     }
 
-    /// 上传技能压缩体（tar.zst 原始字节）。
-    pub fn skill_archive_put(&self, owner: &str, name: &str, bytes: Vec<u8>) -> Result<(), HubError> {
-        let resp = self
+    /// 上传技能压缩体（tar.zst 原始字节）。`version` 指定挂到哪个版本副本（None 为最新版）。
+    pub fn skill_archive_put(
+        &self,
+        owner: &str,
+        name: &str,
+        version: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<(), HubError> {
+        let mut rb = self
             .auth(self.http.put(self.url(&format!("/v1/skill/{owner}/{name}/archive"))))
-            .header(reqwest::header::CONTENT_TYPE, "application/zstd")
-            .body(bytes)
-            .send()
-            .map_err(HubError::transport)?;
+            .header(reqwest::header::CONTENT_TYPE, "application/zstd");
+        if let Some(v) = version.filter(|v| !v.is_empty()) {
+            rb = rb.query(&[("version", v)]);
+        }
+        let resp = rb.body(bytes).send().map_err(HubError::transport)?;
         let _: serde_json::Value = Self::parse(resp)?;
         Ok(())
     }
 
-    /// 下载技能压缩体（tar.zst 原始字节，旧包可能仍为 gzip）。
-    pub fn skill_archive_get(&self, owner: &str, name: &str) -> Result<Vec<u8>, HubError> {
-        let resp = self
-            .auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}/archive"))))
-            .send()
-            .map_err(HubError::transport)?;
+    /// 下载技能压缩体（tar.zst 原始字节，旧包可能仍为 gzip）。`version` 指定历史版本（None 为最新版）。
+    pub fn skill_archive_get(
+        &self,
+        owner: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<Vec<u8>, HubError> {
+        let mut rb = self.auth(self.http.get(self.url(&format!("/v1/skill/{owner}/{name}/archive"))));
+        if let Some(v) = version.filter(|v| !v.is_empty()) {
+            rb = rb.query(&[("version", v)]);
+        }
+        let resp = rb.send().map_err(HubError::transport)?;
         let status = resp.status();
         if !status.is_success() {
             let code = status.as_u16();

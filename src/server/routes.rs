@@ -53,6 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/skill/{owner}/{name}/rename", post(skills::rename))
         .route("/v1/skill/{owner}/{name}/react", post(skills::react))
         .route("/v1/skill/{owner}/{name}/transfer", post(skills::transfer))
+        .route("/v1/skill/{owner}/{name}/versions", get(skills::versions))
         .route(
             "/v1/skill/{owner}/{name}/archive",
             get(skills::archive_get).put(skills::archive_put),

@@ -1,7 +1,8 @@
 //! `tsk skill`：技能包的本地打包（build）、发布（publish）、检索（search）、
-//! 拉取（pull）与查看。技能包是一个文件夹，必须含 `SKILL.md`；元数据放在
-//! `tsk-skill.json`。发布前由 `tsk build` 打成 tar.zst 压缩体（zstd），服务端只收元数据
-//! 与 SKILL.md，庞大的数据体以压缩包形式承载。
+//! 拉取（pull）与查看。技能包是一个文件夹，必须含 `SKILL.md`（agent 分类为 `AGENT.md`）；
+//! **说明书头部的 YAML frontmatter 即元数据**（name/version/category/tags/依赖等），
+//! 历史 `tsk-skill.json` 仍被兼容读取（frontmatter 字段优先）。发布前由 `tsk build`
+//! 打成 tar.zst 压缩体（zstd），服务端只收元数据与 SKILL.md，庞大的数据体以压缩包形式承载。
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use super::config::Config;
 /// 默认（skill/kb/toolchain）分类的能力说明书文件名。agent 分类用 `AGENT.md`，
 /// 由 `crate::shared::doc_filename` 按分类决定。
 const SKILL_MD: &str = "SKILL.md";
-/// 技能元数据清单文件。
+/// 历史技能元数据清单文件（向后兼容读取；元数据主载体已是说明书 frontmatter）。
 const MANIFEST: &str = "tsk-skill.json";
 /// 构建产物目录（打包压缩体落在这里）。
 const BUILD_DIR: &str = ".tsk/dist";
@@ -54,45 +55,37 @@ pub fn init(dir: Option<PathBuf>, category: Option<String>) -> Result<()> {
     // 说明书文件名随分类而定：agent → AGENT.md，其余 → SKILL.md。
     let doc = doc_filename(&category);
 
-    let manifest_path = dir.join(MANIFEST);
-    if manifest_path.exists() {
-        println!("• 已存在 {MANIFEST}，跳过");
-    } else {
-        let m = SkillManifest {
-            name: name.clone(),
-            version: "0.1.0".into(),
-            category: category.clone(),
-            description: "一句话描述这个技能能干什么".into(),
-            tags: vec![],
-            labels: vec![],
-            mcp_dependencies: vec![],
-            preferred_tools: vec![],
-        };
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&m)? + "\n")
-            .with_context(|| format!("写入 {}", manifest_path.display()))?;
-        println!("✓ 生成 {}", manifest_path.display());
-    }
-
     let skill_path = dir.join(doc);
     if skill_path.exists() {
-        println!("• 已存在 {doc}，跳过");
+        println!("• 已存在 {doc}，跳过（元数据直接写在其头部 frontmatter 里）");
     } else {
-        std::fs::write(&skill_path, skill_md_template(&name, doc))
+        std::fs::write(&skill_path, skill_md_template(&name, doc, &category))
             .with_context(|| format!("写入 {}", skill_path.display()))?;
         println!("✓ 生成 {}", skill_path.display());
     }
+    if dir.join(MANIFEST).exists() {
+        println!("• 检测到历史 {MANIFEST}：仍被兼容读取，但 {doc} frontmatter 里出现的字段优先");
+    }
 
     println!("\n下一步：");
-    println!("  1) 编辑 {doc} 与 {MANIFEST}");
+    println!("  1) 编辑 {doc}——头部 frontmatter 即元数据（name / version / category / tags…）");
     println!("  2) tsk build           # 本地打包校验");
     println!("  3) tsk skill publish   # 发布到技能市场");
     Ok(())
 }
 
-fn skill_md_template(name: &str, doc: &str) -> String {
+fn skill_md_template(name: &str, doc: &str, category: &str) -> String {
     format!(
-        "# {name}\n\n\
-> 一份「能力说明书」。Agent 初始化时只读这几百 Token 的 {doc}，按需才触发 CLI。\n\n\
+        "---\n\
+name: {name}\n\
+version: 0.1.0\n\
+category: {category}\n\
+description: 一句话描述这个技能能干什么\n\
+tags: []\n\
+---\n\n\
+# {name}\n\n\
+> 一份「能力说明书」。头部 frontmatter 即技能元数据（无需单独的清单文件）。\n\
+> Agent 初始化时只读这几百 Token 的 {doc}，按需才触发 CLI。\n\n\
 ## 能力概述\n\n\
 描述这个技能解决什么问题、适用场景。\n\n\
 ## 使用方式\n\n\
@@ -105,10 +98,10 @@ tsk run alice/github-inspector --help\n\
 # 调用某个工具（倾向优先使用 create_issue / list_prs）\n\
 tsk run alice/github-inspector create_issue --title \"...\" --body \"...\"\n\
 ```\n\n\
-在 {MANIFEST} 的 `mcp_dependencies` 里登记依赖，在 `preferred_tools` 里写明倾向使用的工具。\n",
+在 frontmatter 的 `mcp_dependencies` 里登记依赖，在 `preferred_tools` 里写明倾向使用的工具。\n",
         name = name,
         doc = doc,
-        MANIFEST = MANIFEST,
+        category = category,
     )
 }
 
@@ -264,13 +257,14 @@ pub fn publish(dir: Option<PathBuf>, visibility: Option<String>) -> Result<()> {
     println!("\n上传元数据与 SKILL.md…");
     let info = api.skill_upsert(&b.manifest, &visibility, &b.skill_md, &b.sha256, b.size)?;
     println!("上传压缩体 ({})…", human_size(b.size));
-    api.skill_archive_put(&info.owner, &info.name, b.archive.clone())?;
+    // 压缩体挂到清单声明的版本上：重复发布同一版本号即覆盖该版本，历史版本保留。
+    api.skill_archive_put(&info.owner, &info.name, Some(&b.manifest.version), b.archive.clone())?;
 
     println!(
         "✓ 已发布 {}/{} v{} [{}/{}]",
-        info.owner, info.name, info.version, info.category, info.visibility
+        info.owner, info.name, b.manifest.version, info.category, info.visibility
     );
-    println!("  拉取: tsk pull {}/{}", info.owner, info.name);
+    println!("  拉取: tsk pull {}/{}（最新版）或 tsk pull {}/{}@{}", info.owner, info.name, info.owner, info.name, b.manifest.version);
     if info.visibility != "public" {
         println!("  （当前为 private，仅自己可见；在 Web 端或重新 publish --visibility public 即可上架）");
     }
@@ -397,7 +391,7 @@ fn import_one(
     let b = build_with(dir, ov)?;
     let info = api.skill_upsert(&b.manifest, visibility, &b.skill_md, &b.sha256, b.size)?;
     if b.size > 0 {
-        api.skill_archive_put(&info.owner, &info.name, b.archive)?;
+        api.skill_archive_put(&info.owner, &info.name, Some(&b.manifest.version), b.archive)?;
     }
     Ok(info)
 }
@@ -446,14 +440,14 @@ pub fn search(query: &str, category: Option<&str>, tag: Option<&str>) -> Result<
 
 pub fn show(package: &str) -> Result<()> {
     let cfg = Config::load();
-    let (owner, name) = split_package(package, &cfg)?;
+    let (owner, name, version) = split_package_spec(package, &cfg)?;
     let api = HubClient::new(
         cfg.hub_url
             .clone()
             .ok_or_else(|| anyhow::anyhow!("尚未配置 Hub，请先 tsk login --hub <url>"))?,
         cfg.token.clone(),
     );
-    let s = api.skill_get(&owner, &name)?;
+    let s = api.skill_get(&owner, &name, version.as_deref())?;
     println!("# {}/{}  v{}  [{}/{}]", s.owner, s.name, s.version, s.category, s.visibility);
     if !s.tags.is_empty() {
         println!("标签: {}", s.tags.join(", "));
@@ -467,8 +461,41 @@ pub fn show(package: &str) -> Result<()> {
     if s.archive_size > 0 {
         println!("压缩体: {} (sha256 {})", human_size(s.archive_size), &s.archive_sha256[..s.archive_sha256.len().min(12)]);
     }
+    if s.versions.len() > 1 {
+        println!("可用版本: {}（tsk pull {}/{}@<version> 拉取指定版本）", s.versions.join(", "), s.owner, s.name);
+    }
     let doc = doc_filename(&s.category);
     println!("\n----- {doc} -----\n{}", s.skill_md);
+    Ok(())
+}
+
+/// 列出某技能已发布的全部版本（新→旧）。
+pub fn versions(package: &str) -> Result<()> {
+    let cfg = Config::load();
+    let (owner, name, _) = split_package_spec(package, &cfg)?;
+    let api = HubClient::new(
+        cfg.hub_url
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("尚未配置 Hub，请先 tsk login --hub <url>"))?,
+        cfg.token.clone(),
+    );
+    let s = api.skill_get(&owner, &name, None)?;
+    let list = api.skill_versions(&owner, &name)?;
+    if list.is_empty() {
+        println!("(无版本记录)");
+        return Ok(());
+    }
+    println!("{owner}/{name} 共 {} 个版本（* 为最新版，默认安装）：", list.len());
+    for v in &list {
+        let head = if v.version == s.version { " *" } else { "  " };
+        let arch = if v.archive_size > 0 {
+            format!("📦{}", human_size(v.archive_size))
+        } else {
+            "(纯文本)".into()
+        };
+        println!("{head} v{}  {}  {}", v.version, arch, v.created_at);
+    }
+    println!("\n拉取指定版本: tsk pull {owner}/{name}@<version>");
     Ok(())
 }
 
@@ -487,14 +514,15 @@ pub fn remove(name: &str) -> Result<()> {
 
 pub fn pull(package: &str, dir: Option<PathBuf>) -> Result<()> {
     let cfg = Config::load();
-    let (owner, name) = split_package(package, &cfg)?;
+    // 支持 `owner/name@version` 指定版本，缺省拉取最新版。
+    let (owner, name, version) = split_package_spec(package, &cfg)?;
     let api = HubClient::new(
         cfg.hub_url
             .clone()
             .ok_or_else(|| anyhow::anyhow!("尚未配置 Hub，请先 tsk login --hub <url>"))?,
         cfg.token.clone(),
     );
-    let s = api.skill_get(&owner, &name)?;
+    let s = api.skill_get(&owner, &name, version.as_deref())?;
 
     let base = dir.unwrap_or_else(|| PathBuf::from("."));
     let target = base.join(&name);
@@ -505,8 +533,8 @@ pub fn pull(package: &str, dir: Option<PathBuf>) -> Result<()> {
         .with_context(|| format!("创建 {}", target.display()))?;
 
     if s.archive_size > 0 && !s.archive_sha256.is_empty() {
-        println!("下载压缩体 {}…", human_size(s.archive_size));
-        let bytes = api.skill_archive_get(&owner, &name)?;
+        println!("下载压缩体 v{} ({})…", s.version, human_size(s.archive_size));
+        let bytes = api.skill_archive_get(&owner, &name, version.as_deref())?;
         let got = sha256_hex(&bytes);
         if got != s.archive_sha256 {
             bail!("压缩体校验失败：期望 {} 实得 {got}", s.archive_sha256);
@@ -520,7 +548,7 @@ pub fn pull(package: &str, dir: Option<PathBuf>) -> Result<()> {
             .with_context(|| format!("写入 {}", target.join(doc).display()))?;
     }
 
-    println!("✓ 已拉取 {}/{} → {}", owner, name, target.display());
+    println!("✓ 已拉取 {}/{} v{} → {}", owner, name, s.version, target.display());
     if !s.mcp_dependencies.is_empty() {
         println!("\n该技能依赖以下 MCP，用 tsk 包装调用：");
         for d in &s.mcp_dependencies {
@@ -560,33 +588,55 @@ fn unpack_archive(bytes: &[u8], target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 读取技能元数据：**说明书 frontmatter 是元数据主载体**（SKILL.md 即清单）。
+/// 历史 `tsk-skill.json` 仍被兼容读取，作为缺省值基底；frontmatter 里出现的字段优先。
+/// 外部导入缺失的字段使用默认值：name ← 目录名，version 0.1.0，category 按说明书推断
+/// （仅有 AGENT.md 归为 agent，否则 skill）。
 fn load_manifest(dir: &Path) -> Result<SkillManifest> {
-    let path = dir.join(MANIFEST);
-    if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("读取 {}", path.display()))?;
-        let m: SkillManifest = serde_json::from_str(&crate::shared::strip_jsonc(&raw))
-            .with_context(|| format!("解析 {}", path.display()))?;
-        Ok(m)
+    // 1) 基底：历史 tsk-skill.json（兼容），否则目录名 + 说明书推断的最小清单。
+    let legacy_path = dir.join(MANIFEST);
+    let mut m = if legacy_path.exists() {
+        let raw = std::fs::read_to_string(&legacy_path)
+            .with_context(|| format!("读取 {}", legacy_path.display()))?;
+        serde_json::from_str::<SkillManifest>(&crate::shared::strip_jsonc(&raw))
+            .with_context(|| format!("解析 {}", legacy_path.display()))?
     } else {
-        // 无清单：用目录名兜底。
         let name = dir
             .canonicalize()
             .ok()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "skill".into());
-        let mut m = SkillManifest::minimal(name.clone());
-        // 无清单时按实际存在的说明书推断分类：仅有 AGENT.md（无 SKILL.md）则归为 agent。
+        let mut m = SkillManifest::minimal(name);
         if !dir.join(SKILL_MD).is_file() && dir.join(doc_filename("agent")).is_file() {
             m.category = "agent".into();
         }
-        println!(
-            "• 未找到 {MANIFEST}，使用目录名 `{name}` 作为技能名（分类 {}）",
-            m.category
-        );
-        Ok(m)
+        m
+    };
+
+    // 2) frontmatter 覆盖。分类决定说明书文件名，而分类又可能写在 frontmatter 里——
+    //    先用「SKILL.md 否则 AGENT.md」的 category 字段定最终说明书，再从分类对应的
+    //    说明书取全量字段（单说明书场景两步读的是同一文件，天然自洽）。
+    let probe = [SKILL_MD, doc_filename("agent")]
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file());
+    if let Some(p) = probe {
+        let text = std::fs::read_to_string(&p).with_context(|| format!("读取 {}", p.display()))?;
+        if let Some(cat) = crate::shared::frontmatter_field(&text, "category") {
+            m.category = cat;
+        }
+        let doc_path = dir.join(doc_filename(&m.category));
+        if doc_path == p {
+            m.apply_frontmatter(&text);
+        } else if doc_path.is_file() {
+            let text = std::fs::read_to_string(&doc_path)
+                .with_context(|| format!("读取 {}", doc_path.display()))?;
+            m.apply_frontmatter(&text);
+        }
+        // 分类对应的说明书不存在时不在此报错，留给 build_with 的检查给出完整指引。
     }
+    Ok(m)
 }
 
 /// 判断目录是否含可发布的说明书（SKILL.md 或 AGENT.md）。
@@ -646,6 +696,17 @@ fn split_package(package: &str, cfg: &Config) -> Result<(String, String)> {
             Ok((me, package.to_string()))
         }
     }
+}
+
+/// 解析 `owner/name[@version]` 包规格：`@` 后为指定版本（技能名不含 `@`，rsplit 安全），
+/// 缺省版本表示最新版；无 owner 时用当前登录用户兜底。
+fn split_package_spec(package: &str, cfg: &Config) -> Result<(String, String, Option<String>)> {
+    let (rest, version) = match package.rsplit_once('@') {
+        Some((rest, v)) if !v.is_empty() && !rest.is_empty() => (rest, Some(v.to_string())),
+        _ => (package, None),
+    };
+    let (owner, name) = split_package(rest, cfg)?;
+    Ok((owner, name, version))
 }
 
 fn print_skill_line(s: &SkillInfo) {

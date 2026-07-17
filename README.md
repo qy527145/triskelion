@@ -12,10 +12,10 @@ Welcome to the Triskelion. Equip your AI Agents with tactical Skills, localized 
 ## 技能全生命周期（tsk）
 
 ```bash
-# 1) 脚手架：生成 SKILL.md + tsk-skill.json（Agent 用 tsk skill init --category agent，生成 AGENT.md）
+# 1) 脚手架：生成带 frontmatter 元数据的 SKILL.md（Agent 用 tsk skill init --category agent，生成 AGENT.md）
 tsk skill init my-skill && cd my-skill
 
-# 2) 本地打包校验（产出 .tsk/dist/<name>-<version>.tar.gz）
+# 2) 本地打包校验（产出 .tsk/dist/<name>-<version>.tar.zst）
 tsk build                       # 等价于 tsk skill build
 
 # 3) 发布（build + 上传元数据/SKILL.md + 上传压缩体）
@@ -23,24 +23,40 @@ tsk skill publish --visibility public
 
 # 4) 发现与拉取
 tsk skill search "" --category toolchain --tag github
-tsk pull alice/shield-dev-pack        # 下载、校验 sha256、解压到 ./shield-dev-pack
-tsk skill show alice/shield-dev-pack  # 查看元数据 + SKILL.md
+tsk pull alice/shield-dev-pack        # 下载、校验 sha256、解压到 ./shield-dev-pack（默认最新版）
+tsk pull alice/shield-dev-pack@1.0.0  # 拉取指定版本（服务端保留全部已发布版本）
+tsk skill versions alice/shield-dev-pack  # 列出全部已发布版本
+tsk skill show alice/shield-dev-pack  # 查看元数据 + SKILL.md（也支持 @version）
 tsk skill list                        # 名下全部技能（含私有）
 ```
 
-### `tsk-skill.json`
+> 版本语义：每次 `publish` 都会保留该版本的完整副本；**重复发布同一版本号会覆盖该版本**；
+> 发布低于当前最新版的旧版本号只更新该版本副本，不影响「最新版」。
 
-```jsonc
-{
-  "name": "shield-dev-pack",
-  "version": "1.0.0",
-  "category": "toolchain",            // skill | kb | toolchain | agent
-  "description": "盾局开发工具链",
-  "tags": ["github", "ci"],
-  "mcp_dependencies": ["alice/github-inspector"],   // 依赖的底层 MCP
-  "preferred_tools": ["github-inspector/create_issue"]
-}
+### 元数据：SKILL.md frontmatter
+
+技能元数据直接写在说明书头部的 YAML frontmatter 里（与 Claude Code 技能格式同构，无需单独的清单文件）：
+
+```markdown
+---
+name: shield-dev-pack
+version: 1.0.0
+category: toolchain                 # skill | kb | toolchain | agent
+description: 盾局开发工具链
+tags: [github, ci]
+mcp_dependencies: [alice/github-inspector]        # 依赖的底层 MCP
+preferred_tools: [github-inspector/create_issue]  # 倾向优先使用的工具
+---
+
+# 盾局开发工具链
+……正文即 Agent 阅读的能力说明书……
 ```
+
+- **外部导入的技能缺字段时自动用默认值**：`name` ← 文件夹名，`version` ← `0.1.0`，
+  `category` ← 按说明书推断（仅有 AGENT.md 归为 agent，否则 skill），标签为空。
+  第三方生态的附加字段（如 `allowed-tools`）原样保留、不受影响。
+- 列表字段支持内联数组 `[a, b]`、块列表（`- item`）或逗号分隔标量（`tags: a, b`）三种写法。
+- 历史 `tsk-skill.json` 仍被兼容读取（作为缺省值来源），frontmatter 里出现的字段优先。
 
 技能若依赖底层 MCP，在 `SKILL.md` 里用 `tsk` 包装调用即可（说明书会随 `tsk pull` 一并提示）：
 
@@ -50,6 +66,29 @@ tsk run alice/github-inspector create_issue --title "..." --body "..."
 ```
 
 纯文本「裸说明书」技能无需任何压缩体，也可在 Web 端「我的技能 → 新建技能」直接创建。
+
+### 开放 API：第三方客户端查询版本、安装指定版本
+
+Hub 的 REST API 完全开放（CORS 放行跨源），任意客户端可直接对接。公开资源匿名可读；
+私有资源带 `Authorization: Bearer <token>`（`POST /v1/auth/login` 以 `{"username","password"}` 换取）。
+
+```bash
+HUB=http://127.0.0.1:8787
+
+# 1) 列出某技能的全部已发布版本（新→旧）
+curl $HUB/v1/skill/alice/shield-dev-pack/versions
+# → [{"version":"1.1.0","archive_sha256":"…","archive_size":1234,"created_at":"…"},
+#    {"version":"1.0.0", …}]
+
+# 2) 查询指定版本的详情（说明书/依赖/压缩体指针；省略 ?version= 为最新版）
+curl "$HUB/v1/skill/alice/shield-dev-pack?version=1.0.0"
+# 响应含 versions 字段（全部版本号，新→旧），可一次拿到「详情 + 可用版本」
+
+# 3) 下载指定版本的压缩体（tar.zst；校验响应体 sha256 == 详情的 archive_sha256）
+curl -LO "$HUB/v1/skill/alice/shield-dev-pack/archive?version=1.0.0"
+```
+
+Web 端技能详情弹窗内同样可浏览版本历史、查看/下载任意历史版本。
 
 ## 免登录使用与本地变量
 

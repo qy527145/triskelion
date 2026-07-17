@@ -81,6 +81,21 @@ pub fn init(conn: &Connection) -> Result<()> {
             UNIQUE(owner_id, name)
         );
 
+        -- 技能版本历史：服务端保留每个已发布版本的完整副本（说明书 + 元数据 + 压缩体指针），
+        -- 客户端可按版本拉取；重复发布同一版本号则覆盖该版本。skills 表始终持有「最新版」快照。
+        -- 压缩体按 sha256 内容寻址落盘于 blobs/，多版本同内容自动复用。
+        CREATE TABLE IF NOT EXISTS skill_versions (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            skill_id       INTEGER NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+            version        TEXT NOT NULL,
+            skill_md       TEXT NOT NULL DEFAULT '',
+            metadata       TEXT NOT NULL DEFAULT '{}',
+            archive_sha256 TEXT NOT NULL DEFAULT '',
+            archive_size   INTEGER NOT NULL DEFAULT 0,
+            created_at     TEXT NOT NULL,
+            UNIQUE(skill_id, version)
+        );
+
         -- 受管标签（taxonomy）：管理后台维护的标签，用于市场资源的标注与筛选。
         -- 默认内置「官方」「社区」两种（见 init 末尾的 seed）。
         CREATE TABLE IF NOT EXISTS labels (
@@ -176,6 +191,16 @@ pub fn init(conn: &Connection) -> Result<()> {
             [],
         );
     }
+
+    // 回填版本历史：旧库里已有的技能（升级前只存最新版）把当前快照补录为一个版本副本。
+    // 幂等：UNIQUE(skill_id, version) + OR IGNORE，已有版本行则不动。
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO skill_versions(skill_id, version, skill_md, metadata,
+                                              archive_sha256, archive_size, created_at)
+         SELECT id, version, skill_md, metadata, archive_sha256, archive_size, updated_at
+         FROM skills",
+        [],
+    );
 
     // 内置默认标签：官方 / 社区（幂等，已存在则忽略）。
     let _ = conn.execute(

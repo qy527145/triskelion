@@ -2,7 +2,8 @@
 //!
 //! 支持四种入包格式：zip（用户用系统工具直接压的文件夹）、tar.zst（`tsk build` 产物）、
 //! tar.gz（历史遗留）、裸 tar。服务端在内存中解包，剥离用户常见的「单层根目录」前缀
-//! （把整个文件夹压进包时会多一层），读取 `tsk-skill.json` 与说明书（SKILL.md / AGENT.md），
+//! （把整个文件夹压进包时会多一层），从说明书（SKILL.md / AGENT.md）的 **frontmatter
+//! 读取元数据**（历史 `tsk-skill.json` 兼容作缺省基底，缺失字段用默认值），
 //! 再统一重打成平台原生的 **tar.zst**——否则 zip 落盘后 `tsk pull` 无法解压。
 
 use std::io::Read;
@@ -12,7 +13,7 @@ use crate::shared::{doc_filename, extract_description, SkillManifest, SKILL_CATE
 
 use super::error::ApiError;
 
-/// 技能元数据清单文件名（与 client 侧一致）。
+/// 历史技能元数据清单文件名（向后兼容读取；元数据主载体已是说明书 frontmatter）。
 const MANIFEST_FILE: &str = "tsk-skill.json";
 /// 解包时跳过的目录/文件名（与 client 打包侧一致，避免把无关体积打进去）。
 /// `__MACOSX` 与 `.DS_Store` / AppleDouble（`._*`）是 macOS 压缩时注入的元数据噪声。
@@ -52,7 +53,8 @@ pub fn extract_skill(bytes: &[u8]) -> Result<Extracted, ApiError> {
         return Err(ApiError::bad_request("压缩包为空，或只含被忽略的文件"));
     }
 
-    // 4) 读取清单（可选）：无 tsk-skill.json 时按说明书/目录名推断。
+    // 4) 元数据基底：历史 tsk-skill.json（兼容读取），否则按目录名/说明书推断最小清单；
+    //    真正的主载体是说明书 frontmatter（下一步覆盖），缺失字段沿用基底默认值。
     let manifest_raw = files.iter().find(|(p, _)| p == MANIFEST_FILE).map(|(_, d)| d);
     let mut manifest = match manifest_raw {
         Some(data) => {
@@ -62,18 +64,22 @@ pub fn extract_skill(bytes: &[u8]) -> Result<Extracted, ApiError> {
         }
         None => infer_manifest(&files, wrapper.as_deref()),
     };
+    // 分类决定说明书文件名，而分类又可能写在 frontmatter 里：先用「SKILL.md 否则
+    // AGENT.md」的 category 字段定分类（单说明书场景与下一步读的是同一文件，自洽）。
+    let probe = ["SKILL.md", "AGENT.md"]
+        .iter()
+        .find_map(|n| files.iter().find(|(p, _)| p == n));
+    if let Some((_, data)) = probe {
+        if let Some(cat) = crate::shared::frontmatter_field(&String::from_utf8_lossy(data), "category") {
+            manifest.category = cat;
+        }
+    }
 
     if !SKILL_CATEGORIES.contains(&manifest.category.as_str()) {
         return Err(ApiError::bad_request(format!(
             "category 只能是 {}",
             SKILL_CATEGORIES.join(" / ")
         )));
-    }
-    // 清单显式给了非法技能名才报错；为空则留给前端表单让用户填。
-    if !manifest.name.is_empty() && !valid_name(&manifest.name) {
-        return Err(ApiError::bad_request(
-            "清单中的技能名非法：仅允许字母、数字、_、-、.，长度 1..=128",
-        ));
     }
 
     // 5) 定位说明书（必需）。分类决定文件名：agent → AGENT.md，其余 → SKILL.md。
@@ -85,6 +91,21 @@ pub fn extract_skill(bytes: &[u8]) -> Result<Extracted, ApiError> {
         .ok_or_else(|| {
             ApiError::bad_request(format!("压缩包根目录缺少 {doc}（{} 分类要求）", manifest.category))
         })?;
+
+    // 说明书 frontmatter 覆盖元数据（name/version/tags/依赖等，未出现的字段保持基底值）。
+    manifest.apply_frontmatter(&skill_md);
+    if !SKILL_CATEGORIES.contains(&manifest.category.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "category 只能是 {}",
+            SKILL_CATEGORIES.join(" / ")
+        )));
+    }
+    // 清单/frontmatter 显式给了非法技能名才报错；为空则留给前端表单让用户填。
+    if !manifest.name.is_empty() && !valid_name(&manifest.name) {
+        return Err(ApiError::bad_request(
+            "元数据中的技能名非法：仅允许字母、数字、_、-、.，长度 1..=128",
+        ));
+    }
 
     if manifest.description.trim().is_empty() {
         manifest.description = extract_description(&skill_md);
@@ -368,6 +389,30 @@ mod tests {
         assert_eq!(e.manifest.version, "1.2.3");
         assert_eq!(e.manifest.category, "kb");
         assert_eq!(e.manifest.tags, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn frontmatter_is_manifest_carrier() {
+        let md: &[u8] = b"---\nname: acme\nversion: 2.0.0\ncategory: kb\ndescription: from fm\ntags: [x, y]\nmcp_dependencies:\n  - alice/gh\n---\nbody";
+        let bytes = tar_zst(&[("wrap/SKILL.md", md)]);
+        let e = ok(&bytes);
+        assert_eq!(e.manifest.name, "acme"); // frontmatter name 优先于剥离的目录名
+        assert_eq!(e.manifest.version, "2.0.0");
+        assert_eq!(e.manifest.category, "kb");
+        assert_eq!(e.manifest.description, "from fm");
+        assert_eq!(e.manifest.tags, vec!["x".to_string(), "y".into()]);
+        assert_eq!(e.manifest.mcp_dependencies, vec!["alice/gh".to_string()]);
+    }
+
+    #[test]
+    fn frontmatter_wins_over_legacy_manifest() {
+        let manifest = br#"{"name":"acme","version":"1.0.0","category":"kb"}"#;
+        let md: &[u8] = b"---\nversion: 3.0.0\n---\nbody";
+        let bytes = tar_zst(&[("acme/tsk-skill.json", manifest), ("acme/SKILL.md", md)]);
+        let e = ok(&bytes);
+        assert_eq!(e.manifest.version, "3.0.0"); // frontmatter 出现的字段优先
+        assert_eq!(e.manifest.name, "acme"); // 未出现的字段沿用历史清单
+        assert_eq!(e.manifest.category, "kb");
     }
 
     #[test]

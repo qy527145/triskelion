@@ -402,28 +402,95 @@ pub fn extract_description(md: &str) -> String {
     first_meaningful_line(md)
 }
 
-/// 解析以 `---` 围起的 YAML frontmatter，取指定标量字段的值（仅支持单行标量，足够覆盖
-/// `name:` / `description:` 这类常见头字段）。非 frontmatter 文档返回 None。
-pub fn frontmatter_field(md: &str, key: &str) -> Option<String> {
-    let mut lines = md.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
+/// frontmatter 顶层字段值：单行标量，或字符串列表（内联 `[a, b]` / 块列表 `- item`）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FmValue {
+    Scalar(String),
+    List(Vec<String>),
+}
+
+impl FmValue {
+    /// 宽松转列表：列表原样，标量按逗号切分（`tags: a, b` 与 `tags: [a, b]` 等价）。
+    pub fn into_list(self) -> Vec<String> {
+        let items = match self {
+            FmValue::List(v) => v,
+            FmValue::Scalar(s) => s.split(',').map(str::to_string).collect(),
+        };
+        items
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
-    let prefix = format!("{key}:");
-    for line in lines {
-        let t = line.trim_end();
-        let trimmed = t.trim();
+}
+
+/// 去掉 YAML 标量外层引号与空白。
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches('"').trim_matches('\'').trim().to_string()
+}
+
+/// 解析 `---` 围栏 YAML frontmatter 的顶层字段。说明书（SKILL.md / AGENT.md）的
+/// frontmatter 即技能元数据载体，此处只实现所需子集：单行标量、内联数组、块列表。
+/// 所有值一律按字符串处理，刻意规避 YAML 隐式类型的坑（`version: 1.10` 不会变成浮点
+/// 1.1）；缩进行（嵌套结构/多行值）与未知形态一律跳过，兼容第三方生态的附加字段
+/// （如 Claude Code 的 `allowed-tools`）。
+pub fn parse_frontmatter(md: &str) -> Vec<(String, FmValue)> {
+    let mut out: Vec<(String, FmValue)> = Vec::new();
+    let mut lines = md.lines().peekable();
+    if lines.next().map(str::trim) != Some("---") {
+        return out;
+    }
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
         if trimmed == "---" || trimmed == "..." {
             break;
         }
-        if let Some(rest) = t.strip_prefix(&prefix) {
-            let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
+        // 顶层字段必须无缩进；缩进行属于上一字段的嵌套内容，跳过。
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || line.starts_with(' ')
+            || line.starts_with('\t')
+        {
+            continue;
         }
+        let Some((key, rest)) = line.split_once(':') else { continue };
+        let (key, rest) = (key.trim().to_string(), rest.trim());
+        let value = if rest.is_empty() {
+            // 可能是块列表：吸收紧随其后的 `- item` 行（允许缩进）。
+            let mut items = Vec::new();
+            while let Some(next) = lines.peek() {
+                match next.trim().strip_prefix("- ") {
+                    Some(v) => {
+                        items.push(unquote(v));
+                        lines.next();
+                    }
+                    None => break,
+                }
+            }
+            if items.is_empty() {
+                FmValue::Scalar(String::new())
+            } else {
+                FmValue::List(items)
+            }
+        } else if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            FmValue::List(inner.split(',').map(unquote).collect())
+        } else {
+            FmValue::Scalar(unquote(rest))
+        };
+        out.push((key, value));
     }
-    None
+    out
+}
+
+/// 取 frontmatter 中指定标量字段的值（空值视为未设置）。非 frontmatter 文档返回 None。
+pub fn frontmatter_field(md: &str, key: &str) -> Option<String> {
+    parse_frontmatter(md)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            FmValue::Scalar(s) if !s.is_empty() => Some(s),
+            _ => None,
+        })
 }
 
 fn first_meaningful_line(md: &str) -> String {
@@ -447,7 +514,8 @@ fn clip(s: &str, n: usize) -> String {
     out
 }
 
-/// 技能包清单，对应本地 `tsk-skill.json`。SKILL.md 不在此处，单独承载。
+/// 技能包清单。本地载体是说明书（SKILL.md / AGENT.md）头部的 YAML frontmatter，
+/// 历史 `tsk-skill.json` 兼容读取（frontmatter 字段优先）。SKILL.md 正文单独承载。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SkillManifest {
     pub name: String,
@@ -490,6 +558,45 @@ impl SkillManifest {
             preferred_tools: Vec::new(),
         }
     }
+
+    /// 把说明书 frontmatter 中已识别的元数据字段覆盖到清单上——**说明书即元数据载体**。
+    /// frontmatter 未出现的字段保持原值：外部导入缺字段时由调用方先备好默认值
+    /// （name ← 目录名、version 0.1.0、category 按说明书文件名推断）。
+    pub fn apply_frontmatter(&mut self, md: &str) {
+        let scalar = |v: FmValue| match v {
+            FmValue::Scalar(s) if !s.is_empty() => Some(s),
+            _ => None,
+        };
+        for (key, value) in parse_frontmatter(md) {
+            match key.as_str() {
+                "name" => {
+                    if let Some(s) = scalar(value) {
+                        self.name = s;
+                    }
+                }
+                "version" => {
+                    if let Some(s) = scalar(value) {
+                        self.version = s;
+                    }
+                }
+                "category" => {
+                    if let Some(s) = scalar(value) {
+                        self.category = s;
+                    }
+                }
+                "description" => {
+                    if let Some(s) = scalar(value) {
+                        self.description = s;
+                    }
+                }
+                "tags" => self.tags = value.into_list(),
+                "labels" => self.labels = value.into_list(),
+                "mcp_dependencies" => self.mcp_dependencies = value.into_list(),
+                "preferred_tools" => self.preferred_tools = value.into_list(),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// 发布/更新一个技能的元数据（不含压缩体本身，压缩体走 archive 上传接口）。
@@ -509,11 +616,12 @@ pub struct SkillUpsertReq {
 }
 
 /// 「拖入压缩包创建技能」的解析结果：服务端解包（zip / tar.zst / tar.gz / 裸 tar）、
-/// 剥离单层根目录、读取 tsk-skill.json 与说明书后回吐，供 Web 端预填表单确认。
-/// 归一化后的 tar.zst 压缩体已按 sha256 落盘，用户确认时以 `archive_sha256` 关联即可。
+/// 剥离单层根目录、从说明书 frontmatter 解析元数据（历史 tsk-skill.json 兼容）后回吐，
+/// 供 Web 端预填表单确认。归一化后的 tar.zst 压缩体已按 sha256 落盘，用户确认时以
+/// `archive_sha256` 关联即可。
 #[derive(Serialize, Deserialize)]
 pub struct SkillInspectResp {
-    /// 从压缩包解析出的清单（无 tsk-skill.json 时按目录名/说明书推断，name 可能为空待用户填写）。
+    /// 从压缩包解析出的清单（frontmatter 优先，缺失字段按目录名/说明书推断，name 可能为空待用户填写）。
     pub manifest: SkillManifest,
     /// 说明书（SKILL.md / AGENT.md）全文。
     pub skill_md: String,
@@ -523,6 +631,40 @@ pub struct SkillInspectResp {
     pub archive_size: u64,
     /// 压缩包内的文件数（供前端展示）。
     pub file_count: usize,
+}
+
+/// 版本号感知比较（非严格 semver，够「取最新版」用）：按 `.` 分段，两段均为纯数字则按
+/// 数值比较，否则退回字符串比较；段数不足按空段补齐（空段 < 任何非空段）。
+/// 例：`1.10.0 > 1.9.0`、`0.2 > 0.1.9`、`1.0.0 < 1.0.0.1`。
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let pa: Vec<&str> = a.trim().split('.').collect();
+    let pb: Vec<&str> = b.trim().split('.').collect();
+    for i in 0..pa.len().max(pb.len()) {
+        let x = pa.get(i).copied().unwrap_or("");
+        let y = pb.get(i).copied().unwrap_or("");
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(m), Ok(n)) => m.cmp(&n),
+            _ => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// 技能的一个已发布版本副本（版本列表接口返回）。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SkillVersionInfo {
+    pub version: String,
+    /// 压缩体 sha256（空表示该版本为纯文本裸说明书包）。
+    #[serde(default)]
+    pub archive_sha256: String,
+    #[serde(default)]
+    pub archive_size: u64,
+    /// 该版本最近一次发布（含覆盖）时间。
+    pub created_at: String,
 }
 
 /// 技能元信息（市场/详情返回）。
@@ -561,6 +703,9 @@ pub struct SkillInfo {
     pub liked: bool,
     #[serde(default)]
     pub favorited: bool,
+    /// 已发布的全部版本号（新→旧）。仅详情接口填充，列表接口为空。
+    #[serde(default)]
+    pub versions: Vec<String>,
     pub updated_at: String,
 }
 
@@ -589,4 +734,59 @@ pub struct ReactResp {
 #[derive(Serialize, Deserialize)]
 pub struct TransferReq {
     pub new_owner: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_versions, parse_frontmatter, FmValue, SkillManifest};
+    use std::cmp::Ordering::{Equal, Greater, Less};
+
+    #[test]
+    fn version_compare_numeric_aware() {
+        assert_eq!(compare_versions("1.10.0", "1.9.0"), Greater); // 数值比较，非字典序
+        assert_eq!(compare_versions("0.2", "0.1.9"), Greater);
+        assert_eq!(compare_versions("1.0.0", "1.0"), Greater); // 缺段按空补齐，空段 < 非空段
+        assert_eq!(compare_versions("1.0.0", "1.0.0.1"), Less);
+        assert_eq!(compare_versions("2.0.0", "2.0.0"), Equal);
+        assert_eq!(compare_versions(" 1.2.3 ", "1.2.3"), Equal); // 容忍首尾空白
+        assert_eq!(compare_versions("1.0.0-beta", "1.0.0-alpha"), Greater); // 非数字段退回字符串比较
+    }
+
+    #[test]
+    fn frontmatter_scalars_inline_and_block_lists() {
+        let md = "---\n\
+                  name: acme\n\
+                  version: \"1.10\"\n\
+                  tags: [a, B ]\n\
+                  mcp_dependencies:\n  - alice/gh\n  - bob/ci\n\
+                  allowed-tools: Bash(git:*)\n\
+                  nested:\n  deep: 1\n\
+                  ---\n# body";
+        let kv = parse_frontmatter(md);
+        let get = |k: &str| kv.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("name"), Some(FmValue::Scalar("acme".into())));
+        // 值一律按字符串处理：1.10 不会掉进 YAML 浮点坑变成 1.1。
+        assert_eq!(get("version"), Some(FmValue::Scalar("1.10".into())));
+        assert_eq!(get("tags"), Some(FmValue::List(vec!["a".into(), "B".into()])));
+        assert_eq!(
+            get("mcp_dependencies"),
+            Some(FmValue::List(vec!["alice/gh".into(), "bob/ci".into()]))
+        );
+        // 第三方生态的附加字段照常解析（消费方忽略即可），嵌套结构不炸。
+        assert_eq!(get("allowed-tools"), Some(FmValue::Scalar("Bash(git:*)".into())));
+        assert_eq!(get("nested"), Some(FmValue::Scalar(String::new())));
+        // 无 frontmatter 的文档返回空。
+        assert!(parse_frontmatter("# 没有头\n正文").is_empty());
+    }
+
+    #[test]
+    fn frontmatter_overrides_manifest_and_keeps_defaults() {
+        let mut m = SkillManifest::minimal("dir-name");
+        m.apply_frontmatter("---\nname: real-name\ntags: a, b\ndescription: 说明\n---\n# t");
+        assert_eq!(m.name, "real-name");
+        assert_eq!(m.version, "0.1.0"); // frontmatter 未出现的字段保持默认值
+        assert_eq!(m.category, "skill");
+        assert_eq!(m.tags, vec!["a".to_string(), "b".into()]); // 标量逗号切分等价于内联数组
+        assert_eq!(m.description, "说明");
+    }
 }

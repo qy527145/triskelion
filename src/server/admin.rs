@@ -1276,6 +1276,19 @@ pub async fn skill_update(
             rusqlite::params![ver, now, oid, name],
         )
         .map_err(db_err)?;
+        // 保持版本历史一致：改版本号视作以当前快照内容发布该版本（同号覆盖，旧版本保留）。
+        conn.execute(
+            "INSERT INTO skill_versions(skill_id, version, skill_md, metadata,
+                                        archive_sha256, archive_size, created_at)
+             SELECT id, ?1, skill_md, metadata, archive_sha256, archive_size, ?2
+             FROM skills WHERE owner_id = ?3 AND name = ?4
+             ON CONFLICT(skill_id, version) DO UPDATE SET
+                 skill_md=excluded.skill_md, metadata=excluded.metadata,
+                 archive_sha256=excluded.archive_sha256, archive_size=excluded.archive_size,
+                 created_at=excluded.created_at",
+            rusqlite::params![ver, now, oid, name],
+        )
+        .map_err(db_err)?;
     }
     if let Some(desc) = req.description.as_deref() {
         conn.execute(

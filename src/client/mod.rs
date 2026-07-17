@@ -51,9 +51,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
-    /// 拉取并解压一个技能包：tsk pull <owner>/<name>
+    /// 拉取并解压一个技能包：tsk pull <owner>/<name>[@version]（缺省最新版）
     Pull {
-        /// owner/name 或 name（默认当前用户）
+        /// owner/name[@version] 或 name[@version]（owner 默认当前用户，version 默认最新版）
         package: String,
         /// 解压到的父目录（默认当前目录，最终落在 <dir>/<name>）
         #[arg(long)]
@@ -137,7 +137,7 @@ enum SecretCmd {
 
 #[derive(Subcommand)]
 enum SkillCmd {
-    /// 在目录里生成技能脚手架（说明书 + tsk-skill.json；agent 分类生成 AGENT.md，其余 SKILL.md）
+    /// 在目录里生成技能脚手架（说明书 frontmatter 即元数据；agent 分类生成 AGENT.md，其余 SKILL.md）
     Init {
         /// 目标目录（默认当前目录）
         dir: Option<PathBuf>,
@@ -170,9 +170,11 @@ enum SkillCmd {
         #[arg(long)]
         tag: Option<String>,
     },
-    /// 查看技能详情与 SKILL.md：tsk skill show <owner>/<name>
+    /// 查看技能详情与 SKILL.md：tsk skill show <owner>/<name>[@version]
     Show { package: String },
-    /// 拉取并解压一个技能包
+    /// 列出技能已发布的全部版本：tsk skill versions <owner>/<name>
+    Versions { package: String },
+    /// 拉取并解压一个技能包（package 可带 @version 指定版本，缺省最新版）
     Pull {
         package: String,
         #[arg(long)]
@@ -209,6 +211,7 @@ pub fn run() -> Result<()> {
                 tag.as_deref(),
             ),
             SkillCmd::Show { package } => skill::show(&package),
+            SkillCmd::Versions { package } => skill::versions(&package),
             SkillCmd::Pull { package, dir } => skill::pull(&package, dir),
             SkillCmd::Remove { name } => skill::remove(&name),
         },

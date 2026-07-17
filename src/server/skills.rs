@@ -15,8 +15,8 @@ use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
 use crate::shared::{
-    ReactReq, ReactResp, SkillInfo, SkillInspectResp, SkillRenameReq, SkillUpsertReq, TransferReq,
-    SKILL_CATEGORIES,
+    compare_versions, ReactReq, ReactResp, SkillInfo, SkillInspectResp, SkillRenameReq,
+    SkillUpsertReq, SkillVersionInfo, TransferReq, SKILL_CATEGORIES,
 };
 
 use super::auth;
@@ -162,6 +162,10 @@ pub async fn list_mine(State(state): S, headers: HeaderMap) -> Result<Json<Vec<S
 }
 
 /// 发布/更新一个技能的元数据（压缩体走 archive 接口单独上传）。
+///
+/// 版本语义：每次发布都会把该版本的完整副本（说明书 + 元数据 + 压缩体指针）写入
+/// `skill_versions`——同版本号重复发布即**覆盖该版本**；`skills` 表始终持有「最新版」
+/// 快照（按版本号序），发布不高于现有最新版的旧版本号只更新版本副本，不回退最新版。
 pub async fn upsert(
     State(state): S,
     headers: HeaderMap,
@@ -172,6 +176,12 @@ pub async fn upsert(
     if !valid_name(&m.name) {
         return Err(ApiError::bad_request(
             "技能名仅允许字母、数字、_、-、.，且长度 1..=128",
+        ));
+    }
+    let version = m.version.trim().to_string();
+    if !valid_version(&version) {
+        return Err(ApiError::bad_request(
+            "版本号非法：仅允许字母、数字、.、_、-、+，长度 1..=64",
         ));
     }
     let category = if SKILL_CATEGORIES.contains(&m.category.as_str()) {
@@ -196,49 +206,69 @@ pub async fn upsert(
     let now = now_string();
 
     let conn = state.db.lock().unwrap();
-    // 保留既有压缩体信息（upsert 元数据不应清空已上传的数据体）。
-    let prev: Option<(String, i64)> = conn
+    // 既有记录：head 版本号 + 该版本已有副本的压缩体信息（upsert 元数据不应清空已上传的数据体）。
+    let prev: Option<(i64, String, String, i64)> = conn
         .query_row(
-            "SELECT archive_sha256, archive_size FROM skills WHERE owner_id = ?1 AND name = ?2",
+            "SELECT id, version, archive_sha256, archive_size FROM skills
+             WHERE owner_id = ?1 AND name = ?2",
             rusqlite::params![claims.sub, m.name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()
         .map_err(db_err)?;
+    // 压缩体指针兜底链：请求携带 > 本版本既有副本 > head 快照（保持旧客户端行为）。
     let (archive_sha256, archive_size) = if req.archive_sha256.is_empty() {
-        prev.unwrap_or_default()
+        let from_version: Option<(String, i64)> = match &prev {
+            Some((sid, ..)) => conn
+                .query_row(
+                    "SELECT archive_sha256, archive_size FROM skill_versions
+                     WHERE skill_id = ?1 AND version = ?2",
+                    rusqlite::params![sid, version],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?
+                .filter(|(sha, _): &(String, i64)| !sha.is_empty()),
+            None => None,
+        };
+        from_version.or_else(|| prev.as_ref().map(|(_, _, sha, size)| (sha.clone(), *size))).unwrap_or_default()
     } else {
         (req.archive_sha256.clone(), req.archive_size as i64)
     };
 
-    conn.execute(
-        "INSERT INTO skills(owner_id, name, category, visibility, version, description,
-                            tags, skill_md, metadata, archive_sha256, archive_size, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT(owner_id, name) DO UPDATE SET
-             category=excluded.category, visibility=excluded.visibility, version=excluded.version,
-             description=excluded.description, tags=excluded.tags, skill_md=excluded.skill_md,
-             metadata=excluded.metadata, archive_sha256=excluded.archive_sha256,
-             archive_size=excluded.archive_size, updated_at=excluded.updated_at",
-        rusqlite::params![
-            claims.sub,
-            m.name,
-            category,
-            visibility,
-            m.version,
-            m.description,
-            tags_json,
-            req.skill_md,
-            meta_json,
-            archive_sha256,
-            archive_size,
-            now
-        ],
-    )
-    .map_err(db_err)?;
+    // 发布旧版本号（低于现有最新版）时只写版本副本，不回退 head 快照。
+    let is_head = match &prev {
+        Some((_, head_ver, ..)) => compare_versions(&version, head_ver) != std::cmp::Ordering::Less,
+        None => true,
+    };
+    if is_head {
+        conn.execute(
+            "INSERT INTO skills(owner_id, name, category, visibility, version, description,
+                                tags, skill_md, metadata, archive_sha256, archive_size, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(owner_id, name) DO UPDATE SET
+                 category=excluded.category, visibility=excluded.visibility, version=excluded.version,
+                 description=excluded.description, tags=excluded.tags, skill_md=excluded.skill_md,
+                 metadata=excluded.metadata, archive_sha256=excluded.archive_sha256,
+                 archive_size=excluded.archive_size, updated_at=excluded.updated_at",
+            rusqlite::params![
+                claims.sub,
+                m.name,
+                category,
+                visibility,
+                version,
+                m.description,
+                tags_json,
+                req.skill_md,
+                meta_json,
+                archive_sha256,
+                archive_size,
+                now
+            ],
+        )
+        .map_err(db_err)?;
+    }
 
-    // 受管标签（labels）：合并式关联（仅新增、去重），须为后台已存在的标签。
-    // 空则不动既有关联，避免客户端重发布覆盖掉后台分配的标签。
     let (skill_id, downloads): (i64, i64) = conn
         .query_row(
             "SELECT id, downloads FROM skills WHERE owner_id = ?1 AND name = ?2",
@@ -246,6 +276,33 @@ pub async fn upsert(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(db_err)?;
+
+    // 版本副本：同版本号重复发布即覆盖。覆盖若替换了压缩体，顺带 GC 失引用的旧 blob。
+    let old_sha: Option<String> = conn
+        .query_row(
+            "SELECT archive_sha256 FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+            rusqlite::params![skill_id, version],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    conn.execute(
+        "INSERT INTO skill_versions(skill_id, version, skill_md, metadata,
+                                    archive_sha256, archive_size, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(skill_id, version) DO UPDATE SET
+             skill_md=excluded.skill_md, metadata=excluded.metadata,
+             archive_sha256=excluded.archive_sha256, archive_size=excluded.archive_size,
+             created_at=excluded.created_at",
+        rusqlite::params![skill_id, version, req.skill_md, meta_json, archive_sha256, archive_size, now],
+    )
+    .map_err(db_err)?;
+    if let Some(old) = old_sha.filter(|s| !s.is_empty() && *s != archive_sha256) {
+        gc_blob_if_unreferenced(&state, &conn, &old);
+    }
+
+    // 受管标签（labels）：合并式关联（仅新增、去重），须为后台已存在的标签。
+    // 空则不动既有关联，避免客户端重发布覆盖掉后台分配的标签。
     let labels = if m.labels.is_empty() {
         super::routes::labels_of(&conn, "skill_labels", "skill_id", skill_id)
     } else {
@@ -264,6 +321,7 @@ pub async fn upsert(
         skill_id,
         Some(claims.sub),
     );
+    let versions = versions_of(&conn, skill_id);
     drop(conn);
 
     Ok(Json(SkillInfo {
@@ -271,7 +329,7 @@ pub async fn upsert(
         name: m.name,
         category,
         visibility,
-        version: m.version,
+        version,
         description: m.description,
         tags: lower_tags(&m.tags),
         mcp_dependencies: m.mcp_dependencies,
@@ -285,18 +343,35 @@ pub async fn upsert(
         downloads,
         liked,
         favorited,
+        versions: versions.into_iter().map(|v| v.version).collect(),
         updated_at: now,
     }))
 }
 
+/// 详情/下载接口的版本选择参数：`?version=1.2.0`，缺省为最新版。
+#[derive(serde::Deserialize)]
+pub struct VersionQuery {
+    version: Option<String>,
+}
+
 /// 技能详情。public 受分组可见性约束；private 仅 owner（带有效 token）可读。
+/// 带 `?version=` 时返回该历史版本的副本内容（说明书/依赖/压缩体指针），缺省为最新版；
+/// 响应的 `versions` 字段列出全部已发布版本（新→旧）。
 pub async fn get(
     State(state): S,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<VersionQuery>,
 ) -> Result<Json<SkillInfo>, ApiError> {
     let (mut info, group_vis, id) = load_skill(&state, &owner, &name)?;
     ensure_skill_access(&state, &headers, &info, &group_vis)?;
+    {
+        let conn = state.db.lock().unwrap();
+        info.versions = versions_of(&conn, id).into_iter().map(|v| v.version).collect();
+        if let Some(ver) = q.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            apply_version(&conn, id, ver, &mut info)?;
+        }
+    }
     if let Some(claims) = auth::authenticate_opt(&state.jwt_secret, &headers) {
         let conn = state.db.lock().unwrap();
         let (_, _, liked, favorited) = super::routes::reaction_summary(
@@ -310,6 +385,18 @@ pub async fn get(
         info.favorited = favorited;
     }
     Ok(Json(info))
+}
+
+/// 列出某技能已发布的全部版本副本（新→旧）。可见性校验同详情接口。
+pub async fn versions(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<Json<Vec<SkillVersionInfo>>, ApiError> {
+    let (info, group_vis, id) = load_skill(&state, &owner, &name)?;
+    ensure_skill_access(&state, &headers, &info, &group_vis)?;
+    let conn = state.db.lock().unwrap();
+    Ok(Json(versions_of(&conn, id)))
 }
 
 /// 点赞 / 收藏一个技能（或取消）。资源须对当前用户可见。
@@ -435,14 +522,8 @@ pub async fn delete(
         return Err(ApiError::unauthorized("只能删除自己的技能"));
     }
     let conn = state.db.lock().unwrap();
-    let sha: Option<String> = conn
-        .query_row(
-            "SELECT archive_sha256 FROM skills WHERE owner_id = ?1 AND name = ?2",
-            rusqlite::params![claims.sub, name],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(db_err)?;
+    // 收集该技能全部版本引用的 blob（head 快照 + 版本副本），删除后逐个 GC。
+    let shas: Vec<String> = collect_skill_shas(&conn, claims.sub, &name)?;
     let n = conn
         .execute(
             "DELETE FROM skills WHERE owner_id = ?1 AND name = ?2",
@@ -452,22 +533,9 @@ pub async fn delete(
     if n == 0 {
         return Err(ApiError::not_found("未找到该技能"));
     }
-    // 若该压缩体已无人引用，顺带清理 blob（尽力而为）。
-    if let Some(sha) = sha.filter(|s| !s.is_empty()) {
-        let still: bool = conn
-            .query_row(
-                "SELECT 1 FROM skills WHERE archive_sha256 = ?1 LIMIT 1",
-                [&sha],
-                |_| Ok(true),
-            )
-            .optional()
-            .map_err(db_err)?
-            .unwrap_or(false);
-        if !still {
-            if let Some(p) = find_blob(&state, &sha) {
-                let _ = std::fs::remove_file(p);
-            }
-        }
+    // 版本副本随 FK 级联删除；失引用的 blob 顺带清理（尽力而为）。
+    for sha in shas {
+        gc_blob_if_unreferenced(&state, &conn, &sha);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -553,10 +621,13 @@ pub async fn inspect(
 }
 
 /// 上传技能压缩体（tar.zst 原始字节，亦兼容旧版 gzip）。仅 owner。服务端计算 sha256 落盘并写回记录。
+/// 带 `?version=` 时挂到该版本副本（须先发布该版本元数据），缺省挂到最新版；
+/// 目标版本恰为最新版时同步刷新 `skills` 快照。
 pub async fn archive_put(
     State(state): S,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<VersionQuery>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
@@ -576,30 +647,77 @@ pub async fn archive_put(
     }
     let now = now_string();
     let conn = state.db.lock().unwrap();
-    let n = conn
-        .execute(
+    let head: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, version FROM skills WHERE owner_id = ?1 AND name = ?2",
+            rusqlite::params![claims.sub, name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((skill_id, head_ver)) = head else {
+        return Err(ApiError::not_found("请先发布技能元数据，再上传压缩体"));
+    };
+    let target_ver = q
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| head_ver.clone());
+
+    // 覆盖版本副本的压缩体指针；被替换的旧 blob 失引用则 GC。
+    let old_sha: Option<String> = conn
+        .query_row(
+            "SELECT archive_sha256 FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+            rusqlite::params![skill_id, target_ver],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    if old_sha.is_none() {
+        return Err(ApiError::not_found(format!(
+            "版本 {target_ver} 不存在，请先发布该版本元数据"
+        )));
+    }
+    conn.execute(
+        "UPDATE skill_versions SET archive_sha256 = ?1, archive_size = ?2, created_at = ?3
+         WHERE skill_id = ?4 AND version = ?5",
+        rusqlite::params![sha, size, now, skill_id, target_ver],
+    )
+    .map_err(db_err)?;
+    if target_ver == head_ver {
+        conn.execute(
             "UPDATE skills SET archive_sha256 = ?1, archive_size = ?2, updated_at = ?3
-             WHERE owner_id = ?4 AND name = ?5",
-            rusqlite::params![sha, size, now, claims.sub, name],
+             WHERE id = ?4",
+            rusqlite::params![sha, size, now, skill_id],
         )
         .map_err(db_err)?;
-    if n == 0 {
-        return Err(ApiError::not_found("请先发布技能元数据，再上传压缩体"));
+    }
+    if let Some(old) = old_sha.filter(|s| !s.is_empty() && *s != sha) {
+        gc_blob_if_unreferenced(&state, &conn, &old);
     }
     Ok(Json(serde_json::json!({
         "archive_sha256": sha,
         "archive_size": size,
+        "version": target_ver,
     })))
 }
 
 /// 下载技能压缩体。public 受分组可见性约束；private 仅 owner。
+/// 带 `?version=` 时下载该历史版本的压缩体，缺省为最新版。
 pub async fn archive_get(
     State(state): S,
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
+    Query(q): Query<VersionQuery>,
 ) -> Result<Response, ApiError> {
-    let (info, group_vis, id) = load_skill(&state, &owner, &name)?;
+    let (mut info, group_vis, id) = load_skill(&state, &owner, &name)?;
     ensure_skill_access(&state, &headers, &info, &group_vis)?;
+    if let Some(ver) = q.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        let conn = state.db.lock().unwrap();
+        apply_version(&conn, id, ver, &mut info)?;
+    }
     if info.archive_sha256.is_empty() {
         return Err(ApiError::not_found("该技能没有压缩体（纯文本裸说明书包）"));
     }
@@ -643,6 +761,113 @@ fn valid_name(s: &str) -> bool {
         && s.len() <= 128
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// 版本号校验：字母/数字/`._-+`（覆盖 semver 及预发布/构建号写法），长度 1..=64。
+fn valid_version(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+}
+
+/// 某技能的全部已发布版本（版本号感知排序，新→旧）。
+fn versions_of(conn: &rusqlite::Connection, skill_id: i64) -> Vec<SkillVersionInfo> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT version, archive_sha256, archive_size, created_at
+         FROM skill_versions WHERE skill_id = ?1",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([skill_id], |r| {
+        Ok(SkillVersionInfo {
+            version: r.get(0)?,
+            archive_sha256: r.get(1)?,
+            archive_size: r.get::<_, i64>(2)? as u64,
+            created_at: r.get(3)?,
+        })
+    });
+    let mut out: Vec<SkillVersionInfo> = match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort_by(|a, b| compare_versions(&b.version, &a.version));
+    out
+}
+
+/// 把 `info` 的版本相关字段（版本号/说明书/依赖/压缩体指针）替换为指定历史版本的副本。
+/// 版本不存在报 not_found。
+fn apply_version(
+    conn: &rusqlite::Connection,
+    skill_id: i64,
+    version: &str,
+    info: &mut SkillInfo,
+) -> Result<(), ApiError> {
+    let row: Option<(String, String, String, i64)> = conn
+        .query_row(
+            "SELECT skill_md, metadata, archive_sha256, archive_size
+             FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+            rusqlite::params![skill_id, version],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let (skill_md, meta_json, sha, size) = row.ok_or_else(|| {
+        ApiError::not_found(format!("未找到版本 {version}（{}/{}）", info.owner, info.name))
+    })?;
+    let meta: SkillMeta = serde_json::from_str(&meta_json).unwrap_or_default();
+    info.version = version.to_string();
+    info.skill_md = skill_md;
+    info.mcp_dependencies = meta.mcp_dependencies;
+    info.preferred_tools = meta.preferred_tools;
+    info.archive_sha256 = sha;
+    info.archive_size = size as u64;
+    Ok(())
+}
+
+/// 若 blob 已不被任何技能（head 快照或版本副本）引用，则删除文件（尽力而为）。
+fn gc_blob_if_unreferenced(state: &AppState, conn: &rusqlite::Connection, sha: &str) {
+    if sha.is_empty() {
+        return;
+    }
+    let referenced: bool = conn
+        .query_row(
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM skills WHERE archive_sha256 = ?1)
+                       OR EXISTS(SELECT 1 FROM skill_versions WHERE archive_sha256 = ?1)",
+            [sha],
+            |_| Ok(true),
+        )
+        .optional()
+        .unwrap_or(Some(true))
+        .unwrap_or(false);
+    if !referenced {
+        if let Some(p) = find_blob(state, sha) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// 某技能（head 快照 + 全部版本副本）引用的 blob sha 去重清单。
+fn collect_skill_shas(
+    conn: &rusqlite::Connection,
+    owner_id: i64,
+    name: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT sha FROM (
+                 SELECT archive_sha256 AS sha FROM skills WHERE owner_id = ?1 AND name = ?2
+                 UNION
+                 SELECT v.archive_sha256 FROM skill_versions v
+                 JOIN skills s ON s.id = v.skill_id
+                 WHERE s.owner_id = ?1 AND s.name = ?2
+             ) WHERE sha != ''",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params![owner_id, name], |r| r.get::<_, String>(0))
+        .map_err(db_err)?;
+    Ok(rows.flatten().collect())
 }
 
 fn lower_tags(tags: &[String]) -> Vec<String> {
@@ -741,6 +966,7 @@ fn tuple_to_info(t: SkillRow) -> Result<SkillInfo, ApiError> {
         downloads,
         liked: false,
         favorited: false,
+        versions: Vec::new(),
         updated_at,
     })
 }
@@ -800,47 +1026,34 @@ fn ensure_skill_access(
     Ok(())
 }
 
-/// 管理后台用：按 owner 用户名 + 技能名删除（含 blob GC）。返回是否删除了行。
+/// 管理后台用：按 owner 用户名 + 技能名删除（含全部版本 blob 的 GC）。返回是否删除了行。
 pub(super) fn delete_skill_record(
     state: &AppState,
     owner: &str,
     name: &str,
 ) -> Result<bool, ApiError> {
     let conn = state.db.lock().unwrap();
-    let sha: Option<String> = conn
+    let oid: Option<i64> = conn
         .query_row(
-            "SELECT s.archive_sha256 FROM skills s JOIN users u ON u.id = s.owner_id
-             WHERE u.username = ?1 AND s.name = ?2",
-            rusqlite::params![owner, name],
+            "SELECT id FROM users WHERE username = ?1",
+            [owner],
             |r| r.get(0),
         )
         .optional()
         .map_err(db_err)?;
+    let Some(oid) = oid else { return Ok(false) };
+    let shas = collect_skill_shas(&conn, oid, name)?;
     let n = conn
         .execute(
-            "DELETE FROM skills WHERE name = ?2 AND owner_id =
-                (SELECT id FROM users WHERE username = ?1)",
-            rusqlite::params![owner, name],
+            "DELETE FROM skills WHERE owner_id = ?1 AND name = ?2",
+            rusqlite::params![oid, name],
         )
         .map_err(db_err)?;
     if n == 0 {
         return Ok(false);
     }
-    if let Some(sha) = sha.filter(|s| !s.is_empty()) {
-        let still: bool = conn
-            .query_row(
-                "SELECT 1 FROM skills WHERE archive_sha256 = ?1 LIMIT 1",
-                [&sha],
-                |_| Ok(true),
-            )
-            .optional()
-            .map_err(db_err)?
-            .unwrap_or(false);
-        if !still {
-            if let Some(p) = find_blob(state, &sha) {
-                let _ = std::fs::remove_file(p);
-            }
-        }
+    for sha in shas {
+        gc_blob_if_unreferenced(state, &conn, &sha);
     }
     Ok(true)
 }
