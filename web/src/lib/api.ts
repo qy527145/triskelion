@@ -21,6 +21,7 @@ import type {
   SkillManifest,
   SkillVersionDeleteResp,
   SkillVersionInfo,
+  ToolMeta,
   UserTransferResult,
 } from "./types";
 
@@ -177,6 +178,12 @@ export const api = {
       auth: true,
       body: { new_owner: newOwner },
     }),
+  /** 服务端在线索引：Hub 连接 MCP 拉取工具清单并落库，返回最新工具列表。 */
+  indexMcpTools: (owner: string, name: string) =>
+    req<{ tools: ToolMeta[] }>(
+      "/v1/mcp/" + encodeURIComponent(owner) + "/" + encodeURIComponent(name) + "/index",
+      { method: "POST", auth: true },
+    ),
 
   callTool: (owner: string, name: string, tool: string, args: unknown) =>
     req<unknown>(

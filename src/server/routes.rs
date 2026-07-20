@@ -39,6 +39,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/mcp/{name}/transfer", post(mcp_transfer))
         .route("/v1/mcp/{name}/tools", post(mcp_set_tools))
         .route("/v1/mcp/{owner}/{name}", get(mcp_get))
+        .route("/v1/mcp/{owner}/{name}/index", post(mcp_index))
         .route("/v1/mcp/{owner}/{name}/react", post(mcp_react))
         // 当前用户收藏的全部资源（技能 + MCP）
         .route("/v1/favorites", get(favorites))
@@ -583,6 +584,52 @@ async fn mcp_set_tools(
         return Err(ApiError::not_found("未找到该 MCP"));
     }
     Ok(Json(serde_json::json!({ "indexed": req.tools.len() })))
+}
+
+/// 服务端在线索引：Hub 直接连接 MCP 执行 tools/list，落库并返回工具清单。
+/// 任何对该 MCP 可见的登录用户都可触发（凭据用调用者本人的线上变量缝合），
+/// Web 详情页在工具为空时自动调用，免去 owner 手动执行 `tsk mcp index`。
+async fn mcp_index(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let (info, group_vis, id) = load_mcp(&state, &owner, &name)?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
+    let (resolved, _required, missing) = stitch_for_user(&state, claims.sub, &info.manifest)?;
+    if !missing.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "缺少变量：{}。请在「我的变量」设置后重试",
+            missing.join(", ")
+        )));
+    }
+    // MCP 连接是阻塞 IO（子进程 / 阻塞 HTTP），放到 blocking 线程。
+    let tools = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ToolMeta>> {
+        let mut mcp = crate::mcp::McpClient::connect(&resolved)?;
+        Ok(mcp
+            .list_tools()?
+            .into_iter()
+            .map(|t| ToolMeta {
+                name: t.name,
+                description: t.description,
+                input_schema: t.input_schema,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("任务执行失败: {e}")))?
+    .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("MCP 连接失败: {e}")))?;
+    let tools_json =
+        serde_json::to_string(&tools).map_err(|e| ApiError::internal(e.to_string()))?;
+    // 不 bump updated_at：索引可由任意可见用户在浏览时触发，不应扰动资源的更新时间。
+    let conn = state.db.lock().unwrap();
+    conn.execute(
+        "UPDATE mcps SET tools = ?1 WHERE id = ?2",
+        rusqlite::params![tools_json, id],
+    )
+    .map_err(db_err)?;
+    Ok(Json(serde_json::json!({ "tools": tools })))
 }
 
 async fn mcp_get(
