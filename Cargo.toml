@@ -63,6 +63,8 @@ server = [
     # Web 端「拖入压缩包创建技能」：解 zip、兼容历史 gzip 压缩体
     "dep:zip",
     "dep:flate2",
+    # LDAP 认证：企业目录绑定认证与本地用户同步
+    "dep:ldap3",
     # 调试期：允许浏览器/Tauri webview 跨源直连本 Hub（CORS）
     "dep:tower-http",
     # 默认数据目录 ~/.triskelion 需要解析用户主目录
@@ -131,5 +133,9 @@ mime_guess = { version = "2", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 # 调试期 CORS：放行跨源前端直连
 tower-http = { version = "0.7", features = ["cors"], optional = true }
+# LDAP 客户端：走 rustls(ring)，与本项目既有 TLS 栈一致，避免引入 OpenSSL
+ldap3 = { version = "0.12", default-features = false, features = [
+    "tls-rustls-ring",
+], optional = true }
 
 [dev-dependencies]

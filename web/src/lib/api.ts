@@ -5,12 +5,17 @@ import type {
   AdminSkill,
   AdminStats,
   AdminUser,
+  AuthConfig,
+  AuthSettings,
+  AuthSettingsPatch,
   BatchResult,
   CallsQuery,
   CallsResp,
   FavoritesResp,
   GroupVisibility,
   ImportSummary,
+  LdapSyncResp,
+  LdapTestResp,
   McpInfo,
   McpManifest,
   ReactKind,
@@ -146,6 +151,8 @@ export const api = {
     req<AuthResp>("/v1/auth/login", { method: "POST", body: { username, password } }),
   register: (username: string, password: string) =>
     req<AuthResp>("/v1/auth/register", { method: "POST", body: { username, password } }),
+  /** 公开的认证能力探测：注册是否开放 / 是否启用 LDAP。 */
+  authConfig: () => req<AuthConfig>("/v1/auth/config"),
 
   explore: (q: string, label?: string) => {
     const p = new URLSearchParams();
@@ -479,6 +486,22 @@ export const admin = {
     adminReq<UserTransferResult>("/v1/admin/users/" + id + "/transfer", token, {
       method: "POST",
       body: { to_username },
+    }),
+
+  // 系统设置：注册开关 + LDAP 认证
+  authSettings: (token: string) => adminReq<AuthSettings>("/v1/admin/settings/auth", token),
+  updateAuthSettings: (token: string, body: AuthSettingsPatch) =>
+    adminReq<AuthSettings>("/v1/admin/settings/auth", token, { method: "PUT", body }),
+  /** LDAP 连通性测试；传 username/password 时跑完整认证链路，可带草稿配置。 */
+  ldapTest: (
+    token: string,
+    body: { ldap?: AuthSettingsPatch["ldap"]; username?: string; password?: string } = {},
+  ) => adminReq<LdapTestResp>("/v1/admin/ldap/test", token, { method: "POST", body }),
+  /** 把全部本地口令账号同步进 LDAP 目录。 */
+  ldapSync: (token: string, sync_password_hashes: boolean) =>
+    adminReq<LdapSyncResp>("/v1/admin/ldap/sync", token, {
+      method: "POST",
+      body: { sync_password_hashes },
     }),
 
   /** 导出全量资源包，触发浏览器下载 .tskpack。 */

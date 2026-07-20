@@ -8,11 +8,14 @@ import type {
   AdminSkill,
   AdminStats,
   AdminUser,
+  AuthSettings,
   CallLog,
   CallsQuery,
   CallsResp,
   GroupVisibility,
   ImportSummary,
+  LdapSyncResp,
+  LdapTestResp,
   McpManifest,
   Protocol,
   Runtime,
@@ -47,6 +50,7 @@ const NAV_SECTIONS = [
       { id: "overview", label: "概览" },
       { id: "calls", label: "调用日志" },
       { id: "migrate", label: "数据迁移" },
+      { id: "settings", label: "系统设置" },
     ],
   },
 ] as const;
@@ -207,6 +211,7 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
             {tab === "labels" && <LabelsTable token={token} notify={notify} />}
             {tab === "calls" && <CallsTable token={token} />}
             {tab === "migrate" && <Migrate token={token} notify={notify} />}
+            {tab === "settings" && <SettingsPanel token={token} notify={notify} />}
           </div>
         </div>
       </main>
@@ -398,15 +403,18 @@ function Toolbar({ title, hint, action }: { title: string; hint?: string; action
 
 function PrimaryButton({
   onClick,
+  disabled,
   children,
 }: {
   onClick: () => void;
+  disabled?: boolean;
   children: React.ReactNode;
 }) {
   return (
     <button
       onClick={onClick}
-      className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600"
+      disabled={disabled}
+      className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
     >
       {children}
     </button>
@@ -1771,7 +1779,14 @@ function UsersTable({ token, notify }: { token: string; notify: (m: string) => v
       <Table head={["用户名", "分组", "技能", "MCP", "凭据", "注册于", "操作"]}>
         {rows.map((u) => (
           <tr key={u.id} className="text-slate-700">
-            <td className="px-5 py-3 font-semibold text-slate-800">{u.username}</td>
+            <td className="px-5 py-3 font-semibold text-slate-800">
+              {u.username}
+              {u.auth_source === "ldap" && (
+                <span className="ml-2 rounded-md border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[11px] font-medium text-sky-600">
+                  LDAP
+                </span>
+              )}
+            </td>
             <td className="px-5 py-3">
               {u.groups.length > 0 ? (
                 <div className="flex flex-wrap gap-1">
@@ -2703,6 +2718,334 @@ function Migrate({ token, notify }: { token: string; notify: (m: string) => void
               <ul className="mt-2 list-inside list-disc text-xs text-amber-600">
                 {summary.skipped.map((s, i) => (
                   <li key={i}>{s}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 系统设置：注册开关 + LDAP 认证配置 / 测试 / 用户同步
+// ---------------------------------------------------------------------------
+
+function SettingsPanel({ token, notify }: { token: string; notify: (m: string) => void }) {
+  const { data, loading, error } = useAdminData<AuthSettings>(
+    () => admin.authSettings(token),
+    [token],
+  );
+  if (loading || error) return <StateLine loading={loading} error={error} />;
+  return <SettingsForm token={token} initial={data!} notify={notify} />;
+}
+
+function SettingsForm({
+  token,
+  initial,
+  notify,
+}: {
+  token: string;
+  initial: AuthSettings;
+  notify: (m: string) => void;
+}) {
+  const [regEnabled, setRegEnabled] = useState(initial.registration_enabled);
+  const [ldap, setLdap] = useState({ ...initial.ldap });
+  const [pwdSet, setPwdSet] = useState(!!initial.ldap.bind_password_set);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [testUser, setTestUser] = useState("");
+  const [testPass, setTestPass] = useState("");
+  const [testResult, setTestResult] = useState<LdapTestResp | null>(null);
+  const [syncHashes, setSyncHashes] = useState(false);
+  const [syncResult, setSyncResult] = useState<LdapSyncResp | null>(null);
+
+  const set = (patch: Partial<typeof ldap>) => setLdap((l) => ({ ...l, ...patch }));
+
+  /** 表单 → 增量请求体：密码留空表示保持服务端已存的不变。 */
+  function ldapPatch() {
+    const p: Partial<AuthSettings["ldap"]> = {
+      enabled: ldap.enabled,
+      url: ldap.url,
+      start_tls: ldap.start_tls,
+      no_tls_verify: ldap.no_tls_verify,
+      bind_dn: ldap.bind_dn,
+      user_base_dn: ldap.user_base_dn,
+      user_filter: ldap.user_filter,
+      username_attr: ldap.username_attr,
+      sync_base_dn: ldap.sync_base_dn,
+    };
+    if (ldap.bind_password) p.bind_password = ldap.bind_password;
+    return p;
+  }
+
+  async function saveRegistration(next: boolean) {
+    setRegEnabled(next);
+    try {
+      await admin.updateAuthSettings(token, { registration_enabled: next });
+      notify(next ? "已开放用户注册" : "已关闭用户注册");
+    } catch (e) {
+      setRegEnabled(!next);
+      notify((e as Error).message);
+    }
+  }
+
+  async function saveLdap() {
+    setSaving(true);
+    try {
+      const saved = await admin.updateAuthSettings(token, { ldap: ldapPatch() });
+      setLdap({ ...saved.ldap });
+      setPwdSet(!!saved.ldap.bind_password_set);
+      notify("LDAP 配置已保存");
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function testLdap() {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await admin.ldapTest(token, {
+        ldap: ldapPatch(),
+        username: testUser.trim() || undefined,
+        password: testPass || undefined,
+      });
+      setTestResult(res);
+    } catch (e) {
+      setTestResult({ ok: false, message: (e as Error).message });
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function syncToLdap() {
+    if (
+      !confirm(
+        `把全部本地账号同步到 LDAP 目录？\n不存在的条目将按 inetOrgPerson 创建于同步基 DN 下。${
+          syncHashes ? "\n将同时写入 {ARGON2} 口令哈希（需目录支持该方案）。" : ""
+        }`,
+      )
+    )
+      return;
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const res = await admin.ldapSync(token, syncHashes);
+      setSyncResult(res);
+      notify("同步完成");
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Panel>
+        <div className="flex items-center justify-between gap-6">
+          <div>
+            <h2 className="font-bold text-slate-800">开放用户注册</h2>
+            <p className="mt-1.5 text-sm text-slate-500">
+              关闭后登录页不再自动注册新账号，新用户只能由管理员创建或通过 LDAP 首次登录进入
+              （即「只允许 LDAP 认证」模式）。
+            </p>
+          </div>
+          <Toggle on={regEnabled} onChange={saveRegistration} />
+        </div>
+      </Panel>
+
+      <Panel>
+        <div className="flex items-center justify-between gap-6">
+          <div>
+            <h2 className="font-bold text-slate-800">LDAP 认证</h2>
+            <p className="mt-1.5 text-sm text-slate-500">
+              对接企业目录（OpenLDAP / Active Directory）：本地不存在的账号登录时先经目录绑定认证，
+              通过后自动落为 LDAP 影子账号；影子账号的口令始终由目录验证。
+            </p>
+          </div>
+          <Toggle on={ldap.enabled} onChange={(v) => set({ enabled: v })} />
+        </div>
+
+        <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <label className="block lg:col-span-2">
+            <span className={adminLabelCls}>服务器地址</span>
+            <input
+              className={inputCls}
+              value={ldap.url}
+              placeholder="ldap://ldap.example.com:389 或 ldaps://ldap.example.com:636"
+              onChange={(e) => set({ url: e.target.value })}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>Bind DN（搜索用服务账号，留空则匿名）</span>
+            <input
+              className={inputCls}
+              value={ldap.bind_dn}
+              placeholder="cn=readonly,dc=example,dc=com"
+              onChange={(e) => set({ bind_dn: e.target.value })}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>Bind 密码</span>
+            <input
+              className={inputCls}
+              type="password"
+              value={ldap.bind_password}
+              placeholder={pwdSet ? "已设置（留空保持不变）" : "服务账号密码"}
+              onChange={(e) => set({ bind_password: e.target.value })}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>用户基 DN</span>
+            <input
+              className={inputCls}
+              value={ldap.user_base_dn}
+              placeholder="ou=people,dc=example,dc=com"
+              onChange={(e) => set({ user_base_dn: e.target.value })}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>用户过滤器（{"{username}"} 为登录名占位符）</span>
+            <input
+              className={inputCls}
+              value={ldap.user_filter}
+              placeholder="(uid={username}) / (sAMAccountName={username})"
+              onChange={(e) => set({ user_filter: e.target.value })}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>用户名属性</span>
+            <input
+              className={inputCls}
+              value={ldap.username_attr}
+              placeholder="uid / sAMAccountName"
+              onChange={(e) => set({ username_attr: e.target.value })}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>同步基 DN（本地用户同步目标，留空复用用户基 DN）</span>
+            <input
+              className={inputCls}
+              value={ldap.sync_base_dn}
+              placeholder="ou=people,dc=example,dc=com"
+              onChange={(e) => set({ sync_base_dn: e.target.value })}
+            />
+          </label>
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-slate-600">
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              type="checkbox"
+              checked={ldap.start_tls}
+              onChange={(e) => set({ start_tls: e.target.checked })}
+            />
+            StartTLS（明文端口升级加密）
+          </label>
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              type="checkbox"
+              checked={ldap.no_tls_verify}
+              onChange={(e) => set({ no_tls_verify: e.target.checked })}
+            />
+            跳过 TLS 证书校验（内网自签名证书）
+          </label>
+        </div>
+
+        <div className="mt-5 flex flex-wrap items-end gap-3 border-t border-slate-100 pt-5">
+          <label className="block">
+            <span className={adminLabelCls}>测试账号（可选）</span>
+            <input
+              className={inputCls}
+              value={testUser}
+              placeholder="留空仅测连接"
+              onChange={(e) => setTestUser(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className={adminLabelCls}>测试密码</span>
+            <input
+              className={inputCls}
+              type="password"
+              value={testPass}
+              onChange={(e) => setTestPass(e.target.value)}
+            />
+          </label>
+          <button
+            onClick={testLdap}
+            disabled={testing}
+            className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-60"
+          >
+            {testing ? "测试中…" : "测试连接"}
+          </button>
+          <PrimaryButton onClick={saveLdap} disabled={saving}>
+            {saving ? "保存中…" : "保存配置"}
+          </PrimaryButton>
+        </div>
+        {testResult && (
+          <div
+            className={`mt-3 rounded-xl border px-4 py-3 text-sm ${
+              testResult.ok
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-rose-200 bg-rose-50 text-rose-600"
+            }`}
+          >
+            {testResult.message}
+          </div>
+        )}
+      </Panel>
+
+      <Panel>
+        <h2 className="font-bold text-slate-800">同步本地用户到 LDAP</h2>
+        <p className="mt-2 text-sm text-slate-500">
+          把全部本地口令账号写入目录（不存在的按{" "}
+          <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs">inetOrgPerson</code>{" "}
+          创建）。需要上方配置了有写权限的服务账号。LDAP 影子账号本就来自目录，不参与同步。
+        </p>
+        <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm text-slate-600">
+          <input
+            type="checkbox"
+            checked={syncHashes}
+            onChange={(e) => setSyncHashes(e.target.checked)}
+          />
+          同步口令哈希（以 {"{ARGON2}"} 方案写入 userPassword）
+        </label>
+        <p className="mt-2 text-xs text-slate-400">
+          本地口令仅存 argon2 哈希、无法还原明文；勾选后目录须支持 ARGON2 口令方案
+          （如 OpenLDAP 2.5+ 的 argon2 模块）用户才能以原口令登录，否则同步后需在目录侧重置密码。
+        </p>
+        <button
+          onClick={syncToLdap}
+          disabled={syncing}
+          className="mt-4 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:opacity-60"
+        >
+          {syncing ? "同步中…" : "同步到 LDAP"}
+        </button>
+        {syncResult && (
+          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+            <div className="font-semibold text-slate-700">
+              共 {syncResult.total} 个账号：新建 {syncResult.created.length} · 更新{" "}
+              {syncResult.updated.length} · 跳过 {syncResult.skipped.length} · 失败{" "}
+              {syncResult.failed.length}
+            </div>
+            {syncResult.created.length > 0 && (
+              <div className="mt-1.5 text-xs">新建：{syncResult.created.join("、")}</div>
+            )}
+            {syncResult.updated.length > 0 && (
+              <div className="mt-1 text-xs">更新：{syncResult.updated.join("、")}</div>
+            )}
+            {syncResult.failed.length > 0 && (
+              <ul className="mt-1.5 list-inside list-disc text-xs text-rose-500">
+                {syncResult.failed.map((f) => (
+                  <li key={f.username}>
+                    {f.username}：{f.error}
+                  </li>
                 ))}
               </ul>
             )}

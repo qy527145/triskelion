@@ -201,10 +201,57 @@ export interface AdminUser {
   id: number;
   username: string;
   groups: GroupBrief[];
+  /** 认证来源：'local' 本地口令 / 'ldap' 目录影子账号。 */
+  auth_source: string;
   created_at: string;
   skills: number;
   mcps: number;
   secrets: number;
+}
+
+/** 公开的认证能力探测（登录框据此调整注册文案）。 */
+export interface AuthConfig {
+  registration_enabled: boolean;
+  ldap_enabled: boolean;
+}
+
+export interface LdapSettings {
+  enabled: boolean;
+  url: string;
+  start_tls: boolean;
+  no_tls_verify: boolean;
+  bind_dn: string;
+  /** 服务端只出脱敏空串；是否已设置看 bind_password_set。 */
+  bind_password: string;
+  bind_password_set?: boolean;
+  user_base_dn: string;
+  user_filter: string;
+  username_attr: string;
+  sync_base_dn: string;
+}
+
+export interface AuthSettings {
+  registration_enabled: boolean;
+  ldap: LdapSettings;
+}
+
+/** LDAP 配置增量：缺省字段保持不变；bind_password 传空串表示清除。 */
+export interface AuthSettingsPatch {
+  registration_enabled?: boolean;
+  ldap?: Partial<LdapSettings>;
+}
+
+export interface LdapTestResp {
+  ok: boolean;
+  message: string;
+}
+
+export interface LdapSyncResp {
+  total: number;
+  created: string[];
+  updated: string[];
+  skipped: string[];
+  failed: { username: string; error: string }[];
 }
 
 export interface AdminGroup {

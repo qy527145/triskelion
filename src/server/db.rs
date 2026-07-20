@@ -24,6 +24,8 @@ pub fn init(conn: &Connection) -> Result<()> {
             password_hash TEXT NOT NULL,
             -- 历史遗留的单分组列（保留以兼容旧库，现已由 user_groups 多对多关联取代）。
             group_id      INTEGER,
+            -- 认证来源：'local' 本地口令 / 'ldap' 企业目录（影子账号，口令不可本地登录）。
+            auth_source   TEXT NOT NULL DEFAULT 'local',
             created_at    TEXT NOT NULL
         );
 
@@ -133,6 +135,13 @@ pub fn init(conn: &Connection) -> Result<()> {
             PRIMARY KEY (user_id, mcp_id, kind)
         );
 
+        -- 系统设置：管理后台运行时可改的 key-value（value 为 JSON 文本），
+        -- 如认证配置（注册开关、LDAP）。敏感字段由写入方自行加密后再入库。
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         -- 工具调用审计：每次经 Hub 网关代调用 MCP 工具时记录一行，供管理后台统计
         -- 24h/累计调用量、热门工具与最近错误。caller 为发起者用户名快照。
         CREATE TABLE IF NOT EXISTS tool_calls (
@@ -176,6 +185,11 @@ pub fn init(conn: &Connection) -> Result<()> {
     // 迁移：技能下载量计数列（旧库补列，已存在则忽略）。
     let _ = conn.execute(
         "ALTER TABLE skills ADD COLUMN downloads INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // 迁移：用户认证来源（'local' 本地口令 / 'ldap' 企业目录），旧库补列。
+    let _ = conn.execute(
+        "ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'",
         [],
     );
 

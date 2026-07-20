@@ -33,7 +33,9 @@ use crate::shared::{McpManifest, Protocol, Runtime, SkillVersionInfo, SKILL_CATE
 use super::auth;
 use super::crypto;
 use super::error::ApiError;
+use super::ldap;
 use super::routes::{db_err, now_string, now_unix};
+use super::settings;
 use super::skills;
 use super::AppState;
 
@@ -244,6 +246,8 @@ pub struct AdminUser {
     id: i64,
     username: String,
     groups: Vec<GroupBrief>,
+    /// 认证来源：'local' 本地口令 / 'ldap' 目录影子账号。
+    auth_source: String,
     created_at: String,
     skills: i64,
     mcps: i64,
@@ -276,7 +280,7 @@ pub async fn users(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Admin
 
     let mut stmt = conn
         .prepare(
-            "SELECT u.id, u.username, u.created_at,
+            "SELECT u.id, u.username, u.created_at, u.auth_source,
                     (SELECT COUNT(*) FROM skills s WHERE s.owner_id = u.id),
                     (SELECT COUNT(*) FROM mcps m WHERE m.owner_id = u.id),
                     (SELECT COUNT(*) FROM secrets x WHERE x.owner_id = u.id)
@@ -289,19 +293,22 @@ pub async fn users(State(state): S, headers: HeaderMap) -> Result<Json<Vec<Admin
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
+                r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
             ))
         })
         .map_err(db_err)?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, username, created_at, skills, mcps, secrets) = row.map_err(db_err)?;
+        let (id, username, created_at, auth_source, skills, mcps, secrets) =
+            row.map_err(db_err)?;
         out.push(AdminUser {
             groups: by_user.remove(&id).unwrap_or_default(),
             id,
             username,
+            auth_source,
             created_at,
             skills,
             mcps,
@@ -1917,11 +1924,219 @@ pub async fn user_transfer(
 }
 
 // ---------------------------------------------------------------------------
+// 系统设置：注册开关 + LDAP 认证配置 / 连通测试 / 用户同步
+// ---------------------------------------------------------------------------
+
+/// 读取认证配置（LDAP 绑定密码脱敏，仅返回是否已设置）。
+pub async fn auth_settings_get(
+    State(state): S,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let s = settings::load(&conn, &state.master_key);
+    Ok(Json(settings::masked_json(&s)))
+}
+
+#[derive(Deserialize)]
+pub struct AuthSettingsPatch {
+    #[serde(default)]
+    registration_enabled: Option<bool>,
+    #[serde(default)]
+    ldap: Option<LdapSettingsPatch>,
+}
+
+/// LDAP 配置增量：字段缺省表示保持不变；bind_password 传空串表示清除。
+#[derive(Deserialize)]
+pub struct LdapSettingsPatch {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    start_tls: Option<bool>,
+    #[serde(default)]
+    no_tls_verify: Option<bool>,
+    #[serde(default)]
+    bind_dn: Option<String>,
+    #[serde(default)]
+    bind_password: Option<String>,
+    #[serde(default)]
+    user_base_dn: Option<String>,
+    #[serde(default)]
+    user_filter: Option<String>,
+    #[serde(default)]
+    username_attr: Option<String>,
+    #[serde(default)]
+    sync_base_dn: Option<String>,
+}
+
+fn apply_ldap_patch(cur: &mut settings::LdapSettings, p: LdapSettingsPatch) {
+    if let Some(v) = p.enabled {
+        cur.enabled = v;
+    }
+    if let Some(v) = p.url {
+        cur.url = v.trim().to_string();
+    }
+    if let Some(v) = p.start_tls {
+        cur.start_tls = v;
+    }
+    if let Some(v) = p.no_tls_verify {
+        cur.no_tls_verify = v;
+    }
+    if let Some(v) = p.bind_dn {
+        cur.bind_dn = v.trim().to_string();
+    }
+    if let Some(v) = p.bind_password {
+        cur.bind_password = v;
+    }
+    if let Some(v) = p.user_base_dn {
+        cur.user_base_dn = v.trim().to_string();
+    }
+    if let Some(v) = p.user_filter {
+        cur.user_filter = v.trim().to_string();
+    }
+    if let Some(v) = p.username_attr {
+        cur.username_attr = v.trim().to_string();
+    }
+    if let Some(v) = p.sync_base_dn {
+        cur.sync_base_dn = v.trim().to_string();
+    }
+}
+
+/// 更新认证配置（增量合并后整体落库）。启用 LDAP 时校验配置完整性。
+pub async fn auth_settings_update(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<AuthSettingsPatch>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let conn = state.db.lock().unwrap();
+    let mut s = settings::load(&conn, &state.master_key);
+    if let Some(v) = req.registration_enabled {
+        s.registration_enabled = v;
+    }
+    if let Some(p) = req.ldap {
+        apply_ldap_patch(&mut s.ldap, p);
+    }
+    if s.ldap.enabled {
+        ldap::validate(&s.ldap).map_err(ApiError::bad_request)?;
+    }
+    settings::save(&conn, &state.master_key, &s)?;
+    Ok(Json(settings::masked_json(&s)))
+}
+
+#[derive(Deserialize)]
+pub struct LdapTestReq {
+    /// 可选：草稿配置（未保存也能试）；密码缺省回落到已保存的。
+    #[serde(default)]
+    ldap: Option<LdapSettingsPatch>,
+    /// 可选：给一个真实账号跑完整认证链路（搜索 + 绑定）。
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// LDAP 连通性测试。始终返回 200，结论在 `{ ok, message }` 里，便于 UI 展示。
+pub async fn ldap_test(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<LdapTestReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let cfg = {
+        let conn = state.db.lock().unwrap();
+        let mut cfg = settings::load(&conn, &state.master_key).ldap;
+        if let Some(p) = req.ldap {
+            apply_ldap_patch(&mut cfg, p);
+        }
+        cfg
+    };
+    let username = req.username.as_deref().unwrap_or("").trim().to_string();
+    let result = if username.is_empty() {
+        ldap::test_connection(&cfg).await
+    } else {
+        match ldap::authenticate(&cfg, &username, req.password.as_deref().unwrap_or("")).await {
+            Ok(canonical) => Ok(format!("认证成功：目录用户 {canonical}")),
+            Err(ldap::LdapAuthError::NotFound) => {
+                Err("目录中搜不到该用户：请检查 user_base_dn / user_filter".into())
+            }
+            Err(ldap::LdapAuthError::BadCredentials) => {
+                Err("找到了用户，但口令校验未通过".into())
+            }
+            Err(ldap::LdapAuthError::Other(e)) => Err(e),
+        }
+    };
+    Ok(Json(match result {
+        Ok(m) => serde_json::json!({ "ok": true, "message": m }),
+        Err(m) => serde_json::json!({ "ok": false, "message": m }),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct LdapSyncReq {
+    /// 同时以 `{ARGON2}<PHC>` 方案写入 userPassword（需目录支持 ARGON2，
+    /// 如 OpenLDAP 2.5+ argon2 模块）；否则仅建条目，口令需在目录侧另行设置。
+    #[serde(default)]
+    sync_password_hashes: bool,
+}
+
+/// 把全部本地口令账号同步进 LDAP 目录（LDAP 影子账号本就来自目录，跳过）。
+pub async fn ldap_sync(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<LdapSyncReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let (cfg, users) = {
+        let conn = state.db.lock().unwrap();
+        let cfg = settings::load(&conn, &state.master_key).ldap;
+        let mut stmt = conn
+            .prepare(
+                "SELECT username, password_hash FROM users
+                 WHERE auth_source != 'ldap' ORDER BY username",
+            )
+            .map_err(db_err)?;
+        let users: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(db_err)?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        (cfg, users)
+    };
+    let report = ldap::sync_users(&cfg, &users, req.sync_password_hashes)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("LDAP 同步失败：{e}")))?;
+    let pick = |action: &str| -> Vec<&String> {
+        report
+            .iter()
+            .filter(|i| i.action == action)
+            .map(|i| &i.username)
+            .collect()
+    };
+    let failed: Vec<serde_json::Value> = report
+        .iter()
+        .filter(|i| i.action == "failed")
+        .map(|i| serde_json::json!({ "username": i.username, "error": i.error }))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "total": report.len(),
+        "created": pick("created"),
+        "updated": pick("updated"),
+        "skipped": pick("skipped"),
+        "failed": failed,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // 外部系统注入：注册 MCP / 批量分发用户变量（供 aiko_hub 等上游推送）
 // ---------------------------------------------------------------------------
 
-/// 生成一个随机不可登录的口令哈希，供自动创建的占位用户使用。
-fn random_password_hash() -> Result<String, ApiError> {
+/// 生成一个随机不可登录的口令哈希，供自动创建的占位用户使用
+/// （外部系统 ensure_user / LDAP 影子账号共用）。
+pub(super) fn random_password_hash() -> Result<String, ApiError> {
     let mut buf = [0u8; 32];
     rand::rngs::SysRng
         .try_fill_bytes(&mut buf)
@@ -2250,7 +2465,14 @@ struct PackUser {
     /// 兼容旧资源包的单分组字段（导入时并入 groups）。
     #[serde(default)]
     group: String,
+    /// 认证来源（旧资源包缺省视为 local）。
+    #[serde(default = "default_auth_source")]
+    auth_source: String,
     created_at: String,
+}
+
+fn default_auth_source() -> String {
+    "local".into()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2473,7 +2695,7 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
             }
         }
         let mut stmt = conn
-            .prepare("SELECT username, password_hash, created_at FROM users ORDER BY id")
+            .prepare("SELECT username, password_hash, auth_source, created_at FROM users ORDER BY id")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -2481,17 +2703,19 @@ fn collect_pack(state: &AppState) -> Result<Pack, ApiError> {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
-            let (username, password_hash, created_at) = row.map_err(db_err)?;
+            let (username, password_hash, auth_source, created_at) = row.map_err(db_err)?;
             out.push(PackUser {
                 groups: by_user.remove(&username).unwrap_or_default(),
                 group: String::new(),
                 username,
                 password_hash,
+                auth_source,
                 created_at,
             });
         }
@@ -2675,9 +2899,10 @@ fn apply_pack(state: &AppState, pack: &Pack) -> Result<ImportSummary, ApiError> 
 
     for u in &pack.users {
         tx.execute(
-            "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash",
-            rusqlite::params![u.username, u.password_hash, u.created_at],
+            "INSERT INTO users(username, password_hash, auth_source, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash,
+                                                 auth_source = excluded.auth_source",
+            rusqlite::params![u.username, u.password_hash, u.auth_source, u.created_at],
         )
         .map_err(db_err)?;
         let uid: i64 = tx

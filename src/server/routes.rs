@@ -18,6 +18,8 @@ use super::auth;
 use super::admin;
 use super::crypto;
 use super::error::ApiError;
+use super::ldap;
+use super::settings;
 use super::skills;
 use super::web;
 use super::AppState;
@@ -30,6 +32,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(health))
         .route("/v1/auth/register", post(register))
         .route("/v1/auth/login", post(login))
+        // 公开的认证能力探测：登录框据此调整文案（注册是否开放 / 是否有 LDAP）。
+        .route("/v1/auth/config", get(auth_config))
         .route("/v1/whoami", get(whoami))
         .route("/v1/explore", get(explore))
         .route("/v1/labels", get(label_names))
@@ -118,6 +122,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 外部系统在登录/注册时配给账号（create-or-update + 注入变量）。
         .route("/v1/admin/provision-user", post(admin::user_provision))
         .route("/v1/admin/calls", get(admin::calls))
+        // 系统设置：注册开关 + LDAP 认证配置；LDAP 连通性测试与本地用户同步。
+        .route(
+            "/v1/admin/settings/auth",
+            get(admin::auth_settings_get).put(admin::auth_settings_update),
+        )
+        .route("/v1/admin/ldap/test", post(admin::ldap_test))
+        .route("/v1/admin/ldap/sync", post(admin::ldap_sync))
         .route("/v1/admin/export", get(admin::export))
         .route("/v1/admin/import", post(admin::import))
         // 技能压缩体可能较大，放宽请求体上限至 512 MiB
@@ -162,6 +173,25 @@ pub(super) fn is_valid_username(u: &str) -> bool {
     valid_username(u)
 }
 
+/// LDAP 影子账号的用户名校验：目录里常见 `john.doe` / 邮箱式登录名，
+/// 在本地规则基础上额外放行 `.` 与 `@`。
+fn valid_ldap_username(u: &str) -> bool {
+    !u.is_empty()
+        && u.len() <= 64
+        && u.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@'))
+}
+
+/// 公开的认证能力探测（无需鉴权）：登录框据此调整「自动注册」文案与行为。
+async fn auth_config(State(state): S) -> Result<Json<serde_json::Value>, ApiError> {
+    let conn = state.db.lock().unwrap();
+    let cfg = settings::load(&conn, &state.master_key);
+    Ok(Json(serde_json::json!({
+        "registration_enabled": cfg.registration_enabled,
+        "ldap_enabled": cfg.ldap.enabled,
+    })))
+}
+
 async fn register(
     State(state): S,
     Json(req): Json<AuthReq>,
@@ -177,6 +207,13 @@ async fn register(
     let hash = auth::hash_password(&req.password)?;
     let now = now_string();
     let conn = state.db.lock().unwrap();
+    // 管理后台可关闭自助注册（如只允许 LDAP 认证时）。
+    if !settings::load(&conn, &state.master_key).registration_enabled {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "用户注册已关闭，请联系管理员开通账号",
+        ));
+    }
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM users WHERE username = ?1",
@@ -204,25 +241,114 @@ async fn register(
 }
 
 async fn login(State(state): S, Json(req): Json<AuthReq>) -> Result<Json<AuthResp>, ApiError> {
-    let conn = state.db.lock().unwrap();
-    let row: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT id, password_hash FROM users WHERE username = ?1",
-            [&req.username],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(db_err)?;
-    drop(conn);
-    let (id, hash) = row.ok_or_else(|| ApiError::not_found("用户不存在"))?;
-    if !auth::verify_password(&req.password, &hash) {
-        return Err(ApiError::unauthorized("密码错误"));
+    // 先取本地账号与认证配置，随后的 LDAP 交互不能持有 DB 锁（跨 await）。
+    let (auth_cfg, row) = {
+        let conn = state.db.lock().unwrap();
+        let cfg = settings::load(&conn, &state.master_key);
+        let row: Option<(i64, String, String)> = conn
+            .query_row(
+                "SELECT id, password_hash, auth_source FROM users WHERE username = ?1",
+                [&req.username],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        (cfg, row)
+    };
+
+    match row {
+        // 本地口令账号：与既有行为一致。
+        Some((id, hash, source)) if source != "ldap" => {
+            if !auth::verify_password(&req.password, &hash) {
+                return Err(ApiError::unauthorized("密码错误"));
+            }
+            let token = auth::issue_token(&state.jwt_secret, id, &req.username)?;
+            Ok(Json(AuthResp {
+                token,
+                username: req.username,
+            }))
+        }
+        // LDAP 影子账号：口令始终交由目录验证。
+        Some((id, _, _)) => {
+            if !auth_cfg.ldap.enabled {
+                return Err(ApiError::unauthorized(
+                    "该账号来自 LDAP，但服务端未启用 LDAP 认证",
+                ));
+            }
+            ldap_verify(&auth_cfg.ldap, &req.username, &req.password).await?;
+            let token = auth::issue_token(&state.jwt_secret, id, &req.username)?;
+            Ok(Json(AuthResp {
+                token,
+                username: req.username,
+            }))
+        }
+        // 本地不存在：LDAP 启用时先问目录，认证通过则落一个影子账号。
+        None => {
+            if !auth_cfg.ldap.enabled {
+                return Err(ApiError::not_found("用户不存在"));
+            }
+            let canonical = ldap_verify(&auth_cfg.ldap, &req.username, &req.password).await?;
+            if !valid_ldap_username(&canonical) {
+                return Err(ApiError::bad_request(
+                    "LDAP 用户名含不支持的字符（仅允许字母、数字、_、-、.、@，长度 1..=64）",
+                ));
+            }
+            let conn = state.db.lock().unwrap();
+            // 以目录返回的规范用户名落库 / 复用（大小写等差异一律归一到目录口径）。
+            let existing: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT id, auth_source FROM users WHERE username = ?1",
+                    [&canonical],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(db_err)?;
+            let id = match existing {
+                // 规范名撞上本地口令账号：拒绝，避免 LDAP 侧同名用户顶号。
+                Some((_, source)) if source != "ldap" => {
+                    return Err(ApiError::conflict(
+                        "存在同名本地账号，无法以 LDAP 身份登录，请联系管理员处理",
+                    ));
+                }
+                Some((id, _)) => id,
+                None => {
+                    // 影子账号使用随机不可登录口令，本地验证永远不会通过。
+                    let hash = admin::random_password_hash()?;
+                    conn.execute(
+                        "INSERT INTO users(username, password_hash, auth_source, created_at)
+                         VALUES (?1, ?2, 'ldap', ?3)",
+                        rusqlite::params![canonical, hash, now_string()],
+                    )
+                    .map_err(db_err)?;
+                    conn.last_insert_rowid()
+                }
+            };
+            drop(conn);
+            let token = auth::issue_token(&state.jwt_secret, id, &canonical)?;
+            Ok(Json(AuthResp {
+                token,
+                username: canonical,
+            }))
+        }
     }
-    let token = auth::issue_token(&state.jwt_secret, id, &req.username)?;
-    Ok(Json(AuthResp {
-        token,
-        username: req.username,
-    }))
+}
+
+/// 调 LDAP 做绑定认证，把失败归因映射成与本地登录一致的 HTTP 语义
+/// （目录里没有该用户 → 404，供前端「自动注册」判定；口令不对 → 401）。
+async fn ldap_verify(
+    cfg: &settings::LdapSettings,
+    username: &str,
+    password: &str,
+) -> Result<String, ApiError> {
+    match ldap::authenticate(cfg, username, password).await {
+        Ok(canonical) => Ok(canonical),
+        Err(ldap::LdapAuthError::NotFound) => Err(ApiError::not_found("用户不存在")),
+        Err(ldap::LdapAuthError::BadCredentials) => Err(ApiError::unauthorized("密码错误")),
+        Err(ldap::LdapAuthError::Other(e)) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("LDAP 认证失败：{e}"),
+        )),
+    }
 }
 
 async fn whoami(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {

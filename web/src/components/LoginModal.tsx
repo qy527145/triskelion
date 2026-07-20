@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Modal from "./Modal";
 import { api, ApiError, setAuth } from "../lib/api";
+import type { AuthConfig } from "../lib/types";
 
 const inputCls =
   "w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm outline-none transition focus:border-indigo-300 focus:ring-4 focus:ring-indigo-500/10";
@@ -16,6 +17,17 @@ export default function LoginModal({
   const [p, setP] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // 认证能力探测：注册是否开放 / 是否有 LDAP。取不到（旧服务端）按开放注册处理。
+  const [cfg, setCfg] = useState<AuthConfig | null>(null);
+
+  useEffect(() => {
+    api
+      .authConfig()
+      .then(setCfg)
+      .catch(() => setCfg(null));
+  }, []);
+
+  const canRegister = cfg?.registration_enabled !== false;
 
   async function submit() {
     setErr("");
@@ -29,7 +41,8 @@ export default function LoginModal({
       try {
         resp = await api.login(u.trim(), p);
       } catch (e) {
-        if (e instanceof ApiError && e.status === 404) {
+        // 注册开放时沿用「账号不存在即自动注册」；关闭后直接把 404 报给用户。
+        if (e instanceof ApiError && e.status === 404 && canRegister) {
           resp = await api.register(u.trim(), p);
         } else {
           throw e;
@@ -44,10 +57,16 @@ export default function LoginModal({
     }
   }
 
+  const subtitle = canRegister
+    ? "用户名密码登录，账号不存在将自动注册。"
+    : cfg?.ldap_enabled
+      ? "用户注册已关闭，请使用已有账号或 LDAP 账号登录。"
+      : "用户注册已关闭，请使用已有账号登录。";
+
   return (
     <Modal
-      title="登录 / 注册"
-      subtitle="用户名密码登录，账号不存在将自动注册。"
+      title={canRegister ? "登录 / 注册" : "登录"}
+      subtitle={subtitle}
       onClose={onClose}
       footer={
         <>
@@ -84,7 +103,7 @@ export default function LoginModal({
             className={inputCls}
             type="password"
             value={p}
-            placeholder="至少 6 位"
+            placeholder={canRegister ? "至少 6 位" : "账号密码"}
             onChange={(e) => setP(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && submit()}
           />
