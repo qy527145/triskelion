@@ -27,8 +27,8 @@ use db::Db;
 /// 进程全局状态。
 pub struct AppState {
     pub db: Db,
-    /// JWT 签名密钥。
-    pub jwt_secret: Vec<u8>,
+    /// JWT RS256 签发/校验密钥对。
+    pub jwt_keys: auth::JwtKeys,
     /// AES-256-GCM 主密钥（32 字节），加密凭据池。
     pub master_key: [u8; 32],
     /// 技能包压缩体落盘目录（按 sha256 内容寻址）。
@@ -45,7 +45,7 @@ pub fn run() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("创建数据目录 {}", data_dir.display()))?;
 
-    let jwt_secret = load_or_create_key(&data_dir.join("jwt.key"), 32)?;
+    let jwt_keys = auth::load_or_create_keys(&data_dir.join("jwt_rsa.pem"))?;
     let master_key_vec = match std::env::var("TRISKELION_MASTER_KEY") {
         Ok(b64) => {
             use base64::{Engine, engine::general_purpose::STANDARD};
@@ -89,7 +89,7 @@ pub fn run() -> Result<()> {
 
         let state = Arc::new(AppState {
             db,
-            jwt_secret,
+            jwt_keys,
             master_key,
             blobs_dir,
             admin_token,

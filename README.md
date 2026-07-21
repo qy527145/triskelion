@@ -121,7 +121,7 @@ TRISKELION_DATABASE_URL='sqlite:/var/lib/triskelion/hub.db' triskelion
 
 - 首次启动自动建表（幂等），无需手工执行 schema；升级版本时的补列迁移也在启动时自动完成。
 - 连接池大小默认 SQLite 4 / PostgreSQL、MySQL 10，可用 `TRISKELION_DB_MAX_CONNS` 覆盖。
-- 技能压缩体 blob、`master.key`、`jwt.key` 仍存放于文件系统数据目录，不随数据库切换。
+- 技能压缩体 blob、`master.key`、`jwt_rsa.pem`（RS256 签发密钥）仍存放于文件系统数据目录，不随数据库切换。
 - MySQL 建表使用 `utf8mb4_bin` 排序规则，保证用户名/资源名唯一性的大小写敏感语义与
   SQLite / PostgreSQL 一致。MariaDB 采用与 MySQL 相同的方言路径（兼容语法，未做专项实测）。
 

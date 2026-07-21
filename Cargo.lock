@@ -3166,6 +3166,7 @@ dependencies = [
  "mime_guess",
  "rand 0.10.1",
  "reqwest",
+ "rsa",
  "rust-embed",
  "rustls",
  "serde",

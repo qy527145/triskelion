@@ -1,17 +1,68 @@
-//! 鉴权：argon2 口令哈希 + HS256 JWT。
+//! 鉴权：argon2 口令哈希 + RS256 JWT。
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use axum::http::HeaderMap;
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand::TryRng;
+use rsa::RsaPrivateKey;
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 
 /// 30 天有效期（秒）。
 const TOKEN_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// RS256 签发/校验密钥对（启动时从 PEM 解析好，避免每个请求重复解析）。
+pub struct JwtKeys {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+/// 读取 RSA 私钥 PEM（PKCS#8），不存在则生成 2048 位密钥对并写入（0600 权限）。
+/// 公钥不单独落盘，每次启动从私钥导出。换发密钥（吊销所有 token）删除该文件即可。
+pub fn load_or_create_keys(path: &std::path::Path) -> Result<JwtKeys> {
+    let private = match std::fs::read_to_string(path) {
+        Ok(pem) => RsaPrivateKey::from_pkcs8_pem(&pem).with_context(|| {
+            format!(
+                "解析 JWT RSA 私钥 {} 失败（如需重新生成请删除该文件）",
+                path.display()
+            )
+        })?,
+        Err(_) => {
+            // debug 构建下 2048 位素数搜索可能要数秒，打点以免看起来像卡死。
+            eprintln!("首次启动：生成 JWT RSA-2048 密钥对…");
+            let key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
+                .map_err(|e| anyhow!("生成 RSA 密钥失败: {e}"))?;
+            let pem = key
+                .to_pkcs8_pem(LineEnding::LF)
+                .map_err(|e| anyhow!("私钥 PEM 编码失败: {e}"))?;
+            std::fs::write(path, pem.as_bytes())
+                .with_context(|| format!("写入密钥 {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            key
+        }
+    };
+    let private_pem = private
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| anyhow!("私钥 PEM 编码失败: {e}"))?;
+    let public_pem = private
+        .to_public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| anyhow!("公钥 PEM 编码失败: {e}"))?;
+    Ok(JwtKeys {
+        encoding: EncodingKey::from_rsa_pem(private_pem.as_bytes())
+            .map_err(|e| anyhow!("构建 JWT 签名密钥失败: {e}"))?,
+        decoding: DecodingKey::from_rsa_pem(public_pem.as_bytes())
+            .map_err(|e| anyhow!("构建 JWT 校验密钥失败: {e}"))?,
+    })
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Claims {
@@ -44,7 +95,7 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     }
 }
 
-pub fn issue_token(secret: &[u8], user_id: i64, username: &str) -> Result<String> {
+pub fn issue_token(keys: &JwtKeys, user_id: i64, username: &str) -> Result<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow!("时钟错误: {e}"))?
@@ -54,16 +105,12 @@ pub fn issue_token(secret: &[u8], user_id: i64, username: &str) -> Result<String
         username: username.to_string(),
         exp: (now + TOKEN_TTL_SECS) as usize,
     };
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret),
-    )
-    .map_err(|e| anyhow!("签发 JWT 失败: {e}"))
+    encode(&Header::new(Algorithm::RS256), &claims, &keys.encoding)
+        .map_err(|e| anyhow!("签发 JWT 失败: {e}"))
 }
 
 /// 从 `Authorization: Bearer <jwt>` 头解析并校验 token，返回声明。
-pub fn authenticate(secret: &[u8], headers: &HeaderMap) -> Result<Claims, ApiError> {
+pub fn authenticate(keys: &JwtKeys, headers: &HeaderMap) -> Result<Claims, ApiError> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -72,17 +119,13 @@ pub fn authenticate(secret: &[u8], headers: &HeaderMap) -> Result<Claims, ApiErr
         .strip_prefix("Bearer ")
         .or_else(|| raw.strip_prefix("bearer "))
         .ok_or_else(|| ApiError::unauthorized("Authorization 头格式应为 Bearer <token>"))?;
-    let data = decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(secret),
-        &Validation::default(),
-    )
-    .map_err(|_| ApiError::unauthorized("token 无效或已过期，请重新 tsk login"))?;
+    let data = decode::<Claims>(token, &keys.decoding, &Validation::new(Algorithm::RS256))
+        .map_err(|_| ApiError::unauthorized("token 无效或已过期，请重新 tsk login"))?;
     Ok(data.claims)
 }
 
 /// 可选鉴权：有合法 token 返回声明，否则返回 None（不报错）。
 /// 用于公开市场接口——匿名访客只看「所有分组可见」资源，登录用户额外看到其分组可见的。
-pub fn authenticate_opt(secret: &[u8], headers: &HeaderMap) -> Option<Claims> {
-    authenticate(secret, headers).ok()
+pub fn authenticate_opt(keys: &JwtKeys, headers: &HeaderMap) -> Option<Claims> {
+    authenticate(keys, headers).ok()
 }

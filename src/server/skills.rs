@@ -75,7 +75,7 @@ pub async fn explore(
         .filter(|s| !s.is_empty() && *s != "all")
         .map(|s| s.to_string());
 
-    let viewer = auth::authenticate_opt(&state.jwt_secret, &headers);
+    let viewer = auth::authenticate_opt(&state.jwt_keys, &headers);
     let viewer_groups = match viewer.as_ref() {
         Some(c) => super::routes::groups_of_user(&state.db, c.sub).await,
         None => Vec::new(),
@@ -129,7 +129,7 @@ pub async fn explore(
 
 /// 列出当前用户名下全部技能（含私有）。
 pub async fn list_mine(State(state): S, headers: HeaderMap) -> Result<Json<Vec<SkillInfo>>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     let label_map = super::routes::all_resource_labels(&state.db, "skill_labels", "skill_id").await;
     let count_map = super::routes::all_reaction_counts(&state.db, "skill_reactions", "skill_id").await;
     let mine_map =
@@ -166,7 +166,7 @@ pub async fn upsert(
     headers: HeaderMap,
     Json(req): Json<SkillUpsertReq>,
 ) -> Result<Json<SkillInfo>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     let m = req.manifest;
     if !valid_name(&m.name) {
         return Err(ApiError::bad_request(
@@ -380,7 +380,7 @@ pub async fn get(
     if let Some(ver) = q.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         apply_version(&state.db, id, ver, &mut info).await?;
     }
-    if let Some(claims) = auth::authenticate_opt(&state.jwt_secret, &headers) {
+    if let Some(claims) = auth::authenticate_opt(&state.jwt_keys, &headers) {
         let (_, _, liked, favorited) = super::routes::reaction_summary(
             &state.db,
             "skill_reactions",
@@ -413,7 +413,7 @@ pub async fn react(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ReactReq>,
 ) -> Result<Json<ReactResp>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     let (info, group_vis, id) = load_skill(&state, &owner, &name).await?;
     ensure_skill_access(&state, &headers, &info, &group_vis).await?;
     let resp = super::routes::set_reaction(
@@ -436,7 +436,7 @@ pub async fn transfer(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<TransferReq>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     if claims.username != owner {
         return Err(ApiError::unauthorized("只能转移自己的技能"));
     }
@@ -532,7 +532,7 @@ pub async fn delete(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     if claims.username != owner {
         return Err(ApiError::unauthorized("只能删除自己的技能"));
     }
@@ -561,7 +561,7 @@ pub async fn rename(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<SkillRenameReq>,
 ) -> Result<Json<SkillInfo>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     if claims.username != owner {
         return Err(ApiError::unauthorized("只能重命名自己的技能"));
     }
@@ -617,7 +617,7 @@ pub async fn inspect(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<SkillInspectResp>, ApiError> {
-    auth::authenticate(&state.jwt_secret, &headers)?;
+    auth::authenticate(&state.jwt_keys, &headers)?;
     if body.is_empty() {
         return Err(ApiError::bad_request("压缩包为空"));
     }
@@ -654,7 +654,7 @@ pub async fn archive_put(
     Query(q): Query<VersionQuery>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_secret, &headers)?;
+    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
     if claims.username != owner {
         return Err(ApiError::unauthorized("只能上传自己的技能压缩体"));
     }
@@ -1037,7 +1037,7 @@ async fn ensure_skill_access(
     info: &SkillInfo,
     group_vis: &str,
 ) -> Result<(), ApiError> {
-    let viewer = auth::authenticate_opt(&state.jwt_secret, headers);
+    let viewer = auth::authenticate_opt(&state.jwt_keys, headers);
     let is_owner = viewer.as_ref().map(|c| c.username.as_str()) == Some(info.owner.as_str());
     if is_owner {
         return Ok(());
