@@ -44,7 +44,7 @@ client = [
 server = [
     "dep:axum",
     "dep:tokio",
-    "dep:rusqlite",
+    "dep:sqlx",
     "dep:jsonwebtoken",
     "dep:argon2",
     "dep:aes-gcm",
@@ -112,7 +112,16 @@ tokio = { version = "1", features = [
     "net",
     "signal",
 ], optional = true }
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+# 数据层：sqlx 异步连接池，SQLite 默认（bundled，同 rusqlite 时代无外部依赖）；
+# PostgreSQL / MySQL 后端按阶段接入（纯 Rust 驱动，无 OpenSSL/libpq/libmysqlclient）。
+# 不用 macros/migrate feature：无编译期 DATABASE_URL 依赖，迁移沿用运行时吞错式补列。
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "sqlite",
+    "postgres",
+    "mysql",
+], optional = true }
 # jsonwebtoken 10 默认不含加密后端，须显式选一个。用 rust_crypto（纯 Rust，HS256/HMAC，
 # 无需 CMake/NASM），避免 aws_lc_rs 的外部构建工具依赖。
 jsonwebtoken = { version = "10", default-features = false, features = [

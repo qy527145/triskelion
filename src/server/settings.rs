@@ -7,10 +7,10 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::crypto;
+use super::db::{Db, db_params};
 
 /// settings 表里承载认证配置的 key。
 const AUTH_KEY: &str = "auth";
@@ -78,16 +78,14 @@ impl Default for LdapSettings {
 }
 
 /// 读取认证配置；无记录或解析失败一律回退默认值（不阻断登录链路）。
-pub fn load(conn: &Connection, master_key: &[u8; 32]) -> AuthSettings {
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            [AUTH_KEY],
-            |r| r.get(0),
-        )
-        .optional()
-        .ok()
-        .flatten();
+pub async fn load(db: &Db, master_key: &[u8; 32]) -> AuthSettings {
+    let raw: Option<String> = match db
+        .query_opt("SELECT value FROM settings WHERE key = ?1", db_params![AUTH_KEY])
+        .await
+    {
+        Ok(Some(r)) => r.get(0).ok(),
+        _ => None,
+    };
     let Some(raw) = raw else {
         return AuthSettings::default();
     };
@@ -108,7 +106,7 @@ pub fn load(conn: &Connection, master_key: &[u8; 32]) -> AuthSettings {
 }
 
 /// 持久化认证配置（bind_password 加密后入库）。
-pub fn save(conn: &Connection, master_key: &[u8; 32], s: &AuthSettings) -> Result<()> {
+pub async fn save(db: &Db, master_key: &[u8; 32], s: &AuthSettings) -> Result<()> {
     let mut stored = s.clone();
     if !stored.ldap.bind_password.is_empty() {
         let (nonce, ct) = crypto::encrypt(master_key, &stored.ldap.bind_password)?;
@@ -117,11 +115,12 @@ pub fn save(conn: &Connection, master_key: &[u8; 32], s: &AuthSettings) -> Resul
         stored.ldap.bind_password = format!("{ENC_PREFIX}{}", STANDARD.encode(buf));
     }
     let json = serde_json::to_string(&stored).context("序列化认证配置")?;
-    conn.execute(
+    db.execute(
         "INSERT INTO settings(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![AUTH_KEY, json],
+        db_params![AUTH_KEY, json],
     )
+    .await
     .context("写入认证配置")?;
     Ok(())
 }

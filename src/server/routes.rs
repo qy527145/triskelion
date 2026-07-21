@@ -6,7 +6,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
-use rusqlite::OptionalExtension;
 
 use crate::shared::{
     AuthReq, AuthResp, CallReq, McpInfo, McpManifest, McpRenameReq, McpUpsertReq, ReactReq,
@@ -17,6 +16,7 @@ use crate::shared::{
 use super::auth;
 use super::admin;
 use super::crypto;
+use super::db::{db_params, Db};
 use super::error::ApiError;
 use super::ldap;
 use super::settings;
@@ -147,14 +147,13 @@ async fn health() -> &'static str {
 
 /// 公开标签清单：列出全部受管标签名（供市场筛选）。无需鉴权。
 async fn label_names(State(state): S) -> Result<Json<Vec<String>>, ApiError> {
-    let conn = state.db.lock().unwrap();
-    let mut stmt = conn
-        .prepare("SELECT name FROM labels ORDER BY name")
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(db_err)?;
-    Ok(Json(rows.filter_map(|r| r.ok()).collect()))
+    let names = state
+        .db
+        .query_map("SELECT name FROM labels ORDER BY name", db_params![], |r| {
+            r.get::<String>(0)
+        })
+        .await?;
+    Ok(Json(names))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,8 +183,7 @@ fn valid_ldap_username(u: &str) -> bool {
 
 /// 公开的认证能力探测（无需鉴权）：登录框据此调整「自动注册」文案与行为。
 async fn auth_config(State(state): S) -> Result<Json<serde_json::Value>, ApiError> {
-    let conn = state.db.lock().unwrap();
-    let cfg = settings::load(&conn, &state.master_key);
+    let cfg = settings::load(&state.db, &state.master_key).await;
     Ok(Json(serde_json::json!({
         "registration_enabled": cfg.registration_enabled,
         "ldap_enabled": cfg.ldap.enabled,
@@ -206,33 +204,34 @@ async fn register(
     }
     let hash = auth::hash_password(&req.password)?;
     let now = now_string();
-    let conn = state.db.lock().unwrap();
     // 管理后台可关闭自助注册（如只允许 LDAP 认证时）。
-    if !settings::load(&conn, &state.master_key).registration_enabled {
+    if !settings::load(&state.db, &state.master_key)
+        .await
+        .registration_enabled
+    {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "用户注册已关闭，请联系管理员开通账号",
         ));
     }
-    let exists: bool = conn
-        .query_row(
+    let exists = state
+        .db
+        .query_opt(
             "SELECT 1 FROM users WHERE username = ?1",
-            [&req.username],
-            |_| Ok(true),
+            db_params![req.username],
         )
-        .optional()
-        .map_err(db_err)?
-        .unwrap_or(false);
+        .await?
+        .is_some();
     if exists {
         return Err(ApiError::conflict("用户名已存在"));
     }
-    conn.execute(
-        "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![req.username, hash, now],
-    )
-    .map_err(db_err)?;
-    let id = conn.last_insert_rowid();
-    drop(conn);
+    let id = state
+        .db
+        .insert_id(
+            "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+            db_params![req.username, hash, now],
+        )
+        .await?;
     let token = auth::issue_token(&state.jwt_secret, id, &req.username)?;
     Ok(Json(AuthResp {
         token,
@@ -242,18 +241,17 @@ async fn register(
 
 async fn login(State(state): S, Json(req): Json<AuthReq>) -> Result<Json<AuthResp>, ApiError> {
     // 先取本地账号与认证配置，随后的 LDAP 交互不能持有 DB 锁（跨 await）。
-    let (auth_cfg, row) = {
-        let conn = state.db.lock().unwrap();
-        let cfg = settings::load(&conn, &state.master_key);
-        let row: Option<(i64, String, String)> = conn
-            .query_row(
-                "SELECT id, password_hash, auth_source FROM users WHERE username = ?1",
-                [&req.username],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .map_err(db_err)?;
-        (cfg, row)
+    let auth_cfg = settings::load(&state.db, &state.master_key).await;
+    let row: Option<(i64, String, String)> = match state
+        .db
+        .query_opt(
+            "SELECT id, password_hash, auth_source FROM users WHERE username = ?1",
+            db_params![req.username],
+        )
+        .await?
+    {
+        Some(r) => Some((r.get(0)?, r.get(1)?, r.get(2)?)),
+        None => None,
     };
 
     match row {
@@ -293,16 +291,18 @@ async fn login(State(state): S, Json(req): Json<AuthReq>) -> Result<Json<AuthRes
                     "LDAP 用户名含不支持的字符（仅允许字母、数字、_、-、.、@，长度 1..=64）",
                 ));
             }
-            let conn = state.db.lock().unwrap();
             // 以目录返回的规范用户名落库 / 复用（大小写等差异一律归一到目录口径）。
-            let existing: Option<(i64, String)> = conn
-                .query_row(
+            let existing: Option<(i64, String)> = match state
+                .db
+                .query_opt(
                     "SELECT id, auth_source FROM users WHERE username = ?1",
-                    [&canonical],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    db_params![canonical],
                 )
-                .optional()
-                .map_err(db_err)?;
+                .await?
+            {
+                Some(r) => Some((r.get(0)?, r.get(1)?)),
+                None => None,
+            };
             let id = match existing {
                 // 规范名撞上本地口令账号：拒绝，避免 LDAP 侧同名用户顶号。
                 Some((_, source)) if source != "ldap" => {
@@ -314,16 +314,16 @@ async fn login(State(state): S, Json(req): Json<AuthReq>) -> Result<Json<AuthRes
                 None => {
                     // 影子账号使用随机不可登录口令，本地验证永远不会通过。
                     let hash = admin::random_password_hash()?;
-                    conn.execute(
-                        "INSERT INTO users(username, password_hash, auth_source, created_at)
-                         VALUES (?1, ?2, 'ldap', ?3)",
-                        rusqlite::params![canonical, hash, now_string()],
-                    )
-                    .map_err(db_err)?;
-                    conn.last_insert_rowid()
+                    state
+                        .db
+                        .insert_id(
+                            "INSERT INTO users(username, password_hash, auth_source, created_at)
+                             VALUES (?1, ?2, 'ldap', ?3)",
+                            db_params![canonical, hash, now_string()],
+                        )
+                        .await?
                 }
             };
-            drop(conn);
             let token = auth::issue_token(&state.jwt_secret, id, &canonical)?;
             Ok(Json(AuthResp {
                 token,
@@ -353,22 +353,17 @@ async fn ldap_verify(
 
 async fn whoami(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let conn = state.db.lock().unwrap();
-    let mut stmt = conn
-        .prepare(
+    let groups: Vec<serde_json::Value> = state
+        .db
+        .query_map(
             "SELECT g.id, g.name FROM user_groups ug JOIN groups g ON g.id = ug.group_id
              WHERE ug.user_id = ?1 ORDER BY g.name",
+            db_params![claims.sub],
+            |r| {
+                Ok(serde_json::json!({ "id": r.get::<i64>(0)?, "name": r.get::<String>(1)? }))
+            },
         )
-        .map_err(db_err)?;
-    let groups: Vec<serde_json::Value> = stmt
-        .query_map([claims.sub], |r| {
-            Ok(serde_json::json!({ "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)? }))
-        })
-        .map_err(db_err)?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(stmt);
-    drop(conn);
+        .await?;
     Ok(Json(serde_json::json!({
         "username": claims.username,
         "user_id": claims.sub,
@@ -400,48 +395,47 @@ async fn explore(
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "all")
         .map(|s| s.to_string());
-    let conn = state.db.lock().unwrap();
     let viewer = auth::authenticate_opt(&state.jwt_secret, &headers);
-    let viewer_groups = viewer
-        .as_ref()
-        .map(|c| groups_of_user(&conn, c.sub))
-        .unwrap_or_default();
+    let viewer_groups = match viewer.as_ref() {
+        Some(c) => groups_of_user(&state.db, c.sub).await,
+        None => Vec::new(),
+    };
     let viewer_name = viewer.as_ref().map(|c| c.username.clone());
-    let label_map = all_resource_labels(&conn, "mcp_labels", "mcp_id");
-    let count_map = all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
-    let mine_map = viewer
-        .as_ref()
-        .map(|c| user_reaction_map(&conn, "mcp_reactions", "mcp_id", c.sub))
-        .unwrap_or_default();
-    let mut stmt = conn
-        .prepare(
+    let label_map = all_resource_labels(&state.db, "mcp_labels", "mcp_id").await;
+    let count_map = all_reaction_counts(&state.db, "mcp_reactions", "mcp_id").await;
+    let mine_map = match viewer.as_ref() {
+        Some(c) => user_reaction_map(&state.db, "mcp_reactions", "mcp_id", c.sub).await,
+        None => Default::default(),
+    };
+    let rows = state
+        .db
+        .query_map(
             "SELECT m.id, u.username, m.name, m.visibility, m.version, m.manifest, m.tools,
                     m.updated_at, m.group_visibility
              FROM mcps m JOIN users u ON u.id = m.owner_id
              WHERE m.visibility = 'public'
                AND (lower(m.name) LIKE ?1 OR lower(m.manifest) LIKE ?1 OR lower(m.tools) LIKE ?1)
              ORDER BY m.updated_at DESC, m.name",
+            db_params![pattern],
+            |r| {
+                Ok((
+                    r.get::<i64>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<String>(2)?,
+                    r.get::<String>(3)?,
+                    r.get::<String>(4)?,
+                    r.get::<String>(5)?,
+                    r.get::<String>(6)?,
+                    r.get::<String>(7)?,
+                    r.get::<String>(8)?,
+                ))
+            },
         )
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([pattern], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, String>(8)?,
-            ))
-        })
-        .map_err(db_err)?;
+        .await?;
     let mut out = Vec::new();
-    for row in rows {
-        let (id, owner, name, visibility, version, manifest_json, tools_json, updated_at, group_vis) =
-            row.map_err(db_err)?;
+    for (id, owner, name, visibility, version, manifest_json, tools_json, updated_at, group_vis) in
+        rows
+    {
         let is_owner = viewer_name.as_deref() == Some(owner.as_str());
         if !group_can_see(&group_vis, &viewer_groups, is_owner) {
             continue;
@@ -503,34 +497,35 @@ async fn mcp_upsert(
     };
     let manifest_json = serde_json::to_string(&manifest).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = now_string();
-    let conn = state.db.lock().unwrap();
-    conn.execute(
-        "INSERT INTO mcps(owner_id, name, visibility, version, manifest, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(owner_id, name)
-         DO UPDATE SET visibility=excluded.visibility, version=excluded.version,
-                       manifest=excluded.manifest, updated_at=excluded.updated_at",
-        rusqlite::params![
-            claims.sub,
-            manifest.name,
-            visibility,
-            manifest.version,
-            manifest_json,
-            now
-        ],
-    )
-    .map_err(db_err)?;
+    state
+        .db
+        .execute(
+            "INSERT INTO mcps(owner_id, name, visibility, version, manifest, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(owner_id, name)
+             DO UPDATE SET visibility=excluded.visibility, version=excluded.version,
+                           manifest=excluded.manifest, updated_at=excluded.updated_at",
+            db_params![
+                claims.sub,
+                manifest.name,
+                visibility,
+                manifest.version,
+                manifest_json,
+                now
+            ],
+        )
+        .await?;
     // tools 不随 manifest 改动（插入默认 '[]'，更新时保留旧值），单独读出用于响应。
-    let (mid, tools_json): (i64, String) = conn
+    let row = state
+        .db
         .query_row(
             "SELECT id, tools FROM mcps WHERE owner_id = ?1 AND name = ?2",
-            rusqlite::params![claims.sub, manifest.name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            db_params![claims.sub, manifest.name],
         )
-        .map_err(db_err)?;
+        .await?;
+    let (mid, tools_json): (i64, String) = (row.get(0)?, row.get(1)?);
     let (likes, favorites, liked, favorited) =
-        reaction_summary(&conn, "mcp_reactions", "mcp_id", mid, Some(claims.sub));
-    drop(conn);
+        reaction_summary(&state.db, "mcp_reactions", "mcp_id", mid, Some(claims.sub)).await;
     Ok(Json(McpInfo {
         owner: claims.username,
         name: manifest.name.clone(),
@@ -549,33 +544,30 @@ async fn mcp_upsert(
 
 async fn mcp_list(State(state): S, headers: HeaderMap) -> Result<Json<Vec<McpInfo>>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let conn = state.db.lock().unwrap();
-    let label_map = all_resource_labels(&conn, "mcp_labels", "mcp_id");
-    let count_map = all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
-    let mine_map = user_reaction_map(&conn, "mcp_reactions", "mcp_id", claims.sub);
-    let mut stmt = conn
-        .prepare(
+    let label_map = all_resource_labels(&state.db, "mcp_labels", "mcp_id").await;
+    let count_map = all_reaction_counts(&state.db, "mcp_reactions", "mcp_id").await;
+    let mine_map = user_reaction_map(&state.db, "mcp_reactions", "mcp_id", claims.sub).await;
+    let rows = state
+        .db
+        .query_map(
             "SELECT id, name, visibility, version, manifest, tools, updated_at
              FROM mcps WHERE owner_id = ?1 ORDER BY name",
+            db_params![claims.sub],
+            |r| {
+                Ok((
+                    r.get::<i64>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<String>(2)?,
+                    r.get::<String>(3)?,
+                    r.get::<String>(4)?,
+                    r.get::<String>(5)?,
+                    r.get::<String>(6)?,
+                ))
+            },
         )
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([claims.sub], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-            ))
-        })
-        .map_err(db_err)?;
+        .await?;
     let mut out = Vec::new();
-    for row in rows {
-        let (id, name, visibility, version, manifest_json, tools_json, updated_at) =
-            row.map_err(db_err)?;
+    for (id, name, visibility, version, manifest_json, tools_json, updated_at) in rows {
         let manifest: McpManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| ApiError::internal(format!("manifest 解析失败: {e}")))?;
         let (likes, favorites) = count_map.get(&id).copied().unwrap_or_default();
@@ -604,13 +596,13 @@ async fn mcp_delete(
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let conn = state.db.lock().unwrap();
-    let n = conn
+    let n = state
+        .db
         .execute(
             "DELETE FROM mcps WHERE owner_id = ?1 AND name = ?2",
-            rusqlite::params![claims.sub, name],
+            db_params![claims.sub, name],
         )
-        .map_err(db_err)?;
+        .await?;
     if n == 0 {
         return Err(ApiError::not_found("未找到该 MCP"));
     }
@@ -630,28 +622,29 @@ async fn mcp_rename(
         return Err(ApiError::bad_request("新名称非法（不能为空、含 '/'，且 ≤128 字符）"));
     }
     let now = now_string();
-    let conn = state.db.lock().unwrap();
-    let row: Option<(i64, String, String, String, String)> = conn
-        .query_row(
+    let row: Option<(i64, String, String, String, String)> = match state
+        .db
+        .query_opt(
             "SELECT id, visibility, version, manifest, tools FROM mcps WHERE owner_id = ?1 AND name = ?2",
-            rusqlite::params![claims.sub, name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            db_params![claims.sub, name],
         )
-        .optional()
-        .map_err(db_err)?;
+        .await?
+    {
+        Some(r) => Some((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        None => None,
+    };
     let (mid, visibility, version, manifest_json, tools_json) =
         row.ok_or_else(|| ApiError::not_found("未找到该 MCP"))?;
 
     if new_name != name {
-        let taken: bool = conn
-            .query_row(
+        let taken = state
+            .db
+            .query_opt(
                 "SELECT 1 FROM mcps WHERE owner_id = ?1 AND name = ?2",
-                rusqlite::params![claims.sub, new_name],
-                |_| Ok(true),
+                db_params![claims.sub, new_name],
             )
-            .optional()
-            .map_err(db_err)?
-            .unwrap_or(false);
+            .await?
+            .is_some();
         if taken {
             return Err(ApiError::conflict("已存在同名 MCP"));
         }
@@ -662,15 +655,16 @@ async fn mcp_rename(
     manifest.name = new_name.clone();
     let new_json =
         serde_json::to_string(&manifest).map_err(|e| ApiError::internal(e.to_string()))?;
-    conn.execute(
-        "UPDATE mcps SET name = ?1, manifest = ?2, updated_at = ?3
-         WHERE owner_id = ?4 AND name = ?5",
-        rusqlite::params![new_name, new_json, now, claims.sub, name],
-    )
-    .map_err(db_err)?;
+    state
+        .db
+        .execute(
+            "UPDATE mcps SET name = ?1, manifest = ?2, updated_at = ?3
+             WHERE owner_id = ?4 AND name = ?5",
+            db_params![new_name, new_json, now, claims.sub, name],
+        )
+        .await?;
     let (likes, favorites, liked, favorited) =
-        reaction_summary(&conn, "mcp_reactions", "mcp_id", mid, Some(claims.sub));
-    drop(conn);
+        reaction_summary(&state.db, "mcp_reactions", "mcp_id", mid, Some(claims.sub)).await;
 
     Ok(Json(McpInfo {
         owner: claims.username,
@@ -699,15 +693,26 @@ async fn mcp_set_tools(
     let tools_json =
         serde_json::to_string(&req.tools).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = now_string();
-    let conn = state.db.lock().unwrap();
-    let n = conn
+    let n = state
+        .db
         .execute(
             "UPDATE mcps SET tools = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
-            rusqlite::params![tools_json, now, claims.sub, name],
+            db_params![tools_json, now, claims.sub, name],
         )
-        .map_err(db_err)?;
+        .await?;
+    // MySQL 仅统计实际变更行：无变化的 UPDATE 返回 0，须复核存在性再判 404。
     if n == 0 {
-        return Err(ApiError::not_found("未找到该 MCP"));
+        let exists: bool = state
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mcps WHERE owner_id = ?1 AND name = ?2)",
+                db_params![claims.sub, name],
+            )
+            .await?
+            .get(0)?;
+        if !exists {
+            return Err(ApiError::not_found("未找到该 MCP"));
+        }
     }
     Ok(Json(serde_json::json!({ "indexed": req.tools.len() })))
 }
@@ -721,9 +726,9 @@ async fn mcp_index(
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let (info, group_vis, id) = load_mcp(&state, &owner, &name)?;
-    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
-    let (resolved, _required, missing) = stitch_for_user(&state, claims.sub, &info.manifest)?;
+    let (info, group_vis, id) = load_mcp(&state, &owner, &name).await?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
+    let (resolved, _required, missing) = stitch_for_user(&state, claims.sub, &info.manifest).await?;
     if !missing.is_empty() {
         return Err(ApiError::bad_request(format!(
             "缺少变量：{}。请在「我的变量」设置后重试",
@@ -749,12 +754,13 @@ async fn mcp_index(
     let tools_json =
         serde_json::to_string(&tools).map_err(|e| ApiError::internal(e.to_string()))?;
     // 不 bump updated_at：索引可由任意可见用户在浏览时触发，不应扰动资源的更新时间。
-    let conn = state.db.lock().unwrap();
-    conn.execute(
-        "UPDATE mcps SET tools = ?1 WHERE id = ?2",
-        rusqlite::params![tools_json, id],
-    )
-    .map_err(db_err)?;
+    state
+        .db
+        .execute(
+            "UPDATE mcps SET tools = ?1 WHERE id = ?2",
+            db_params![tools_json, id],
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "tools": tools })))
 }
 
@@ -764,12 +770,10 @@ async fn mcp_get(
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<McpInfo>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let (mut info, group_vis, id) = load_mcp(&state, &owner, &name)?;
-    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
-    let conn = state.db.lock().unwrap();
+    let (mut info, group_vis, id) = load_mcp(&state, &owner, &name).await?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     let (_, _, liked, favorited) =
-        reaction_summary(&conn, "mcp_reactions", "mcp_id", id, Some(claims.sub));
-    drop(conn);
+        reaction_summary(&state.db, "mcp_reactions", "mcp_id", id, Some(claims.sub)).await;
     info.liked = liked;
     info.favorited = favorited;
     Ok(Json(info))
@@ -783,10 +787,11 @@ async fn mcp_react(
     Json(req): Json<ReactReq>,
 ) -> Result<Json<ReactResp>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let (info, group_vis, id) = load_mcp(&state, &owner, &name)?;
-    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
-    let conn = state.db.lock().unwrap();
-    let resp = set_reaction(&conn, "mcp_reactions", "mcp_id", id, claims.sub, &req.kind, req.on)?;
+    let (info, group_vis, id) = load_mcp(&state, &owner, &name).await?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
+    let resp =
+        set_reaction(&state.db, "mcp_reactions", "mcp_id", id, claims.sub, &req.kind, req.on)
+            .await?;
     Ok(Json(resp))
 }
 
@@ -800,32 +805,43 @@ async fn mcp_transfer(
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
     let new_owner = req.new_owner.trim().to_string();
     let now = now_string();
-    let conn = state.db.lock().unwrap();
-    let target = user_id_by_name(&conn, &new_owner)?
+    let target = user_id_by_name(&state.db, &new_owner)
+        .await?
         .ok_or_else(|| ApiError::not_found("目标用户不存在"))?;
     if target == claims.sub {
         return Err(ApiError::bad_request("不能转移给自己"));
     }
-    let taken: bool = conn
-        .query_row(
+    let taken = state
+        .db
+        .query_opt(
             "SELECT 1 FROM mcps WHERE owner_id = ?1 AND name = ?2",
-            rusqlite::params![target, name],
-            |_| Ok(true),
+            db_params![target, name],
         )
-        .optional()
-        .map_err(db_err)?
-        .unwrap_or(false);
+        .await?
+        .is_some();
     if taken {
         return Err(ApiError::conflict("对方已有同名 MCP，请先重命名"));
     }
-    let n = conn
+    let n = state
+        .db
         .execute(
             "UPDATE mcps SET owner_id = ?1, updated_at = ?2 WHERE owner_id = ?3 AND name = ?4",
-            rusqlite::params![target, now, claims.sub, name],
+            db_params![target, now, claims.sub, name],
         )
-        .map_err(db_err)?;
+        .await?;
+    // MySQL 仅统计实际变更行：无变化的 UPDATE（如转让给自己）返回 0，须复核存在性再判 404。
     if n == 0 {
-        return Err(ApiError::not_found("未找到该 MCP"));
+        let exists: bool = state
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM mcps WHERE owner_id = ?1 AND name = ?2)",
+                db_params![claims.sub, name],
+            )
+            .await?
+            .get(0)?;
+        if !exists {
+            return Err(ApiError::not_found("未找到该 MCP"));
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -834,14 +850,14 @@ async fn mcp_transfer(
 /// 已失去可见性的（对方转私有 / 分组收紧）自动过滤，不在列表中出现。
 async fn favorites(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let skills = skills::favorites_of(&state, &claims)?;
-    let conn = state.db.lock().unwrap();
-    let viewer_groups = groups_of_user(&conn, claims.sub);
-    let label_map = all_resource_labels(&conn, "mcp_labels", "mcp_id");
-    let count_map = all_reaction_counts(&conn, "mcp_reactions", "mcp_id");
-    let mine_map = user_reaction_map(&conn, "mcp_reactions", "mcp_id", claims.sub);
-    let mut stmt = conn
-        .prepare(
+    let skills = skills::favorites_of(&state, &claims).await?;
+    let viewer_groups = groups_of_user(&state.db, claims.sub).await;
+    let label_map = all_resource_labels(&state.db, "mcp_labels", "mcp_id").await;
+    let count_map = all_reaction_counts(&state.db, "mcp_reactions", "mcp_id").await;
+    let mine_map = user_reaction_map(&state.db, "mcp_reactions", "mcp_id", claims.sub).await;
+    let rows = state
+        .db
+        .query_map(
             "SELECT m.id, u.username, m.name, m.visibility, m.version, m.manifest, m.tools,
                     m.updated_at, m.group_visibility
              FROM mcp_reactions r
@@ -849,27 +865,26 @@ async fn favorites(State(state): S, headers: HeaderMap) -> Result<Json<serde_jso
              JOIN users u ON u.id = m.owner_id
              WHERE r.user_id = ?1 AND r.kind = 'favorite'
              ORDER BY r.created_at DESC, m.name",
+            db_params![claims.sub],
+            |r| {
+                Ok((
+                    r.get::<i64>(0)?,
+                    r.get::<String>(1)?,
+                    r.get::<String>(2)?,
+                    r.get::<String>(3)?,
+                    r.get::<String>(4)?,
+                    r.get::<String>(5)?,
+                    r.get::<String>(6)?,
+                    r.get::<String>(7)?,
+                    r.get::<String>(8)?,
+                ))
+            },
         )
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([claims.sub], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, String>(8)?,
-            ))
-        })
-        .map_err(db_err)?;
+        .await?;
     let mut mcps = Vec::new();
-    for row in rows {
-        let (id, owner, name, visibility, version, manifest_json, tools_json, updated_at, group_vis) =
-            row.map_err(db_err)?;
+    for (id, owner, name, visibility, version, manifest_json, tools_json, updated_at, group_vis) in
+        rows
+    {
         let is_owner = owner == claims.username;
         if !is_owner
             && (visibility != "public" || !group_can_see(&group_vis, &viewer_groups, false))
@@ -896,8 +911,6 @@ async fn favorites(State(state): S, headers: HeaderMap) -> Result<Json<serde_jso
             updated_at,
         });
     }
-    drop(stmt);
-    drop(conn);
     Ok(Json(serde_json::json!({ "skills": skills, "mcps": mcps })))
 }
 
@@ -916,17 +929,17 @@ async fn secret_set(
     }
     let (nonce, ct) = crypto::encrypt(&state.master_key, &req.value)?;
     let now = now_string();
-    let conn = state.db.lock().unwrap();
-    conn.execute(
-        "INSERT INTO secrets(owner_id, key, nonce, ciphertext, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(owner_id, key)
-         DO UPDATE SET nonce=excluded.nonce, ciphertext=excluded.ciphertext,
-                       updated_at=excluded.updated_at",
-        rusqlite::params![claims.sub, req.key, nonce, ct, now],
-    )
-    .map_err(db_err)?;
-    drop(conn);
+    state
+        .db
+        .execute(
+            "INSERT INTO secrets(owner_id, key, nonce, ciphertext, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(owner_id, key)
+             DO UPDATE SET nonce=excluded.nonce, ciphertext=excluded.ciphertext,
+                           updated_at=excluded.updated_at",
+            db_params![claims.sub, req.key, nonce, ct, now],
+        )
+        .await?;
     Ok(Json(SecretInfo {
         key: req.key,
         updated_at: now,
@@ -938,22 +951,19 @@ async fn secret_list(
     headers: HeaderMap,
 ) -> Result<Json<Vec<SecretInfo>>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let conn = state.db.lock().unwrap();
-    let mut stmt = conn
-        .prepare("SELECT key, updated_at FROM secrets WHERE owner_id = ?1 ORDER BY key")
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([claims.sub], |r| {
-            Ok(SecretInfo {
-                key: r.get(0)?,
-                updated_at: r.get(1)?,
-            })
-        })
-        .map_err(db_err)?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(db_err)?);
-    }
+    let out = state
+        .db
+        .query_map(
+            "SELECT key, updated_at FROM secrets WHERE owner_id = ?1 ORDER BY key",
+            db_params![claims.sub],
+            |r| {
+                Ok(SecretInfo {
+                    key: r.get(0)?,
+                    updated_at: r.get(1)?,
+                })
+            },
+        )
+        .await?;
     Ok(Json(out))
 }
 
@@ -963,13 +973,13 @@ async fn secret_delete(
     Path(key): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let conn = state.db.lock().unwrap();
-    let n = conn
+    let n = state
+        .db
         .execute(
             "DELETE FROM secrets WHERE owner_id = ?1 AND key = ?2",
-            rusqlite::params![claims.sub, key],
+            db_params![claims.sub, key],
         )
-        .map_err(db_err)?;
+        .await?;
     if n == 0 {
         return Err(ApiError::not_found("未找到该变量"));
     }
@@ -987,19 +997,16 @@ async fn run_resolve(
 ) -> Result<Json<ResolveResp>, ApiError> {
     // 鉴权可选：未登录也能解析公开 MCP（返回原始 manifest，线上变量为空）。
     let viewer = auth::authenticate_opt(&state.jwt_secret, &headers);
-    let (info, group_vis, _) = load_mcp(&state, &owner, &name)?;
+    let (info, group_vis, _) = load_mcp(&state, &owner, &name).await?;
     let is_owner = viewer.as_ref().map(|c| c.username == owner).unwrap_or(false);
     if !is_owner {
         if info.visibility != "public" {
             return Err(ApiError::not_found("未找到该 MCP（或为私有）"));
         }
-        let viewer_groups = viewer
-            .as_ref()
-            .map(|c| {
-                let conn = state.db.lock().unwrap();
-                groups_of_user(&conn, c.sub)
-            })
-            .unwrap_or_default();
+        let viewer_groups = match viewer.as_ref() {
+            Some(c) => groups_of_user(&state.db, c.sub).await,
+            None => Vec::new(),
+        };
         if !group_can_see(&group_vis, &viewer_groups, false) {
             return Err(ApiError::not_found("未找到该 MCP（或所属分组不可见）"));
         }
@@ -1007,7 +1014,7 @@ async fn run_resolve(
     let required = info.manifest.required_vars();
     // 仅返回调用者本人线上已设置、且被该 manifest 引用的变量值。
     let vars = if let Some(claims) = &viewer {
-        let all = decrypt_user_secrets(&state, claims.sub)?;
+        let all = decrypt_user_secrets(&state, claims.sub).await?;
         required
             .iter()
             .filter_map(|k| all.get(k).map(|v| (k.clone(), v.clone())))
@@ -1030,12 +1037,12 @@ async fn run_call(
     Json(req): Json<CallReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::authenticate(&state.jwt_secret, &headers)?;
-    let (info, group_vis, _) = load_mcp(&state, &owner, &name)?;
-    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
+    let (info, group_vis, _) = load_mcp(&state, &owner, &name).await?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     if req.tool.is_empty() {
         return Err(ApiError::bad_request("缺少 tool 字段"));
     }
-    let (resolved, _required, missing) = stitch_for_user(&state, claims.sub, &info.manifest)?;
+    let (resolved, _required, missing) = stitch_for_user(&state, claims.sub, &info.manifest).await?;
     if !missing.is_empty() {
         return Err(ApiError::bad_request(format!(
             "缺少变量：{}。请在「我的变量」设置后重试",
@@ -1061,12 +1068,14 @@ async fn run_call(
     match outcome {
         Ok(result) => {
             let summary = summarize_result(&result);
-            log_tool_call(&state, &claims.username, &owner, &name, &tool, true, "", &summary, ms);
+            log_tool_call(&state, &claims.username, &owner, &name, &tool, true, "", &summary, ms)
+                .await;
             Ok(Json(result))
         }
         Err(e) => {
             let msg = format!("MCP 调用失败: {e}");
-            log_tool_call(&state, &claims.username, &owner, &name, &tool, false, &msg, "", ms);
+            log_tool_call(&state, &claims.username, &owner, &name, &tool, false, &msg, "", ms)
+                .await;
             Err(ApiError::new(StatusCode::BAD_GATEWAY, msg))
         }
     }
@@ -1085,8 +1094,8 @@ async fn run_report(
         return Err(ApiError::bad_request("缺少 tool 字段"));
     }
     // 校验该 MCP 确实存在且调用者可见，避免被用来伪造任意审计行。
-    let (info, group_vis, _) = load_mcp(&state, &owner, &name)?;
-    ensure_mcp_access(&state, &info, &group_vis, &claims)?;
+    let (info, group_vis, _) = load_mcp(&state, &owner, &name).await?;
+    ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     log_tool_call(
         &state,
         &claims.username,
@@ -1097,44 +1106,45 @@ async fn run_report(
         &req.error,
         &req.summary,
         req.ms.max(0),
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// 取用户名下凭据并缝合进清单，返回 (resolved, required, missing)。
 /// 解密某用户名下全部线上变量为明文 map（变量名→值）。
-fn decrypt_user_secrets(
+async fn decrypt_user_secrets(
     state: &AppState,
     user_id: i64,
 ) -> Result<std::collections::BTreeMap<String, String>, ApiError> {
-    let conn = state.db.lock().unwrap();
-    let mut stmt = conn
-        .prepare("SELECT key, nonce, ciphertext FROM secrets WHERE owner_id = ?1")
-        .map_err(db_err)?;
-    let rows = stmt
-        .query_map([user_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .map_err(db_err)?;
+    let rows = state
+        .db
+        .query_map(
+            "SELECT key, nonce, ciphertext FROM secrets WHERE owner_id = ?1",
+            db_params![user_id],
+            |r| {
+                Ok((
+                    r.get::<String>(0)?,
+                    r.get::<Vec<u8>>(1)?,
+                    r.get::<Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .await?;
     let mut vars = std::collections::BTreeMap::new();
-    for row in rows {
-        let (key, nonce, ct) = row.map_err(db_err)?;
+    for (key, nonce, ct) in rows {
         let val = crypto::decrypt(&state.master_key, &nonce, &ct)?;
         vars.insert(key, val);
     }
     Ok(vars)
 }
 
-fn stitch_for_user(
+async fn stitch_for_user(
     state: &AppState,
     user_id: i64,
     manifest: &McpManifest,
 ) -> Result<(McpManifest, Vec<String>, Vec<String>), ApiError> {
-    let vars = decrypt_user_secrets(state, user_id)?;
+    let vars = decrypt_user_secrets(state, user_id).await?;
     let required = manifest.required_vars();
     let (resolved, missing) = stitch(manifest, &vars);
     Ok((resolved, required, missing))
@@ -1144,23 +1154,33 @@ fn stitch_for_user(
 // helpers
 // ---------------------------------------------------------------------------
 
-fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, String, i64), ApiError> {
-    let conn = state.db.lock().unwrap();
-    let row: Option<(i64, String, String, String, String, String, String)> = conn
-        .query_row(
+async fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, String, i64), ApiError> {
+    let row: Option<(i64, String, String, String, String, String, String)> = match state
+        .db
+        .query_opt(
             "SELECT m.id, m.visibility, m.version, m.manifest, m.tools, m.updated_at, m.group_visibility
              FROM mcps m JOIN users u ON u.id = m.owner_id
              WHERE u.username = ?1 AND m.name = ?2",
-            rusqlite::params![owner, name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            db_params![owner, name],
         )
-        .optional()
-        .map_err(db_err)?;
+        .await?
+    {
+        Some(r) => Some((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        )),
+        None => None,
+    };
     let (id, visibility, version, manifest_json, tools_json, updated_at, group_vis) =
         row.ok_or_else(|| ApiError::not_found(format!("未找到 MCP: {owner}/{name}")))?;
-    let labels = labels_of(&conn, "mcp_labels", "mcp_id", id);
-    let (likes, favorites, _, _) = reaction_summary(&conn, "mcp_reactions", "mcp_id", id, None);
-    drop(conn);
+    let labels = labels_of(&state.db, "mcp_labels", "mcp_id", id).await;
+    let (likes, favorites, _, _) =
+        reaction_summary(&state.db, "mcp_reactions", "mcp_id", id, None).await;
     let manifest: McpManifest = serde_json::from_str(&manifest_json)
         .map_err(|e| ApiError::internal(format!("manifest 解析失败: {e}")))?;
     Ok((
@@ -1184,7 +1204,7 @@ fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo, Strin
 }
 
 /// 非 owner 访问公开 MCP 时的分组可见性校验：不可见时统一报 not_found（避免泄漏存在性）。
-fn ensure_mcp_access(
+async fn ensure_mcp_access(
     state: &AppState,
     info: &McpInfo,
     group_vis: &str,
@@ -1196,10 +1216,7 @@ fn ensure_mcp_access(
     if info.visibility != "public" {
         return Err(ApiError::not_found("未找到该 MCP（或为私有）"));
     }
-    let viewer_groups = {
-        let conn = state.db.lock().unwrap();
-        groups_of_user(&conn, claims.sub)
-    };
+    let viewer_groups = groups_of_user(&state.db, claims.sub).await;
     if !group_can_see(group_vis, &viewer_groups, false) {
         return Err(ApiError::not_found("未找到该 MCP（或所属分组不可见）"));
     }
@@ -1226,42 +1243,34 @@ pub(super) fn group_can_see(group_visibility: &str, viewer_groups: &[i64], is_ow
 }
 
 /// 查询某用户所属的全部分组 id（多对多）。
-pub(super) fn groups_of_user(conn: &rusqlite::Connection, user_id: i64) -> Vec<i64> {
-    let mut stmt = match conn.prepare("SELECT group_id FROM user_groups WHERE user_id = ?1") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = match stmt.query_map([user_id], |r| r.get::<_, i64>(0)) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    rows.filter_map(|r| r.ok()).collect()
+pub(super) async fn groups_of_user(db: &Db, user_id: i64) -> Vec<i64> {
+    db.query_map(
+        "SELECT group_id FROM user_groups WHERE user_id = ?1",
+        db_params![user_id],
+        |r| r.get::<i64>(0),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// 取某资源（skill / mcp）已分配的受管标签名（按名排序）。
 /// `junction`/`fk` 为内部常量（skill_labels/skill_id 等），非用户输入，无注入风险。
-pub(super) fn labels_of(conn: &rusqlite::Connection, junction: &str, fk: &str, id: i64) -> Vec<String> {
+pub(super) async fn labels_of(db: &Db, junction: &str, fk: &str, id: i64) -> Vec<String> {
     let sql = format!(
         "SELECT l.name FROM {junction} j JOIN labels l ON l.id = j.label_id
          WHERE j.{fk} = ?1 ORDER BY l.name"
     );
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let rows = match stmt.query_map([id], |r| r.get::<_, String>(0)) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    db.query_map(&sql, db_params![id], |r| r.get::<String>(0))
+        .await
+        .unwrap_or_default()
 }
 
 /// 按标签名把资源关联到受管标签（合并式：仅新增、去重，不删除既有关联，避免客户端发布
 /// 覆盖掉后台分配的标签）。名称须为已存在的受管标签（大小写/空白敏感，按 `labels.name`
 /// 精确匹配），未知名返回 400。返回该资源当前全部标签名（按名排序）。
 /// `junction`/`fk` 为内部常量（skill_labels/skill_id 等），非用户输入，无注入风险。
-pub(super) fn merge_resource_labels_by_name(
-    conn: &rusqlite::Connection,
+pub(super) async fn merge_resource_labels_by_name(
+    db: &Db,
     junction: &str,
     fk: &str,
     rid: i64,
@@ -1272,25 +1281,28 @@ pub(super) fn merge_resource_labels_by_name(
         if name.is_empty() {
             continue;
         }
-        let lid: Option<i64> = conn
-            .query_row("SELECT id FROM labels WHERE name = ?1", [name], |r| r.get(0))
-            .optional()
-            .map_err(db_err)?;
+        let lid: Option<i64> = match db
+            .query_opt("SELECT id FROM labels WHERE name = ?1", db_params![name])
+            .await?
+        {
+            Some(r) => Some(r.get(0)?),
+            None => None,
+        };
         let lid = lid.ok_or_else(|| {
             ApiError::bad_request(format!("受管标签「{name}」不存在，请先在管理后台创建"))
         })?;
-        conn.execute(
-            &format!("INSERT OR IGNORE INTO {junction}({fk}, label_id) VALUES (?1, ?2)"),
-            rusqlite::params![rid, lid],
+        db.execute(
+            &format!("INSERT INTO {junction}({fk}, label_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING"),
+            db_params![rid, lid],
         )
-        .map_err(db_err)?;
+        .await?;
     }
-    Ok(labels_of(conn, junction, fk, rid))
+    Ok(labels_of(db, junction, fk, rid).await)
 }
 
 /// 全量映射：资源 id → 受管标签名列表。供列表接口一次性装配，避免 N+1。
-pub(super) fn all_resource_labels(
-    conn: &rusqlite::Connection,
+pub(super) async fn all_resource_labels(
+    db: &Db,
     junction: &str,
     fk: &str,
 ) -> std::collections::HashMap<i64, Vec<String>> {
@@ -1298,11 +1310,14 @@ pub(super) fn all_resource_labels(
     let sql = format!(
         "SELECT j.{fk}, l.name FROM {junction} j JOIN labels l ON l.id = j.label_id ORDER BY l.name"
     );
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
-            for (id, name) in rows.flatten() {
-                map.entry(id).or_default().push(name);
-            }
+    if let Ok(rows) = db
+        .query_map(&sql, db_params![], |r| {
+            Ok((r.get::<i64>(0)?, r.get::<String>(1)?))
+        })
+        .await
+    {
+        for (id, name) in rows {
+            map.entry(id).or_default().push(name);
         }
     }
     map
@@ -1314,24 +1329,25 @@ pub(super) fn all_resource_labels(
 
 /// 全量映射：资源 id → (点赞数, 收藏数)。供列表接口一次性装配，避免 N+1。
 /// `junction`/`fk` 为内部常量（skill_reactions/skill_id 等），非用户输入，无注入风险。
-pub(super) fn all_reaction_counts(
-    conn: &rusqlite::Connection,
+pub(super) async fn all_reaction_counts(
+    db: &Db,
     junction: &str,
     fk: &str,
 ) -> std::collections::HashMap<i64, (i64, i64)> {
     let mut map: std::collections::HashMap<i64, (i64, i64)> = std::collections::HashMap::new();
     let sql = format!("SELECT {fk}, kind, COUNT(*) FROM {junction} GROUP BY {fk}, kind");
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        if let Ok(rows) = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-        }) {
-            for (id, kind, n) in rows.flatten() {
-                let e = map.entry(id).or_default();
-                match kind.as_str() {
-                    "like" => e.0 = n,
-                    "favorite" => e.1 = n,
-                    _ => {}
-                }
+    if let Ok(rows) = db
+        .query_map(&sql, db_params![], |r| {
+            Ok((r.get::<i64>(0)?, r.get::<String>(1)?, r.get::<i64>(2)?))
+        })
+        .await
+    {
+        for (id, kind, n) in rows {
+            let e = map.entry(id).or_default();
+            match kind.as_str() {
+                "like" => e.0 = n,
+                "favorite" => e.1 = n,
+                _ => {}
             }
         }
     }
@@ -1339,25 +1355,26 @@ pub(super) fn all_reaction_counts(
 }
 
 /// 某用户的互动状态全量映射：资源 id → (已点赞, 已收藏)。
-pub(super) fn user_reaction_map(
-    conn: &rusqlite::Connection,
+pub(super) async fn user_reaction_map(
+    db: &Db,
     junction: &str,
     fk: &str,
     user_id: i64,
 ) -> std::collections::HashMap<i64, (bool, bool)> {
     let mut map: std::collections::HashMap<i64, (bool, bool)> = std::collections::HashMap::new();
     let sql = format!("SELECT {fk}, kind FROM {junction} WHERE user_id = ?1");
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        if let Ok(rows) = stmt.query_map([user_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        }) {
-            for (id, kind) in rows.flatten() {
-                let e = map.entry(id).or_default();
-                match kind.as_str() {
-                    "like" => e.0 = true,
-                    "favorite" => e.1 = true,
-                    _ => {}
-                }
+    if let Ok(rows) = db
+        .query_map(&sql, db_params![user_id], |r| {
+            Ok((r.get::<i64>(0)?, r.get::<String>(1)?))
+        })
+        .await
+    {
+        for (id, kind) in rows {
+            let e = map.entry(id).or_default();
+            match kind.as_str() {
+                "like" => e.0 = true,
+                "favorite" => e.1 = true,
+                _ => {}
             }
         }
     }
@@ -1365,8 +1382,8 @@ pub(super) fn user_reaction_map(
 }
 
 /// 单个资源的互动汇总：(点赞数, 收藏数, 查看者已点赞, 查看者已收藏)。
-pub(super) fn reaction_summary(
-    conn: &rusqlite::Connection,
+pub(super) async fn reaction_summary(
+    db: &Db,
     junction: &str,
     fk: &str,
     rid: i64,
@@ -1374,29 +1391,31 @@ pub(super) fn reaction_summary(
 ) -> (i64, i64, bool, bool) {
     let mut out = (0i64, 0i64, false, false);
     let sql = format!("SELECT kind, COUNT(*) FROM {junction} WHERE {fk} = ?1 GROUP BY kind");
-    if let Ok(mut stmt) = conn.prepare(&sql) {
-        if let Ok(rows) = stmt.query_map([rid], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        }) {
-            for (kind, n) in rows.flatten() {
-                match kind.as_str() {
-                    "like" => out.0 = n,
-                    "favorite" => out.1 = n,
-                    _ => {}
-                }
+    if let Ok(rows) = db
+        .query_map(&sql, db_params![rid], |r| {
+            Ok((r.get::<String>(0)?, r.get::<i64>(1)?))
+        })
+        .await
+    {
+        for (kind, n) in rows {
+            match kind.as_str() {
+                "like" => out.0 = n,
+                "favorite" => out.1 = n,
+                _ => {}
             }
         }
     }
     if let Some(uid) = viewer {
         let sql = format!("SELECT kind FROM {junction} WHERE {fk} = ?1 AND user_id = ?2");
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            if let Ok(rows) = stmt.query_map(rusqlite::params![rid, uid], |r| r.get::<_, String>(0)) {
-                for kind in rows.flatten() {
-                    match kind.as_str() {
-                        "like" => out.2 = true,
-                        "favorite" => out.3 = true,
-                        _ => {}
-                    }
+        if let Ok(rows) = db
+            .query_map(&sql, db_params![rid, uid], |r| r.get::<String>(0))
+            .await
+        {
+            for kind in rows {
+                match kind.as_str() {
+                    "like" => out.2 = true,
+                    "favorite" => out.3 = true,
+                    _ => {}
                 }
             }
         }
@@ -1405,8 +1424,8 @@ pub(super) fn reaction_summary(
 }
 
 /// 设置 / 取消某用户对资源的点赞或收藏，随后回吐该资源的最新互动汇总。
-pub(super) fn set_reaction(
-    conn: &rusqlite::Connection,
+pub(super) async fn set_reaction(
+    db: &Db,
     junction: &str,
     fk: &str,
     rid: i64,
@@ -1418,22 +1437,22 @@ pub(super) fn set_reaction(
         return Err(ApiError::bad_request("kind 只能是 like 或 favorite"));
     }
     if on {
-        conn.execute(
+        db.execute(
             &format!(
-                "INSERT OR IGNORE INTO {junction}(user_id, {fk}, kind, created_at) VALUES (?1, ?2, ?3, ?4)"
+                "INSERT INTO {junction}(user_id, {fk}, kind, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING"
             ),
-            rusqlite::params![user_id, rid, kind, now_string()],
+            db_params![user_id, rid, kind, now_string()],
         )
-        .map_err(db_err)?;
+        .await?;
     } else {
-        conn.execute(
+        db.execute(
             &format!("DELETE FROM {junction} WHERE user_id = ?1 AND {fk} = ?2 AND kind = ?3"),
-            rusqlite::params![user_id, rid, kind],
+            db_params![user_id, rid, kind],
         )
-        .map_err(db_err)?;
+        .await?;
     }
     let (likes, favorites, liked, favorited) =
-        reaction_summary(conn, junction, fk, rid, Some(user_id));
+        reaction_summary(db, junction, fk, rid, Some(user_id)).await;
     Ok(ReactResp {
         likes,
         favorites,
@@ -1443,22 +1462,17 @@ pub(super) fn set_reaction(
 }
 
 /// 按用户名查用户 id（供资源转移解析目标账号）。
-pub(super) fn user_id_by_name(
-    conn: &rusqlite::Connection,
-    username: &str,
-) -> Result<Option<i64>, ApiError> {
-    conn.query_row(
-        "SELECT id FROM users WHERE username = ?1",
-        [username],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(db_err)
-}
-
-pub(super) fn db_err(e: rusqlite::Error) -> ApiError {
-    eprintln!("db error: {e}");
-    ApiError::internal(format!("数据库错误: {e}"))
+pub(super) async fn user_id_by_name(db: &Db, username: &str) -> Result<Option<i64>, ApiError> {
+    match db
+        .query_opt(
+            "SELECT id FROM users WHERE username = ?1",
+            db_params![username],
+        )
+        .await?
+    {
+        Some(r) => Ok(Some(r.get(0)?)),
+        None => Ok(None),
+    }
 }
 
 /// 当前 Unix 时间戳（秒）。用于审计表的时间窗过滤（24h 等）。
@@ -1470,7 +1484,7 @@ pub(super) fn now_unix() -> i64 {
 }
 
 /// 记录一次工具调用审计（尽力而为，落库失败不影响调用结果）。
-pub(super) fn log_tool_call(
+pub(super) async fn log_tool_call(
     state: &AppState,
     caller: &str,
     owner: &str,
@@ -1481,23 +1495,25 @@ pub(super) fn log_tool_call(
     result: &str,
     ms: i64,
 ) {
-    let conn = state.db.lock().unwrap();
-    let _ = conn.execute(
-        "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, result, ms, created_at, created_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        rusqlite::params![
-            caller,
-            owner,
-            mcp_name,
-            tool,
-            ok as i64,
-            error,
-            result,
-            ms,
-            now_string(),
-            now_unix()
-        ],
-    );
+    let _ = state
+        .db
+        .execute(
+            "INSERT INTO tool_calls(caller, owner, mcp_name, tool, ok, error, result, ms, created_at, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            db_params![
+                caller,
+                owner,
+                mcp_name,
+                tool,
+                ok as i64,
+                error,
+                result,
+                ms,
+                now_string(),
+                now_unix()
+            ],
+        )
+        .await;
 }
 
 /// 把一次 MCP 工具调用结果压缩成一行可读摘要，供审计面板「结果摘要」列展示。
