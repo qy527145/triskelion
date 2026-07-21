@@ -45,7 +45,12 @@ pub fn run() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("创建数据目录 {}", data_dir.display()))?;
 
-    let jwt_keys = auth::load_or_create_keys(&data_dir.join("jwt_rsa.pem"))?;
+    // 密钥集中在 keys/ 子目录。
+    let keys_dir = data_dir.join("keys");
+    std::fs::create_dir_all(&keys_dir)
+        .with_context(|| format!("创建密钥目录 {}", keys_dir.display()))?;
+
+    let jwt_keys = auth::load_or_create_keys(&keys_dir.join("jwt_rsa.pem"))?;
     let master_key_vec = match std::env::var("TRISKELION_MASTER_KEY") {
         Ok(b64) => {
             use base64::{Engine, engine::general_purpose::STANDARD};
@@ -53,7 +58,7 @@ pub fn run() -> Result<()> {
                 .decode(b64.trim())
                 .context("TRISKELION_MASTER_KEY 不是合法 base64")?
         }
-        Err(_) => load_or_create_key(&data_dir.join("master.key"), 32)?,
+        Err(_) => load_or_create_key(&keys_dir.join("master.key"), 32)?,
     };
     anyhow::ensure!(
         master_key_vec.len() == 32,
@@ -63,7 +68,7 @@ pub fn run() -> Result<()> {
     let mut master_key = [0u8; 32];
     master_key.copy_from_slice(&master_key_vec);
 
-    let blobs_dir = data_dir.join("blobs");
+    let blobs_dir = data_dir.join("data").join("blobs");
     std::fs::create_dir_all(&blobs_dir)
         .with_context(|| format!("创建技能包目录 {}", blobs_dir.display()))?;
 

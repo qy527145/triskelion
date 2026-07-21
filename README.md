@@ -103,11 +103,13 @@ Web 端技能详情弹窗内同样可浏览版本历史、查看/下载任意历
 ## 数据目录
 
 - **服务端**：默认 `~/.triskelion`，可用 `TRISKELION_SERVER_DATA_DIR` 覆盖（兼容旧的 `TRISKELION_DATA_DIR`）。
+  目录布局：`keys/`（`jwt_rsa.pem` RS256 签发密钥、`master.key` 凭据池主密钥）、
+  `data/`（`blobs/` 技能压缩体按 sha256 内容寻址、`hub.db` 默认 SQLite 库）。
 - **客户端 CLI**：统一存放于 `~/.tsk`（`config.json` 登录态 + `secrets.json` 本地变量），可用 `TRISKELION_CLIENT_DATA_DIR` 覆盖。
 
 ## 数据库（SQLite 默认 / PostgreSQL / MySQL）
 
-Hub 的持久化默认使用 **SQLite**（`<数据目录>/hub.db`，零配置开箱即用，适合单机与开发）。
+Hub 的持久化默认使用 **SQLite**（`<数据目录>/data/hub.db`，零配置开箱即用，适合单机与开发）。
 生产环境可通过 `TRISKELION_DATABASE_URL` 切换到外部数据库，按连接串前缀自动选择后端：
 
 ```bash
@@ -121,7 +123,7 @@ TRISKELION_DATABASE_URL='sqlite:/var/lib/triskelion/hub.db' triskelion
 
 - 首次启动自动建表（幂等），无需手工执行 schema；升级版本时的补列迁移也在启动时自动完成。
 - 连接池大小默认 SQLite 4 / PostgreSQL、MySQL 10，可用 `TRISKELION_DB_MAX_CONNS` 覆盖。
-- 技能压缩体 blob、`master.key`、`jwt_rsa.pem`（RS256 签发密钥）仍存放于文件系统数据目录，不随数据库切换。
+- 技能压缩体 blob（`data/blobs/`）与密钥（`keys/`）仍存放于文件系统数据目录，不随数据库切换。
 - MySQL 建表使用 `utf8mb4_bin` 排序规则，保证用户名/资源名唯一性的大小写敏感语义与
   SQLite / PostgreSQL 一致。MariaDB 采用与 MySQL 相同的方言路径（兼容语法，未做专项实测）。
 

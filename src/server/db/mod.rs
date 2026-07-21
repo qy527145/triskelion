@@ -266,11 +266,16 @@ fn max_conns(default: u32) -> u32 {
 }
 
 impl Db {
-    /// 按连接串建池。`url` 为空 → 默认 `<data_dir>/hub.db`（零配置单机部署，行为与历史一致）。
+    /// 按连接串建池。`url` 为空 → 默认 `<data_dir>/data/hub.db`（零配置单机部署）。
     pub async fn connect(url: Option<&str>, data_dir: &Path) -> Result<Db> {
         let url = url.map(str::trim).filter(|s| !s.is_empty());
         match url {
-            None => Self::connect_sqlite(&data_dir.join("hub.db")).await,
+            None => {
+                let dir = data_dir.join("data");
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("创建数据库目录 {}", dir.display()))?;
+                Self::connect_sqlite(&dir.join("hub.db")).await
+            }
             Some(u) if u.starts_with("sqlite:") => {
                 // 接受 sqlite:/path、sqlite:///path、sqlite://path 三种写法。
                 let path = u.trim_start_matches("sqlite:").trim_start_matches("//");
