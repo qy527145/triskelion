@@ -124,8 +124,32 @@ pub fn authenticate(keys: &JwtKeys, headers: &HeaderMap) -> Result<Claims, ApiEr
     Ok(data.claims)
 }
 
-/// 可选鉴权：有合法 token 返回声明，否则返回 None（不报错）。
+/// 鉴权 + 落地本地用户：验签后按 `username` 解析本地 users.id，并把
+/// `claims.sub` 重写为本地 id 返回，调用方照旧用 `claims.sub` 即可。
+///
+/// 为什么不能直接用 token 里的 sub：token 可能由共享同一把 RSA 私钥的网关
+/// （aiko_gateway 统一登录 JWT）签发，其 sub 是**网关侧**用户 id，与本地
+/// id 空间无关——直接当 owner_id 用轻则外键失败，重则写到同 id 的别人名下。
+/// username 才是跨服务的自然键。本地无此用户时即时建号（随机不可登录口令），
+/// 顺带消除网关注册联动（provision-user 异步）的竞态。
+pub async fn require_user(
+    state: &super::AppState,
+    headers: &HeaderMap,
+) -> Result<Claims, ApiError> {
+    let mut claims = authenticate(&state.jwt_keys, headers)?;
+    claims.sub = super::admin::ensure_user(&state.db, &claims.username).await?;
+    Ok(claims)
+}
+
+/// 可选鉴权：有合法 token 返回声明（sub 已落地为本地 id），否则 None（匿名视角）。
 /// 用于公开市场接口——匿名访客只看「所有分组可见」资源，登录用户额外看到其分组可见的。
-pub fn authenticate_opt(keys: &JwtKeys, headers: &HeaderMap) -> Option<Claims> {
-    authenticate(keys, headers).ok()
+pub async fn require_user_opt(state: &super::AppState, headers: &HeaderMap) -> Option<Claims> {
+    let mut claims = authenticate(&state.jwt_keys, headers).ok()?;
+    match super::admin::ensure_user(&state.db, &claims.username).await {
+        Ok(id) => {
+            claims.sub = id;
+            Some(claims)
+        }
+        Err(_) => None,
+    }
 }

@@ -352,7 +352,7 @@ async fn ldap_verify(
 }
 
 async fn whoami(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let groups: Vec<serde_json::Value> = state
         .db
         .query_map(
@@ -395,7 +395,7 @@ async fn explore(
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "all")
         .map(|s| s.to_string());
-    let viewer = auth::authenticate_opt(&state.jwt_keys, &headers);
+    let viewer = auth::require_user_opt(&state, &headers).await;
     let viewer_groups = match viewer.as_ref() {
         Some(c) => groups_of_user(&state.db, c.sub).await,
         None => Vec::new(),
@@ -477,7 +477,7 @@ async fn mcp_upsert(
     headers: HeaderMap,
     Json(req): Json<McpUpsertReq>,
 ) -> Result<Json<McpInfo>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let manifest = req.manifest;
     if manifest.name.is_empty() {
         return Err(ApiError::bad_request("manifest.name 不能为空"));
@@ -543,7 +543,7 @@ async fn mcp_upsert(
 }
 
 async fn mcp_list(State(state): S, headers: HeaderMap) -> Result<Json<Vec<McpInfo>>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let label_map = all_resource_labels(&state.db, "mcp_labels", "mcp_id").await;
     let count_map = all_reaction_counts(&state.db, "mcp_reactions", "mcp_id").await;
     let mine_map = user_reaction_map(&state.db, "mcp_reactions", "mcp_id", claims.sub).await;
@@ -595,7 +595,7 @@ async fn mcp_delete(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let n = state
         .db
         .execute(
@@ -616,7 +616,7 @@ async fn mcp_rename(
     Path(name): Path<String>,
     Json(req): Json<McpRenameReq>,
 ) -> Result<Json<McpInfo>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let new_name = req.new_name.trim().to_string();
     if new_name.is_empty() || new_name.contains('/') || new_name.len() > 128 {
         return Err(ApiError::bad_request("新名称非法（不能为空、含 '/'，且 ≤128 字符）"));
@@ -689,7 +689,7 @@ async fn mcp_set_tools(
     Path(name): Path<String>,
     Json(req): Json<SetToolsReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let tools_json =
         serde_json::to_string(&req.tools).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = now_string();
@@ -725,7 +725,7 @@ async fn mcp_index(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let (info, group_vis, id) = load_mcp(&state, &owner, &name).await?;
     ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     let (resolved, _required, missing) = stitch_for_user(&state, claims.sub, &info.manifest).await?;
@@ -769,7 +769,7 @@ async fn mcp_get(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<McpInfo>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let (mut info, group_vis, id) = load_mcp(&state, &owner, &name).await?;
     ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     let (_, _, liked, favorited) =
@@ -786,7 +786,7 @@ async fn mcp_react(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ReactReq>,
 ) -> Result<Json<ReactResp>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let (info, group_vis, id) = load_mcp(&state, &owner, &name).await?;
     ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     let resp =
@@ -802,7 +802,7 @@ async fn mcp_transfer(
     Path(name): Path<String>,
     Json(req): Json<TransferReq>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let new_owner = req.new_owner.trim().to_string();
     let now = now_string();
     let target = user_id_by_name(&state.db, &new_owner)
@@ -849,7 +849,7 @@ async fn mcp_transfer(
 /// 当前用户收藏的全部资源（技能 + MCP），按收藏时间倒序。
 /// 已失去可见性的（对方转私有 / 分组收紧）自动过滤，不在列表中出现。
 async fn favorites(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let skills = skills::favorites_of(&state, &claims).await?;
     let viewer_groups = groups_of_user(&state.db, claims.sub).await;
     let label_map = all_resource_labels(&state.db, "mcp_labels", "mcp_id").await;
@@ -923,7 +923,7 @@ async fn secret_set(
     headers: HeaderMap,
     Json(req): Json<SecretSetReq>,
 ) -> Result<Json<SecretInfo>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     if req.key.is_empty() {
         return Err(ApiError::bad_request("变量名不能为空"));
     }
@@ -950,7 +950,7 @@ async fn secret_list(
     State(state): S,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SecretInfo>>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let out = state
         .db
         .query_map(
@@ -972,7 +972,7 @@ async fn secret_delete(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let n = state
         .db
         .execute(
@@ -996,7 +996,7 @@ async fn run_resolve(
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<ResolveResp>, ApiError> {
     // 鉴权可选：未登录也能解析公开 MCP（返回原始 manifest，线上变量为空）。
-    let viewer = auth::authenticate_opt(&state.jwt_keys, &headers);
+    let viewer = auth::require_user_opt(&state, &headers).await;
     let (info, group_vis, _) = load_mcp(&state, &owner, &name).await?;
     let is_owner = viewer.as_ref().map(|c| c.username == owner).unwrap_or(false);
     if !is_owner {
@@ -1036,7 +1036,7 @@ async fn run_call(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<CallReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     let (info, group_vis, _) = load_mcp(&state, &owner, &name).await?;
     ensure_mcp_access(&state, &info, &group_vis, &claims).await?;
     if req.tool.is_empty() {
@@ -1089,7 +1089,7 @@ async fn run_report(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ReportCallReq>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = auth::authenticate(&state.jwt_keys, &headers)?;
+    let claims = auth::require_user(&state, &headers).await?;
     if req.tool.is_empty() {
         return Err(ApiError::bad_request("缺少 tool 字段"));
     }

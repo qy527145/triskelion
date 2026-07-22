@@ -2189,8 +2189,9 @@ pub(super) fn random_password_hash() -> Result<String, ApiError> {
 }
 
 /// 取用户 id；不存在则按用户名自动创建（随机不可登录口令）。
-/// 调用方须先校验用户名合法。
-async fn ensure_user(db: &Db, username: &str) -> Result<i64, ApiError> {
+/// 调用方须先校验用户名合法（管理接口自行校验；auth::require_user 的
+/// username 来自已验签的 JWT，由签发方保证）。
+pub(super) async fn ensure_user(db: &Db, username: &str) -> Result<i64, ApiError> {
     if let Some(row) = db
         .query_opt("SELECT id FROM users WHERE username = ?1", db_params![username])
         .await?
