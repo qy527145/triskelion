@@ -148,17 +148,17 @@ fn server_data_dir() -> PathBuf {
         .join(".triskelion")
 }
 
-/// 解析监听地址。优先级：命令行参数 > 环境变量 `TRISKELION_BIND` > 默认 `127.0.0.1:8787`。
+/// 解析监听地址。优先级：命令行参数 > 环境变量 `TRISKELION_BIND` > 默认 `0.0.0.0:8787`。
 ///
 /// 支持的命令行参数（不传则用上一级默认值）：
-///   --host <HOST> / -H <HOST>   监听主机（默认 127.0.0.1）
+///   --host <HOST> / -H <HOST>   监听主机（默认 0.0.0.0）
 ///   --port <PORT> / -p <PORT>   监听端口（默认 8787）
 ///   -h / --help                 打印帮助并退出
 ///
 /// 服务端 bin 仅启用 `server` feature，不引入 clap，这里做最小手写解析。
 fn resolve_bind() -> Result<String> {
     // 基准取自环境变量（兼容历史用法），否则用默认 host:port。
-    let base = std::env::var("TRISKELION_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
+    let base = std::env::var("TRISKELION_BIND").unwrap_or_else(|_| "0.0.0.0:8787".into());
     let (mut host, mut port) = split_host_port(&base);
 
     let mut args = std::env::args().skip(1);
@@ -185,7 +185,7 @@ fn resolve_bind() -> Result<String> {
                     "triskelion — Triskelion Hub Web Server\n\n\
                      用法: triskelion [选项]\n\n\
                      选项:\n  \
-                     -H, --host <HOST>   监听主机 (默认 127.0.0.1，亦可用 TRISKELION_BIND)\n  \
+                     -H, --host <HOST>   监听主机 (默认 0.0.0.0，亦可用 TRISKELION_BIND)\n  \
                      -p, --port <PORT>   监听端口 (默认 8787)\n  \
                      -h, --help          打印本帮助"
                 );
