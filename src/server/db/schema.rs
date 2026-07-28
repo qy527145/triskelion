@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS users (
     group_id      {INT},
     -- 认证来源：'local' 本地口令 / 'ldap' 企业目录（影子账号，口令不可本地登录）。
     auth_source   {KEYTEXT} NOT NULL DEFAULT 'local',
+    -- 昵称（LDAP displayName / 网关 display_name 同步而来）。空表示未知，展示回退用户名。
+    display_name  {KEYTEXT} NOT NULL DEFAULT '',
     created_at    {KEYTEXT} NOT NULL
 ){TAIL};
 
@@ -192,6 +194,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE tool_calls ADD COLUMN result {DOC} NOT NULL DEFAULT ''",
     "ALTER TABLE skills ADD COLUMN downloads {INT} NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN auth_source {KEYTEXT} NOT NULL DEFAULT 'local'",
+    "ALTER TABLE users ADD COLUMN display_name {KEYTEXT} NOT NULL DEFAULT ''",
 ];
 
 fn tokens(d: Dialect) -> [(&'static str, &'static str); 6] {

@@ -42,11 +42,13 @@ pub struct ExploreQuery {
     tag: Option<String>,
     /// 按受管标签名筛选（如「官方」「社区」）。
     label: Option<String>,
+    /// 按作者精确筛选：用户名或昵称（大小写不敏感），供作者主页取其全部资源。
+    owner: Option<String>,
 }
 
-/// 公开技能市场：列出所有 public 技能，可按 `q`（名称/描述/SKILL.md/标签模糊）、
-/// `category`、`tag`（自由标签）、`label`（受管标签）过滤。鉴权可选——匿名访客只看
-/// 「所有分组可见」的，登录用户额外看到其分组可见的与自己的。
+/// 公开技能市场：列出所有 public 技能，可按 `q`（名称/描述/SKILL.md/标签/作者模糊）、
+/// `category`、`tag`（自由标签）、`label`（受管标签）、`owner`（作者精确）过滤。鉴权
+/// 可选——匿名访客只看「所有分组可见」的，登录用户额外看到其分组可见的与自己的。
 pub async fn explore(
     State(state): S,
     headers: HeaderMap,
@@ -74,6 +76,13 @@ pub async fn explore(
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "all")
         .map(|s| s.to_string());
+    // 作者精确筛选：用户名或昵称任一命中（比对前统一小写）。
+    let owner_filter = query
+        .owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase());
 
     let viewer = auth::require_user_opt(&state, &headers).await;
     let viewer_groups = match viewer.as_ref() {
@@ -92,18 +101,20 @@ pub async fn explore(
     let rows = state
         .db
         .query_map(
-            "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
+            "SELECT u.username, u.display_name, s.name, s.category, s.visibility, s.version, s.description,
                     s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
                     s.downloads, s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
              WHERE s.visibility = 'public'
                AND (lower(s.name) LIKE ?1 OR lower(s.description) LIKE ?1
-                    OR lower(s.skill_md) LIKE ?1 OR lower(s.tags) LIKE ?1)
+                    OR lower(s.skill_md) LIKE ?1 OR lower(s.tags) LIKE ?1
+                    OR lower(u.username) LIKE ?1 OR lower(u.display_name) LIKE ?1)
                AND (?2 IS NULL OR s.category = ?2)
                AND (?3 IS NULL OR lower(s.tags) LIKE ?3)
+               AND (?4 IS NULL OR lower(u.username) = ?4 OR lower(u.display_name) = ?4)
              ORDER BY s.updated_at DESC, s.name",
-            db_params![pattern, category, tag],
-            |r| Ok((row_to_tuple(r)?, r.get::<String>(13)?, r.get::<i64>(14)?)),
+            db_params![pattern, category, tag, owner_filter],
+            |r| Ok((row_to_tuple(r)?, r.get::<String>(14)?, r.get::<i64>(15)?)),
         )
         .await?;
     let mut out = Vec::new();
@@ -137,12 +148,13 @@ pub async fn list_mine(State(state): S, headers: HeaderMap) -> Result<Json<Vec<S
     let rows = state
         .db
         .query_map(
-            "SELECT CAST(?1 AS TEXT), s.name, s.category, s.visibility, s.version, s.description,
-                    s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
-                    s.downloads, s.id
-             FROM skills s WHERE s.owner_id = ?2 ORDER BY s.updated_at DESC, s.name",
+            "SELECT CAST(?1 AS TEXT), u.display_name, s.name, s.category, s.visibility, s.version,
+                    s.description, s.tags, s.skill_md, s.metadata, s.archive_sha256,
+                    s.archive_size, s.updated_at, s.downloads, s.id
+             FROM skills s JOIN users u ON u.id = s.owner_id
+             WHERE s.owner_id = ?2 ORDER BY s.updated_at DESC, s.name",
             db_params![claims.username, claims.sub],
-            |r| Ok((row_to_tuple(r)?, r.get::<i64>(13)?)),
+            |r| Ok((row_to_tuple(r)?, r.get::<i64>(14)?)),
         )
         .await?;
     let mut out = Vec::new();
@@ -337,6 +349,7 @@ pub async fn upsert(
 
     Ok(Json(SkillInfo {
         owner: claims.username,
+        owner_display_name: display_name_of(&state.db, claims.sub).await,
         name: m.name,
         category,
         visibility,
@@ -497,7 +510,7 @@ pub(super) async fn favorites_of(
     let rows = state
         .db
         .query_map(
-            "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
+            "SELECT u.username, u.display_name, s.name, s.category, s.visibility, s.version, s.description,
                     s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
                     s.downloads, s.group_visibility, s.id
              FROM skill_reactions r
@@ -506,14 +519,14 @@ pub(super) async fn favorites_of(
              WHERE r.user_id = ?1 AND r.kind = 'favorite'
              ORDER BY r.created_at DESC, s.name",
             db_params![claims.sub],
-            |r| Ok((row_to_tuple(r)?, r.get::<String>(13)?, r.get::<i64>(14)?)),
+            |r| Ok((row_to_tuple(r)?, r.get::<String>(14)?, r.get::<i64>(15)?)),
         )
         .await?;
     let mut out = Vec::new();
     for (tuple, group_vis, id) in rows {
         let is_owner = tuple.0 == claims.username;
         if !is_owner
-            && (tuple.3 != "public"
+            && (tuple.4 != "public"
                 || !super::routes::group_can_see(&group_vis, &viewer_groups, false))
         {
             continue;
@@ -941,6 +954,7 @@ pub(super) fn sha256_hex(bytes: &[u8]) -> String {
 
 type SkillRow = (
     String, // owner
+    String, // owner display_name（昵称；空表示未同步）
     String, // name
     String, // category
     String, // visibility
@@ -970,16 +984,31 @@ fn row_to_tuple(r: &super::db::Row) -> Result<SkillRow, super::db::DbError> {
         r.get(10)?,
         r.get(11)?,
         r.get(12)?,
+        r.get(13)?,
     ))
 }
 
+/// 取用户昵称（users.display_name）；未同步或查询失败一律空串（展示端回退用户名）。
+async fn display_name_of(db: &Db, user_id: i64) -> String {
+    db.query_opt(
+        "SELECT display_name FROM users WHERE id = ?1",
+        db_params![user_id],
+    )
+    .await
+    .ok()
+    .flatten()
+    .and_then(|r| r.get::<String>(0).ok())
+    .unwrap_or_default()
+}
+
 fn tuple_to_info(t: SkillRow) -> Result<SkillInfo, ApiError> {
-    let (owner, name, category, visibility, version, description, tags_json, skill_md, meta_json, sha, size, updated_at, downloads) =
+    let (owner, owner_display_name, name, category, visibility, version, description, tags_json, skill_md, meta_json, sha, size, updated_at, downloads) =
         t;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let meta: SkillMeta = serde_json::from_str(&meta_json).unwrap_or_default();
     Ok(SkillInfo {
         owner,
+        owner_display_name,
         name,
         category,
         visibility,
@@ -1006,7 +1035,7 @@ async fn load_skill(state: &AppState, owner: &str, name: &str) -> Result<(SkillI
     let row: Option<(SkillRow, String, i64)> = match state
         .db
         .query_opt(
-            "SELECT u.username, s.name, s.category, s.visibility, s.version, s.description,
+            "SELECT u.username, u.display_name, s.name, s.category, s.visibility, s.version, s.description,
                     s.tags, s.skill_md, s.metadata, s.archive_sha256, s.archive_size, s.updated_at,
                     s.downloads, s.group_visibility, s.id
              FROM skills s JOIN users u ON u.id = s.owner_id
@@ -1015,7 +1044,7 @@ async fn load_skill(state: &AppState, owner: &str, name: &str) -> Result<(SkillI
         )
         .await?
     {
-        Some(r) => Some((row_to_tuple(&r)?, r.get::<String>(13)?, r.get::<i64>(14)?)),
+        Some(r) => Some((row_to_tuple(&r)?, r.get::<String>(14)?, r.get::<i64>(15)?)),
         None => None,
     };
     let (row, group_vis, id) =

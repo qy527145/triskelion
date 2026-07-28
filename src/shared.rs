@@ -671,6 +671,9 @@ pub struct SkillVersionInfo {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SkillInfo {
     pub owner: String,
+    /// 作者昵称（users.display_name）。空表示未同步，展示端回退 `owner`。
+    #[serde(default)]
+    pub owner_display_name: String,
     pub name: String,
     pub category: String,
     pub visibility: String,

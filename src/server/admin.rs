@@ -2380,6 +2380,9 @@ pub async fn secrets_distribute(
 pub struct UserProvisionReq {
     username: String,
     password: String,
+    /// 可选：昵称（网关侧 display_name / LDAP displayName）。缺省或空串不覆盖既有值。
+    #[serde(default)]
+    display_name: Option<String>,
     /// 可选：随账号一并注入的变量名（如 "AIKO_HUB_KEY"）。
     #[serde(default)]
     key: Option<String>,
@@ -2425,6 +2428,13 @@ pub async fn user_provision(
         Some(r) => Some(r.get(0)?),
         None => None,
     };
+    // 昵称：仅在调用方给出非空值时写入，避免把已有昵称覆盖成空。
+    let display_name = req
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let (uid, created) = match existing {
         Some(id) => {
             // 同步口令保持一致。
@@ -2435,14 +2445,24 @@ pub async fn user_provision(
                     db_params![hash, id],
                 )
                 .await?;
+            if let Some(nick) = &display_name {
+                state
+                    .db
+                    .execute(
+                        "UPDATE users SET display_name = ?1 WHERE id = ?2",
+                        db_params![nick, id],
+                    )
+                    .await?;
+            }
             (id, false)
         }
         None => {
             let id = state
                 .db
                 .insert_id(
-                    "INSERT INTO users(username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-                    db_params![username, hash, now],
+                    "INSERT INTO users(username, password_hash, display_name, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    db_params![username, hash, display_name.clone().unwrap_or_default(), now],
                 )
                 .await?;
             (id, true)
