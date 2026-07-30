@@ -9,9 +9,11 @@ import DetailModal from "./components/DetailModal";
 import SkillDetailModal from "./components/SkillDetailModal";
 import SecretModal from "./components/SecretModal";
 import TransferModal from "./components/TransferModal";
+import EditProfileModal from "./components/EditProfileModal";
 import { SearchIcon, PlusIcon, KeyIcon, TrashIcon, Spinner } from "./components/icons";
 import { api, clearAuth, getUser } from "./lib/api";
-import type { FavoritesResp, McpInfo, ReactKind, SecretInfo, SkillInfo } from "./lib/types";
+import { initials } from "./lib/color";
+import type { FavoritesResp, McpInfo, ReactKind, SecretInfo, SkillInfo, WhoamiResp } from "./lib/types";
 import { SKILL_CATEGORIES } from "./lib/types";
 
 const isSkillTab = (t: Tab) => t === "skill-market" || t === "skill-mine";
@@ -19,6 +21,7 @@ const isMcpTab = (t: Tab) => t === "mcp-market" || t === "mcp-mine";
 const isMarket = (t: Tab) => t === "skill-market" || t === "mcp-market";
 
 const PERSONAL: { id: Tab; label: string }[] = [
+  { id: "profile", label: "个人主页" },
   { id: "skill-mine", label: "我的技能" },
   { id: "mcp-mine", label: "我的 MCP" },
   { id: "favorites", label: "我的收藏" },
@@ -33,6 +36,7 @@ export default function App() {
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [secrets, setSecrets] = useState<SecretInfo[]>([]);
   const [favs, setFavs] = useState<FavoritesResp>({ skills: [], mcps: [] });
+  const [profile, setProfile] = useState<WhoamiResp | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -47,6 +51,7 @@ export default function App() {
   const [detail, setDetail] = useState<McpInfo | null>(null);
   const [skillDetail, setSkillDetail] = useState<SkillInfo | null>(null);
   const [secretEdit, setSecretEdit] = useState<{ key: string | null } | null>(null);
+  const [profileEdit, setProfileEdit] = useState(false);
   const [transfer, setTransfer] = useState<{ kind: "skill" | "mcp"; owner: string; name: string } | null>(
     null,
   );
@@ -61,7 +66,9 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      if (tab === "secrets") {
+      if (tab === "profile") {
+        setProfile(await api.whoami());
+      } else if (tab === "secrets") {
         setSecrets(await api.listSecrets());
       } else if (tab === "favorites") {
         setFavs(await api.favorites());
@@ -178,6 +185,10 @@ export default function App() {
   }
 
   const meta: Record<Tab, { title: string; subtitle: string }> = {
+    profile: {
+      title: "个人主页",
+      subtitle: "你的账号档案：昵称、所属分组、注册时间与名下资源概览。",
+    },
     "skill-market": {
       title: "技能市场",
       subtitle: "万物皆 Skill：技能 / 知识库 / 工具链。Agent 只读精简 SKILL.md，按需用 tsk 触发底层 MCP。",
@@ -309,6 +320,12 @@ export default function App() {
             <Loading />
           ) : error ? (
             <Empty big="加载失败">{error}</Empty>
+          ) : tab === "profile" ? (
+            profile ? (
+              <ProfilePage p={profile} onNav={switchTab} onEdit={() => setProfileEdit(true)} />
+            ) : (
+              <Empty big="暂无个人信息">请重新登录后再试。</Empty>
+            )
           ) : tab === "secrets" ? (
             secrets.length === 0 ? (
               <Empty big="还没有变量">点击 “设置变量” 添加，例如 AIKO_HUB_KEY。</Empty>
@@ -503,12 +520,108 @@ export default function App() {
           }}
         />
       )}
+      {profileEdit && profile && (
+        <EditProfileModal
+          current={profile.display_name}
+          onClose={() => setProfileEdit(false)}
+          onSaved={(displayName) => {
+            setProfileEdit(false);
+            setProfile((cur) => (cur ? { ...cur, display_name: displayName } : cur));
+            notify("已保存");
+          }}
+        />
+      )}
 
       {toast && (
         <div className="fixed bottom-7 left-1/2 z-[100] -translate-x-1/2 rounded-xl bg-slate-800 px-4 py-2.5 text-sm text-white shadow-2xl">
           {toast}
         </div>
       )}
+    </div>
+  );
+}
+
+/** 个人主页：账号档案卡 + 名下资源统计块（点击跳转对应子页）。 */
+function ProfilePage({ p, onNav, onEdit }: { p: WhoamiResp; onNav: (t: Tab) => void; onEdit: () => void }) {
+  const stats: { id: Tab; label: string; value: number }[] = [
+    { id: "skill-mine", label: "技能", value: p.stats.skills },
+    { id: "mcp-mine", label: "MCP", value: p.stats.mcps },
+    { id: "favorites", label: "收藏", value: p.stats.favorites },
+    { id: "secrets", label: "变量", value: p.stats.secrets },
+  ];
+  return (
+    <div className="max-w-3xl space-y-5 tsk-rise">
+      <div className="rounded-2xl border border-slate-200/70 bg-white p-8 shadow-sm">
+        <div className="flex items-center gap-5">
+          <div className="grid size-20 flex-none place-items-center rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-500 text-2xl font-bold text-white">
+            {initials(p.username)}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-3">
+              <h2 className="truncate text-2xl font-bold text-slate-800">
+                {p.display_name || p.username}
+              </h2>
+              <span className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs text-slate-500">
+                {p.auth_source === "ldap" ? "LDAP 账号" : "本地账号"}
+              </span>
+            </div>
+            <div className="mt-1.5 text-sm text-slate-400">@{p.username}</div>
+          </div>
+          <button
+            onClick={onEdit}
+            className="flex-none rounded-lg border border-indigo-200 px-3 py-1.5 text-xs font-semibold text-indigo-500 transition hover:bg-indigo-50"
+          >
+            编辑资料
+          </button>
+        </div>
+
+        <dl className="mt-7 grid gap-x-8 gap-y-4 sm:grid-cols-2">
+          <div>
+            <dt className="text-xs font-medium uppercase tracking-wider text-slate-400">昵称</dt>
+            <dd className="mt-1 text-sm text-slate-700">
+              {p.display_name || <span className="text-slate-400">未设置</span>}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs font-medium uppercase tracking-wider text-slate-400">用户名</dt>
+            <dd className="mt-1 font-mono text-sm text-slate-700">{p.username}</dd>
+          </div>
+          <div>
+            <dt className="text-xs font-medium uppercase tracking-wider text-slate-400">注册时间</dt>
+            <dd className="mt-1 text-sm text-slate-700">{p.created_at || "—"}</dd>
+          </div>
+          <div>
+            <dt className="text-xs font-medium uppercase tracking-wider text-slate-400">所属分组</dt>
+            <dd className="mt-1 flex flex-wrap gap-1.5">
+              {p.groups.length === 0 ? (
+                <span className="text-sm text-slate-400">未加入任何分组</span>
+              ) : (
+                p.groups.map((g) => (
+                  <span
+                    key={g.id}
+                    className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 text-xs font-medium text-indigo-600"
+                  >
+                    {g.name}
+                  </span>
+                ))
+              )}
+            </dd>
+          </div>
+        </dl>
+      </div>
+
+      <div className="grid grid-cols-2 gap-5 sm:grid-cols-4">
+        {stats.map((s) => (
+          <button
+            key={s.id}
+            onClick={() => onNav(s.id)}
+            className="rounded-2xl border border-slate-200/70 bg-white p-5 text-left shadow-sm transition hover:-translate-y-0.5 hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-500/10"
+          >
+            <div className="text-sm text-slate-400">{s.label}</div>
+            <div className="mt-1 text-3xl font-semibold text-slate-800">{s.value}</div>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

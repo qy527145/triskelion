@@ -35,6 +35,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // 公开的认证能力探测：登录框据此调整文案（注册是否开放 / 是否有 LDAP）。
         .route("/v1/auth/config", get(auth_config))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/profile", patch(profile_update))
         .route("/v1/explore", get(explore))
         .route("/v1/labels", get(label_names))
         .route("/v1/mcp", get(mcp_list).post(mcp_upsert))
@@ -351,8 +352,19 @@ async fn ldap_verify(
     }
 }
 
+/// 当前用户的个人信息：账号档案（昵称、认证来源、注册时间）、所属分组与
+/// 名下资源统计，供 Web「个人主页」一次取齐。
 async fn whoami(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     let claims = auth::require_user(&state, &headers).await?;
+    let row = state
+        .db
+        .query_row(
+            "SELECT display_name, auth_source, created_at FROM users WHERE id = ?1",
+            db_params![claims.sub],
+        )
+        .await?;
+    let (display_name, auth_source, created_at): (String, String, String) =
+        (row.get(0)?, row.get(1)?, row.get(2)?);
     let groups: Vec<serde_json::Value> = state
         .db
         .query_map(
@@ -364,11 +376,56 @@ async fn whoami(State(state): S, headers: HeaderMap) -> Result<Json<serde_json::
             },
         )
         .await?;
+    let stats = state
+        .db
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM skills WHERE owner_id = ?1),
+                (SELECT COUNT(*) FROM mcps WHERE owner_id = ?1),
+                (SELECT COUNT(*) FROM skill_reactions WHERE user_id = ?1 AND kind = 'favorite')
+                  + (SELECT COUNT(*) FROM mcp_reactions WHERE user_id = ?1 AND kind = 'favorite'),
+                (SELECT COUNT(*) FROM secrets WHERE owner_id = ?1)",
+            db_params![claims.sub],
+        )
+        .await?;
+    let (skills, mcps, favorites, secrets): (i64, i64, i64, i64) =
+        (stats.get(0)?, stats.get(1)?, stats.get(2)?, stats.get(3)?);
     Ok(Json(serde_json::json!({
         "username": claims.username,
         "user_id": claims.sub,
+        "display_name": display_name,
+        "auth_source": auth_source,
+        "created_at": created_at,
         "groups": groups,
+        "stats": { "skills": skills, "mcps": mcps, "favorites": favorites, "secrets": secrets },
     })))
+}
+
+#[derive(serde::Deserialize)]
+struct ProfileUpdateReq {
+    display_name: String,
+}
+
+/// 更新当前用户的个人资料（目前仅昵称）。空串表示清除昵称（展示端回退用户名）。
+/// 外部网关 provision-user 携带非空昵称时会覆盖此处的自助修改。
+async fn profile_update(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<ProfileUpdateReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let claims = auth::require_user(&state, &headers).await?;
+    let display_name = req.display_name.trim().to_string();
+    if display_name.chars().count() > 64 {
+        return Err(ApiError::bad_request("昵称最长 64 个字符"));
+    }
+    state
+        .db
+        .execute(
+            "UPDATE users SET display_name = ?1 WHERE id = ?2",
+            db_params![display_name, claims.sub],
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "display_name": display_name })))
 }
 
 #[derive(serde::Deserialize)]

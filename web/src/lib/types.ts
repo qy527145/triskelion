@@ -149,6 +149,20 @@ export interface FavoritesResp {
   mcps: McpInfo[];
 }
 
+/** 当前登录用户的个人信息（个人主页展示）。 */
+export interface WhoamiResp {
+  username: string;
+  user_id: number;
+  /** 昵称（LDAP displayName / 网关同步而来）。空表示未设置，展示回退用户名。 */
+  display_name: string;
+  /** 认证来源：'local' 本地口令 / 'ldap' 目录账号。 */
+  auth_source: string;
+  created_at: string;
+  groups: GroupBrief[];
+  /** 名下资源统计。 */
+  stats: { skills: number; mcps: number; favorites: number; secrets: number };
+}
+
 /** 「拖入压缩包创建技能」的服务端解析结果：清单 + 说明书 + 已落盘的归一化压缩体信息。 */
 export interface SkillInspectResp {
   manifest: SkillManifest;

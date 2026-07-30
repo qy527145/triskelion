@@ -2,10 +2,17 @@ import { initials } from "../lib/color";
 import { LogoutIcon } from "./icons";
 import Brand from "./Brand";
 
-export type Tab = "skill-market" | "mcp-market" | "skill-mine" | "mcp-mine" | "favorites" | "secrets";
+export type Tab =
+  | "skill-market"
+  | "mcp-market"
+  | "profile"
+  | "skill-mine"
+  | "mcp-mine"
+  | "favorites"
+  | "secrets";
 
 /** 个人中心下的子页签。 */
-export const PERSONAL_TABS: Tab[] = ["skill-mine", "mcp-mine", "favorites", "secrets"];
+export const PERSONAL_TABS: Tab[] = ["profile", "skill-mine", "mcp-mine", "favorites", "secrets"];
 export const isPersonal = (t: Tab) => PERSONAL_TABS.includes(t);
 
 const MARKET_TABS: { id: Tab; label: string }[] = [
@@ -47,7 +54,7 @@ export default function Header({
         ))}
         {user && (
           <button
-            onClick={() => onTab("skill-mine")}
+            onClick={() => onTab("profile")}
             className={`rounded-[10px] px-3 py-2 text-[15px] font-medium transition ${
               personalActive
                 ? "bg-indigo-50 font-semibold text-indigo-500"
@@ -64,9 +71,9 @@ export default function Header({
       {user ? (
         <div className="flex items-center gap-3">
           <button
-            onClick={() => onTab("skill-mine")}
+            onClick={() => onTab("profile")}
             className="flex items-center gap-2 rounded-full border border-indigo-100 bg-indigo-50/50 py-1 pl-1 pr-3 transition hover:border-indigo-200 hover:bg-indigo-50"
-            title="进入个人中心"
+            title="进入个人主页"
           >
             <span className="grid size-8 place-items-center rounded-full border border-indigo-200 bg-indigo-50 text-xs font-bold text-indigo-500">
               {initials(user)}

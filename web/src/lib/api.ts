@@ -28,6 +28,7 @@ import type {
   SkillVersionInfo,
   ToolMeta,
   UserTransferResult,
+  WhoamiResp,
 } from "./types";
 
 const TOKEN_KEY = "tsk_token";
@@ -153,6 +154,15 @@ export const api = {
     req<AuthResp>("/v1/auth/register", { method: "POST", body: { username, password } }),
   /** 公开的认证能力探测：注册是否开放 / 是否启用 LDAP。 */
   authConfig: () => req<AuthConfig>("/v1/auth/config"),
+  /** 当前登录用户的个人信息（昵称、分组、注册时间、资源统计）。 */
+  whoami: () => req<WhoamiResp>("/v1/whoami", { auth: true }),
+  /** 更新当前用户的昵称（空串清除，展示回退用户名）。 */
+  updateProfile: (display_name: string) =>
+    req<{ display_name: string }>("/v1/profile", {
+      method: "PATCH",
+      auth: true,
+      body: { display_name },
+    }),
 
   explore: (q: string, label?: string) => {
     const p = new URLSearchParams();
