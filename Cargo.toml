@@ -1,10 +1,18 @@
 [package]
 name = "triskelion"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "Triskelion — unified resource gateway and open marketplace for LLM agent tools"
 license = "Apache-2.0"
+repository = "https://github.com/qy527145/triskelion"
+authors = ["wmymz"]
 default-run = "tsk"
+
+[package.metadata.wix]
+upgrade-guid = "CDA8D5E1-D956-4B8A-AC41-71FF23C62667"
+path-guid = "B4B24941-DBCB-444C-B5E8-5DD279B7FDEE"
+license = false
+eula = false
 
 [lib]
 name = "triskelion"
@@ -152,3 +160,8 @@ ldap3 = { version = "0.12", default-features = false, features = [
 ], optional = true }
 
 [dev-dependencies]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
