@@ -24,7 +24,7 @@ import type {
 } from "../lib/types";
 import Modal from "./Modal";
 import Brand from "./Brand";
-import { DownloadIcon, LogoutIcon, PlusIcon, Spinner, TrashIcon } from "./icons";
+import { DownloadIcon, LogoutIcon, PlusIcon, Spinner, StarIcon, TrashIcon } from "./icons";
 
 const TOKEN_KEY = "tsk_admin_token";
 
@@ -987,6 +987,7 @@ function ResourcesManager({ token, notify }: { token: string; notify: (m: string
           skill={content.raw as AdminSkill}
           onClose={() => setContent(null)}
           onChanged={reload}
+          notify={notify}
           onSaved={() => {
             setContent(null);
             notify("已更新");
@@ -1398,13 +1399,16 @@ function AdminSkillEditModal({
   onClose,
   onSaved,
   onChanged,
+  notify,
 }: {
   token: string;
   skill: AdminSkill;
   onClose: () => void;
   onSaved: () => void;
-  /** 版本删除等就地变更后通知外层刷新列表（弹窗保持打开）。 */
+  /** 版本切换等就地变更后通知外层刷新列表（弹窗保持打开）。 */
   onChanged?: () => void;
+  /** 就地操作成功后的提示。 */
+  notify?: (msg: string) => void;
 }) {
   const [version, setVersion] = useState(skill.version);
   const [category, setCategory] = useState<SkillCategory>(skill.category as SkillCategory);
@@ -1415,7 +1419,7 @@ function AdminSkillEditModal({
   const [skillMd, setSkillMd] = useState(skill.skill_md);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  // 版本历史：null=加载中；head 为当前最新版本号（删除最新版后服务端会回退并回传新值）。
+  // 版本历史：null=加载中；head 为当前最新版本号（切版本 / 删除最新版后服务端会回传新值）。
   const [versions, setVersions] = useState<SkillVersionInfo[] | null>(null);
   const [head, setHead] = useState(skill.version);
   const [busyVer, setBusyVer] = useState<string | null>(null);
@@ -1450,6 +1454,33 @@ function AdminSkillEditModal({
       // 避免「保存」把已删除的版本号写回去。
       setVersion((cur) => (cur === head || cur === v.version ? r.head : cur));
       onChanged?.();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+    setBusyVer(null);
+  }
+
+  /**
+   * 把某个历史版本设为最新版（回退 / 前进，可逆）。服务端只改 head 快照，
+   * 市场与客户端下一次请求即看到新内容与新版本号，无需重新发布。
+   */
+  async function promoteVersion(v: SkillVersionInfo) {
+    const msg =
+      `将 v${v.version} 设为最新版（当前 v${head}）？\n` +
+      "市场与客户端（tsk pull 默认最新版）将立即取到该版本内容。" +
+      "原有版本副本全部保留，随时可再切回来。";
+    if (!confirm(msg)) return;
+    setBusyVer(v.version);
+    setError("");
+    try {
+      const r = await admin.promoteSkillVersion(token, skill.owner, skill.name, v.version);
+      setVersions(r.versions);
+      setHead(r.head);
+      // 版本输入框若未被手工改过（仍为旧最新版），同步到新最新版，
+      // 避免「保存」把旧版本号当作新版本发布出去。
+      setVersion((cur) => (cur === head ? r.head : cur));
+      onChanged?.();
+      notify?.(`已切换最新版为 v${r.head}`);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1517,7 +1548,7 @@ function AdminSkillEditModal({
         </div>
         <div>
           <label className={adminLabelCls}>
-            版本历史（删除最新版将自动回退到次新版本；仅剩一个版本时不可删除）
+            版本历史（点「设为最新」把任意版本切换为市场当前版本，可逆；删除最新版将自动回退到次新版本）
           </label>
           {versions === null ? (
             <div className="px-1 py-1 text-xs text-slate-400">加载中…</div>
@@ -1537,6 +1568,17 @@ function AdminSkillEditModal({
                     {v.archive_size > 0 ? humanSize(v.archive_size) : "纯文本"}
                   </span>
                   <span className="flex-1 text-slate-400">{v.created_at.replace(" UTC", "")}</span>
+                  {v.version !== head && (
+                    <button
+                      onClick={() => promoteVersion(v)}
+                      disabled={busyVer !== null}
+                      title="把该版本设为最新版：市场与客户端立即取到该版本内容"
+                      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-indigo-600 transition hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {busyVer === v.version ? <Spinner /> : <StarIcon width={12} height={12} />}
+                      设为最新
+                    </button>
+                  )}
                   <button
                     onClick={() => removeVersion(v)}
                     disabled={versions.length <= 1 || busyVer !== null}

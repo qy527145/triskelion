@@ -25,6 +25,7 @@ import type {
   SkillInspectResp,
   SkillManifest,
   SkillVersionDeleteResp,
+  SkillVersionPromoteResp,
   SkillVersionInfo,
   ToolMeta,
   UserTransferResult,
@@ -444,6 +445,23 @@ export const admin = {
         encodeURIComponent(version),
       token,
       { method: "DELETE" },
+    ),
+  /**
+   * 把指定历史版本设为最新版（回退 / 前进到任意版本，可逆）。
+   * 只改 head 快照（说明书 / 元数据 / 压缩体指针 / 版本号），不动可见性、标签与下载量；
+   * 所有版本副本原样保留。返回新的最新版本号、切换前的版本号与版本列表。
+   */
+  promoteSkillVersion: (token: string, owner: string, name: string, version: string) =>
+    adminReq<SkillVersionPromoteResp>(
+      "/v1/admin/skills/" +
+        encodeURIComponent(owner) +
+        "/" +
+        encodeURIComponent(name) +
+        "/versions/" +
+        encodeURIComponent(version) +
+        "/promote",
+      token,
+      { method: "POST" },
     ),
   updateMcp: (
     token: string,

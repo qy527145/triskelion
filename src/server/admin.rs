@@ -1405,6 +1405,80 @@ pub async fn skill_versions(
     Ok(Json(skills::versions_of(&state.db, sid).await))
 }
 
+/// 管理后台：把指定历史版本设为最新版（回退 / 前进到任意版本）。
+///
+/// 把 `skill_versions` 中该版本的完整副本（说明书 + 元数据 + 压缩体指针）恢复为
+/// `skills` 的 head 快照。市场读写全程直查库、无缓存，前端下一次请求即可见新内容和
+/// 版本号，客户端 `tsk pull`（缺省最新版）随即取到该版本。
+///
+/// 与「删除最新版」不同，这里是可逆切换：所有版本副本都原样保留，随时可再切回去。
+/// 只改内容与版本号，不动可见性 / 分组 / 标签 / 下载量。
+pub async fn skill_version_promote(
+    State(state): S,
+    headers: HeaderMap,
+    Path((owner, name, version)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let (sid, head) = admin_skill_head(&state.db, &owner, &name).await?;
+    let row: Option<(String, String, String, i64)> = match state
+        .db
+        .query_opt(
+            "SELECT skill_md, metadata, archive_sha256, archive_size
+             FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+            db_params![sid, version],
+        )
+        .await?
+    {
+        Some(r) => Some((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        None => None,
+    };
+    let Some((v_md, v_meta, v_sha, v_size)) = row else {
+        return Err(ApiError::not_found(format!("未找到版本 {version}")));
+    };
+    // 版本副本存在但压缩体已被清理（历史脏数据）时拒绝，避免把市场指向一个下不动的包。
+    if !v_sha.is_empty() && skills::find_blob(&state, &v_sha).is_none() {
+        return Err(ApiError::bad_request(format!(
+            "版本 {version} 的压缩体文件缺失，无法设为最新版"
+        )));
+    }
+
+    promote_head(&state.db, sid, &version, (v_md, v_meta, v_sha, v_size)).await?;
+
+    Ok(Json(serde_json::json!({
+        "head": version,
+        "previous": head,
+        "versions": skills::versions_of(&state.db, sid).await,
+    })))
+}
+
+/// 把版本副本的四个内容字段覆盖到 head 快照上（只动内容与版本号）。
+///
+/// 拆成只依赖 `Db` 的函数，便于不构造整个 `AppState` 直接测。全程单条 UPDATE，
+/// 市场读写都直查该行，因此切换对其他请求立即可见。
+async fn promote_head(
+    db: &Db,
+    skill_id: i64,
+    version: &str,
+    (skill_md, metadata, archive_sha256, archive_size): (String, String, String, i64),
+) -> Result<(), ApiError> {
+    db.execute(
+        "UPDATE skills SET version = ?1, skill_md = ?2, metadata = ?3,
+            archive_sha256 = ?4, archive_size = ?5, updated_at = ?6
+         WHERE id = ?7",
+        db_params![
+            version,
+            skill_md,
+            metadata,
+            archive_sha256,
+            archive_size,
+            now_string(),
+            skill_id
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// 管理后台：删除技能的指定版本副本（含失引用 blob 的清理）。
 ///
 /// - 删除的是最新版时，自动把剩余最高版本提升为最新版（`skills` 快照随之恢复该版本内容）；
@@ -3452,4 +3526,102 @@ fn read_pack_tar(body: &[u8]) -> anyhow::Result<(Pack, Vec<(String, Vec<u8>)>)> 
     }
     let pack = pack.ok_or_else(|| anyhow::anyhow!("资源包缺少 manifest.json"))?;
     Ok((pack, blobs))
+}
+
+#[cfg(test)]
+mod promote_tests {
+    use super::*;
+    use crate::server::db::schema;
+
+    /// 建一个临时 SQLite 库并灌入一个技能的两个版本副本，返回 (db, 临时目录, skill_id)。
+    /// 目录名带进程内自增序号：并行测试同一秒内启动时 now_string 会撞名，共用一个库文件。
+    async fn fixture() -> (Db, std::path::PathBuf, i64) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "triskelion-promote-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::connect(None, &dir).await.unwrap();
+        schema::init(&db).await.unwrap();
+        let uid = db
+            .insert_id(
+                "INSERT INTO users(username, password_hash, created_at) VALUES ('alice', '', 't')",
+                db_params![],
+            )
+            .await
+            .unwrap();
+        let sid = db
+            .insert_id(
+                "INSERT INTO skills(owner_id, name, version, skill_md, metadata, updated_at)
+                 VALUES (?1, 'pkg', '2.0.0', '# head', '{}', 't')",
+                db_params![uid],
+            )
+            .await
+            .unwrap();
+        for (ver, md) in [("1.0.0", "# old"), ("2.0.0", "# head"), ("1.5.0", "# mid")] {
+            db.execute(
+                "INSERT INTO skill_versions(skill_id, version, skill_md, metadata, created_at)
+                 VALUES (?1, ?2, ?3, '{}', 't')",
+                db_params![sid, ver, md],
+            )
+            .await
+            .unwrap();
+        }
+        (db, dir, sid)
+    }
+
+    async fn head_of(db: &Db, sid: i64) -> (String, String) {
+        let r = db
+            .query_row("SELECT version, skill_md FROM skills WHERE id = ?1", db_params![sid])
+            .await
+            .unwrap();
+        (r.get(0).unwrap(), r.get(1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn promote_rewrites_head_to_chosen_version() {
+        let (db, dir, sid) = fixture().await;
+        promote_head(&db, sid, "1.0.0", ("# old".into(), "{}".into(), String::new(), 0))
+            .await
+            .map_err(|e| e.message)
+            .unwrap();
+        assert_eq!(head_of(&db, sid).await, ("1.0.0".into(), "# old".into()));
+        // 所有版本副本原样保留，切换可逆。
+        assert_eq!(skills::versions_of(&db, sid).await.len(), 3);
+        promote_head(&db, sid, "2.0.0", ("# head".into(), "{}".into(), String::new(), 0))
+            .await
+            .map_err(|e| e.message)
+            .unwrap();
+        assert_eq!(head_of(&db, sid).await, ("2.0.0".into(), "# head".into()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn promote_does_not_touch_visibility_or_downloads() {
+        let (db, dir, sid) = fixture().await;
+        db.execute(
+            "UPDATE skills SET visibility = 'public', downloads = 7 WHERE id = ?1",
+            db_params![sid],
+        )
+        .await
+        .unwrap();
+        promote_head(&db, sid, "1.5.0", ("# mid".into(), "{}".into(), String::new(), 0))
+            .await
+            .map_err(|e| e.message)
+            .unwrap();
+        let r = db
+            .query_row(
+                "SELECT version, visibility, downloads FROM skills WHERE id = ?1",
+                db_params![sid],
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.get::<String>(0).unwrap(), "1.5.0");
+        assert_eq!(r.get::<String>(1).unwrap(), "public");
+        assert_eq!(r.get::<i64>(2).unwrap(), 7);
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

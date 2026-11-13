@@ -133,6 +133,14 @@ export interface SkillVersionDeleteResp {
   versions: SkillVersionInfo[];
 }
 
+/** 管理后台把某个版本设为最新版后的状态：新的最新版本号、切换前的版本号与版本列表。 */
+export interface SkillVersionPromoteResp {
+  head: string;
+  /** 切换前的版本号（再次设为该版本即可撤销）。 */
+  previous: string;
+  versions: SkillVersionInfo[];
+}
+
 /** 点赞 / 收藏切换后的最新状态（计数 + 查看者标记）。 */
 export interface ReactResp {
   likes: number;
