@@ -32,6 +32,10 @@ export interface McpInfo {
   owner: string;
   name: string;
   visibility: string;
+  /** 上传/重发布时可见性被管理员上传策略改写成 private（请求要求 public 时）。 */
+  visibility_forced_private?: boolean;
+  /** 服务端的提示信息（如「已按策略存为私有」）。 */
+  warnings?: string[];
   version: string;
   manifest: McpManifest;
   tools?: ToolMeta[];
@@ -114,6 +118,10 @@ export interface SkillInfo {
   favorited: boolean;
   /** 已发布的全部版本号（新→旧）。仅详情接口填充，列表接口为空。 */
   versions?: string[];
+  /** 上传/重发布时可见性被管理员上传策略改写成 private（请求要求 public 时）。 */
+  visibility_forced_private?: boolean;
+  /** 服务端的提示信息（如「已按策略存为私有」）。 */
+  warnings?: string[];
   updated_at: string;
 }
 
@@ -255,6 +263,12 @@ export interface LdapSettings {
 export interface AuthSettings {
   registration_enabled: boolean;
   ldap: LdapSettings;
+}
+
+/** 资源上传策略。 */
+export interface UploadSettings {
+  /** 强制用户上传 / 重发布的资源仅自己可见（管理员修改可见性不受限）。 */
+  force_private_uploads: boolean;
 }
 
 /** LDAP 配置增量：缺省字段保持不变；bind_password 传空串表示清除。 */

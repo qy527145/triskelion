@@ -16,6 +16,11 @@ import { initials } from "./lib/color";
 import type { FavoritesResp, McpInfo, ReactKind, SecretInfo, SkillInfo, WhoamiResp } from "./lib/types";
 import { SKILL_CATEGORIES } from "./lib/types";
 
+/** 上传成功的提示；服务端有策略提示（如被压成私有）时接在后面一并展示。 */
+function joinWarnings(msg: string, warnings?: string[]): string {
+  return warnings?.length ? `${msg}（${warnings.join("；")}）` : msg;
+}
+
 const isSkillTab = (t: Tab) => t === "skill-market" || t === "skill-mine";
 const isMcpTab = (t: Tab) => t === "mcp-market" || t === "mcp-mine";
 const isMarket = (t: Tab) => t === "skill-market" || t === "mcp-market";
@@ -464,10 +469,10 @@ export default function App() {
         <CreateMcpModal
           edit={mcpModal.edit}
           onClose={() => setMcpModal(null)}
-          onSaved={(name) => {
+          onSaved={(name, warnings) => {
             const editing = !!mcpModal.edit;
             setMcpModal(null);
-            notify(editing ? "已更新 " + name : "已创建 " + name);
+            notify(joinWarnings(editing ? "已更新 " + name : "已创建 " + name, warnings));
             load();
           }}
         />
@@ -476,10 +481,10 @@ export default function App() {
         <CreateSkillModal
           edit={skillModal.edit}
           onClose={() => setSkillModal(null)}
-          onSaved={(name) => {
+          onSaved={(name, warnings) => {
             const editing = !!skillModal.edit;
             setSkillModal(null);
-            notify(editing ? "已更新 " + name : "已创建 " + name);
+            notify(joinWarnings(editing ? "已更新 " + name : "已创建 " + name, warnings));
             load();
           }}
         />

@@ -329,6 +329,9 @@ fn cmd_mcp_add(file: Option<PathBuf>, visibility: Option<String>, yes: bool) -> 
 
     let visibility = visibility.unwrap_or_else(|| "private".into());
     let info = api.mcp_upsert(manifest, visibility)?;
+    for w in &info.warnings {
+        println!("  ⚠ {w}");
+    }
     println!(
         "✓ 已注册 {}/{} (v{}, {})",
         info.owner, info.name, info.version, info.visibility

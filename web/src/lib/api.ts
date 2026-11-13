@@ -28,6 +28,7 @@ import type {
   SkillVersionPromoteResp,
   SkillVersionInfo,
   ToolMeta,
+  UploadSettings,
   UserTransferResult,
   WhoamiResp,
 } from "./types";
@@ -520,6 +521,11 @@ export const admin = {
   authSettings: (token: string) => adminReq<AuthSettings>("/v1/admin/settings/auth", token),
   updateAuthSettings: (token: string, body: AuthSettingsPatch) =>
     adminReq<AuthSettings>("/v1/admin/settings/auth", token, { method: "PUT", body }),
+  /** 资源上传策略：是否强制用户上传的资源仅自己可见。 */
+  uploadSettings: (token: string) =>
+    adminReq<UploadSettings>("/v1/admin/settings/upload", token),
+  updateUploadSettings: (token: string, body: Partial<UploadSettings>) =>
+    adminReq<UploadSettings>("/v1/admin/settings/upload", token, { method: "PUT", body }),
   /** LDAP 连通性测试；传 username/password 时跑完整认证链路，可带草稿配置。 */
   ldapTest: (
     token: string,

@@ -21,6 +21,7 @@ import type {
   Runtime,
   SkillCategory,
   SkillVersionInfo,
+  UploadSettings,
 } from "../lib/types";
 import Modal from "./Modal";
 import Brand from "./Brand";
@@ -2779,8 +2780,65 @@ function SettingsPanel({ token, notify }: { token: string; notify: (m: string) =
     () => admin.authSettings(token),
     [token],
   );
-  if (loading || error) return <StateLine loading={loading} error={error} />;
-  return <SettingsForm token={token} initial={data!} notify={notify} />;
+  const upload = useAdminData<UploadSettings>(() => admin.uploadSettings(token), [token]);
+  if (loading || error || upload.loading || upload.error)
+    return (
+      <StateLine
+        loading={loading || upload.loading}
+        error={error ?? upload.error}
+      />
+    );
+  return (
+    <div className="space-y-6">
+      <UploadPolicyPanel token={token} initial={upload.data!} notify={notify} />
+      <SettingsForm token={token} initial={data!} notify={notify} />
+    </div>
+  );
+}
+
+/** 资源上传策略：用户上传 / 重发布的资源是否一律仅自己可见。 */
+function UploadPolicyPanel({
+  token,
+  initial,
+  notify,
+}: {
+  token: string;
+  initial: UploadSettings;
+  notify: (m: string) => void;
+}) {
+  const [on, setOn] = useState(initial.force_private_uploads);
+
+  async function toggle(next: boolean) {
+    setOn(next);
+    try {
+      const saved = await admin.updateUploadSettings(token, { force_private_uploads: next });
+      setOn(saved.force_private_uploads);
+      notify(
+        saved.force_private_uploads
+          ? "已开启：用户上传的资源仅自己可见"
+          : "已关闭：用户上传按所选可见性生效",
+      );
+    } catch (e) {
+      setOn(!next);
+      notify((e as Error).message);
+    }
+  }
+
+  return (
+    <Panel>
+      <div className="flex items-center justify-between gap-6">
+        <div>
+          <h2 className="font-bold text-slate-800">用户上传的资源仅自己可见</h2>
+          <p className="mt-1.5 text-sm text-slate-500">
+            开启后，普通用户上传或重新发布的技能与 MCP 一律存为 private——即使明确选择
+            public 也会被压回 private（提示「已按策略存为私有」）。管理员在「资源」页修改可见性不受限制。
+            立即生效，已存在资源不会被批量改写。
+          </p>
+        </div>
+        <Toggle on={on} onChange={toggle} />
+      </div>
+    </Panel>
+  );
 }
 
 function SettingsForm({

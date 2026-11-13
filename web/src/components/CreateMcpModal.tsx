@@ -33,7 +33,8 @@ export default function CreateMcpModal({
 }: {
   edit?: McpInfo | null;
   onClose: () => void;
-  onSaved: (name: string) => void;
+  /** warnings：服务端提示（如被管理员上传策略压成私有），由调用方展示。 */
+  onSaved: (name: string, warnings?: string[]) => void;
 }) {
   const em = edit?.manifest;
   const editing = !!edit;
@@ -99,8 +100,8 @@ export default function CreateMcpModal({
       if (editing && oldName && name.trim() !== oldName) {
         await api.renameMcp(oldName, name.trim());
       }
-      await api.upsertMcp(manifest, visibility);
-      onSaved(name.trim());
+      const saved = await api.upsertMcp(manifest, visibility);
+      onSaved(name.trim(), saved.warnings);
     } catch (e) {
       setErr((e as Error).message);
     } finally {

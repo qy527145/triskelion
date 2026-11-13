@@ -265,6 +265,9 @@ pub fn publish(dir: Option<PathBuf>, visibility: Option<String>) -> Result<()> {
         info.owner, info.name, b.manifest.version, info.category, info.visibility
     );
     println!("  拉取: tsk pull {}/{}（最新版）或 tsk pull {}/{}@{}", info.owner, info.name, info.owner, info.name, b.manifest.version);
+    for w in &info.warnings {
+        println!("  ⚠ {w}");
+    }
     if info.visibility != "public" {
         println!("  （当前为 private，仅自己可见；在 Web 端或重新 publish --visibility public 即可上架）");
     }

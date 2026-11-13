@@ -2151,6 +2151,40 @@ pub async fn auth_settings_update(
     Ok(Json(settings::masked_json(&s)))
 }
 
+// ---------------------------------------------------------------------------
+// 资源上传策略
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct UploadSettingsPatch {
+    #[serde(default)]
+    force_private_uploads: Option<bool>,
+}
+
+pub async fn upload_settings_get(
+    State(state): S,
+    headers: HeaderMap,
+) -> Result<Json<settings::UploadSettings>, ApiError> {
+    require_admin(&state, &headers)?;
+    Ok(Json(settings::load_upload(&state.db).await))
+}
+
+/// 更新上传策略（增量合并后整体落库）。立即生效：新增与重发布的资源在下一次请求
+/// 起即按新策略落库，无需重启；已存在的资源不会被批量改写。
+pub async fn upload_settings_update(
+    State(state): S,
+    headers: HeaderMap,
+    Json(req): Json<UploadSettingsPatch>,
+) -> Result<Json<settings::UploadSettings>, ApiError> {
+    require_admin(&state, &headers)?;
+    let mut s = settings::load_upload(&state.db).await;
+    if let Some(v) = req.force_private_uploads {
+        s.force_private_uploads = v;
+    }
+    settings::save_upload(&state.db, &s).await?;
+    Ok(Json(s))
+}
+
 #[derive(Deserialize)]
 pub struct LdapTestReq {
     /// 可选：草稿配置（未保存也能试）；密码缺省回落到已保存的。

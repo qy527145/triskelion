@@ -318,6 +318,12 @@ pub struct McpInfo {
     pub owner: String,
     pub name: String,
     pub visibility: String,
+    /// 本次上传的可见性是否被管理员的上传策略改写成 private（请求要求 public 时）。
+    #[serde(default)]
+    pub visibility_forced_private: bool,
+    /// 需要提示给上传者的说明（如被上传策略压成私有）。未发生时为空。
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub version: String,
     pub manifest: McpManifest,
     #[serde(default)]
@@ -677,6 +683,12 @@ pub struct SkillInfo {
     pub name: String,
     pub category: String,
     pub visibility: String,
+    /// 本次上传的可见性是否被管理员的上传策略改写成 private（请求要求 public 时）。
+    #[serde(default)]
+    pub visibility_forced_private: bool,
+    /// 需要提示给上传者的说明（如被上传策略压成私有）。未发生时为空。
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub version: String,
     pub description: String,
     #[serde(default)]

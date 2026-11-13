@@ -212,17 +212,18 @@ pub async fn upsert(
     let meta_json = serde_json::to_string(&meta).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = now_string();
 
-    // 既有记录：head 版本号 + 该版本已有副本的压缩体信息（upsert 元数据不应清空已上传的数据体）。
-    let prev: Option<(i64, String, String, i64)> = match state
+    // 既有记录：head 版本号 + head 当前可见性 + 该版本已有副本的压缩体信息
+    // （upsert 元数据不应清空已上传的数据体）。既有可见性用于上传策略下的提示与响应。
+    let prev: Option<(i64, String, String, i64, String)> = match state
         .db
         .query_opt(
-            "SELECT id, version, archive_sha256, archive_size FROM skills
+            "SELECT id, version, archive_sha256, archive_size, visibility FROM skills
              WHERE owner_id = ?1 AND name = ?2",
             db_params![claims.sub, m.name],
         )
         .await?
     {
-        Some(r) => Some((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        Some(r) => Some((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         None => None,
     };
     // 压缩体指针兜底链：请求携带 > 本版本既有副本 > head 快照（保持旧客户端行为）。
@@ -245,7 +246,7 @@ pub async fn upsert(
             }
             None => None,
         };
-        from_version.or_else(|| prev.as_ref().map(|(_, _, sha, size)| (sha.clone(), *size))).unwrap_or_default()
+        from_version.or_else(|| prev.as_ref().map(|(_, _, sha, size, _)| (sha.clone(), *size))).unwrap_or_default()
     } else {
         (req.archive_sha256.clone(), req.archive_size as i64)
     };
@@ -255,23 +256,36 @@ pub async fn upsert(
         Some((_, head_ver, ..)) => compare_versions(&version, head_ver) != std::cmp::Ordering::Less,
         None => true,
     };
+    // 上传策略（强制私有）开启且请求要求 public 时，实际落库的是 private——
+    // SQL 内已叠加，这里算出回显值并标出「被策略改写」。
+    let force_private = super::settings::force_private(&state.db).await;
+    let effective_visibility = if force_private && visibility == "public" {
+        "private".to_string()
+    } else {
+        visibility.clone()
+    };
+    let forced = effective_visibility != visibility;
     if is_head {
+        // 可见性在 SQL 内叠加上传策略（?1 为请求可见性，业务参数从 ?2 起）。
         state
             .db
             .execute(
-                "INSERT INTO skills(owner_id, name, category, visibility, version, description,
-                                tags, skill_md, metadata, archive_sha256, archive_size, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(owner_id, name) DO UPDATE SET
-                 category=excluded.category, visibility=excluded.visibility, version=excluded.version,
-                 description=excluded.description, tags=excluded.tags, skill_md=excluded.skill_md,
-                 metadata=excluded.metadata, archive_sha256=excluded.archive_sha256,
-                 archive_size=excluded.archive_size, updated_at=excluded.updated_at",
+                &format!(
+                    "INSERT INTO skills(owner_id, name, category, visibility, version, description,
+                                    tags, skill_md, metadata, archive_sha256, archive_size, updated_at)
+                 SELECT ?2, ?3, ?4, {}, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                 ON CONFLICT(owner_id, name) DO UPDATE SET
+                     category=excluded.category, visibility=excluded.visibility, version=excluded.version,
+                     description=excluded.description, tags=excluded.tags, skill_md=excluded.skill_md,
+                     metadata=excluded.metadata, archive_sha256=excluded.archive_sha256,
+                     archive_size=excluded.archive_size, updated_at=excluded.updated_at",
+                    super::settings::effective_visibility_sql()
+                ),
                 db_params![
+                    visibility,
                     claims.sub,
                     m.name,
                     category,
-                    visibility,
                     version,
                     m.description,
                     tags_json,
@@ -346,13 +360,20 @@ pub async fn upsert(
     )
     .await;
     let versions = versions_of(&state.db, skill_id).await;
+    // 未改 head 时不回显请求值：私有资源被策略挡回时，head 仍是原来的可见性。
+    let displayed_visibility = match &prev {
+        Some((_, _, _, _, head_vis)) if !is_head => head_vis.clone(),
+        _ => effective_visibility,
+    };
 
-    Ok(Json(SkillInfo {
+    let mut resp = Json(SkillInfo {
         owner: claims.username,
         owner_display_name: display_name_of(&state.db, claims.sub).await,
         name: m.name,
         category,
-        visibility,
+        visibility: displayed_visibility,
+        visibility_forced_private: forced,
+        warnings: Vec::new(),
         version,
         description: m.description,
         tags: lower_tags(&m.tags),
@@ -369,7 +390,27 @@ pub async fn upsert(
         favorited,
         versions: versions.into_iter().map(|v| v.version).collect(),
         updated_at: now,
-    }))
+    });
+    if forced {
+        add_policy_hint(&mut resp.0, &prev, is_head);
+    }
+    Ok(resp)
+}
+
+/// 上传策略把可见性压成 private 时，在响应里补一条 `warnings` 说明，
+/// 让 `tsk publish --visibility public` 的控制台能直接告诉用户为什么还是私有。
+fn add_policy_hint(
+    info: &mut SkillInfo,
+    prev: &Option<(i64, String, String, i64, String)>,
+    is_head: bool,
+) {
+    let already_private = !is_head || prev.as_ref().is_some_and(|p| p.4 == "private");
+    let msg = if already_private {
+        "管理员开启了「用户上传的资源仅自己可见」，资源保持私有，无法上架市场"
+    } else {
+        "管理员开启了「用户上传的资源仅自己可见」，本次已按策略存为私有，无法上架市场"
+    };
+    info.warnings.push(msg.to_string());
 }
 
 /// 详情/下载接口的版本选择参数：`?version=1.2.0`，缺省为最新版。
@@ -1012,6 +1053,8 @@ fn tuple_to_info(t: SkillRow) -> Result<SkillInfo, ApiError> {
         name,
         category,
         visibility,
+        visibility_forced_private: false,
+        warnings: Vec::new(),
         version,
         description,
         tags,

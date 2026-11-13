@@ -45,7 +45,8 @@ export default function CreateSkillModal({
 }: {
   edit?: SkillInfo | null;
   onClose: () => void;
-  onSaved: (name: string) => void;
+  /** warnings：服务端提示（如被管理员上传策略压成私有），由调用方展示。 */
+  onSaved: (name: string, warnings?: string[]) => void;
 }) {
   const editing = !!edit;
   const [name, setName] = useState(edit?.name ?? "");
@@ -155,8 +156,8 @@ export default function CreateSkillModal({
         await api.renameSkill(edit.owner, edit.name, name.trim());
       }
       // 拖入了压缩包则带上其 sha256/size 关联数据体；否则留空，服务端保留既有压缩体。
-      await api.upsertSkill(manifest, visibility, skillMd, archiveSha, archiveSize);
-      onSaved(name.trim());
+      const saved = await api.upsertSkill(manifest, visibility, skillMd, archiveSha, archiveSize);
+      onSaved(name.trim(), saved.warnings);
     } catch (e) {
       setErr((e as Error).message);
     } finally {

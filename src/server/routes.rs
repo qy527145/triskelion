@@ -133,6 +133,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/admin/settings/auth",
             get(admin::auth_settings_get).put(admin::auth_settings_update),
         )
+        // 资源上传策略：是否强制用户上传的资源仅自己可见（立即生效）。
+        .route(
+            "/v1/admin/settings/upload",
+            get(admin::upload_settings_get).put(admin::upload_settings_update),
+        )
         .route("/v1/admin/ldap/test", post(admin::ldap_test))
         .route("/v1/admin/ldap/sync", post(admin::ldap_sync))
         .route("/v1/admin/export", get(admin::export))
@@ -516,6 +521,8 @@ async fn explore(
             owner,
             name,
             visibility,
+            visibility_forced_private: false,
+            warnings: Vec::new(),
             version,
             manifest,
             tools: parse_tools(&tools_json),
@@ -559,24 +566,35 @@ async fn mcp_upsert(
     };
     let manifest_json = serde_json::to_string(&manifest).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = now_string();
+    // 可见性在 SQL 内叠加上传策略（?1 为请求可见性，业务参数从 ?2 起）。
     state
         .db
         .execute(
-            "INSERT INTO mcps(owner_id, name, visibility, version, manifest, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(owner_id, name)
-             DO UPDATE SET visibility=excluded.visibility, version=excluded.version,
-                           manifest=excluded.manifest, updated_at=excluded.updated_at",
+            &format!(
+                "INSERT INTO mcps(owner_id, name, visibility, version, manifest, updated_at)
+                 SELECT ?2, ?3, {}, ?4, ?5, ?6
+                 ON CONFLICT(owner_id, name)
+                 DO UPDATE SET visibility=excluded.visibility, version=excluded.version,
+                               manifest=excluded.manifest, updated_at=excluded.updated_at",
+                settings::effective_visibility_sql()
+            ),
             db_params![
+                visibility,
                 claims.sub,
                 manifest.name,
-                visibility,
                 manifest.version,
                 manifest_json,
                 now
             ],
         )
         .await?;
+    let visibility_forced_private =
+        visibility == "public" && settings::force_private(&state.db).await;
+    let stored_visibility = if visibility_forced_private {
+        "private".to_string()
+    } else {
+        visibility.clone()
+    };
     // tools 不随 manifest 改动（插入默认 '[]'，更新时保留旧值），单独读出用于响应。
     let row = state
         .db
@@ -588,10 +606,17 @@ async fn mcp_upsert(
     let (mid, tools_json): (i64, String) = (row.get(0)?, row.get(1)?);
     let (likes, favorites, liked, favorited) =
         reaction_summary(&state.db, "mcp_reactions", "mcp_id", mid, Some(claims.sub)).await;
+    let warnings = if visibility_forced_private {
+        vec!["管理员开启了「用户上传的资源仅自己可见」，本次已按策略存为私有".to_string()]
+    } else {
+        Vec::new()
+    };
     Ok(Json(McpInfo {
         owner: claims.username,
         name: manifest.name.clone(),
-        visibility,
+        visibility: stored_visibility,
+        visibility_forced_private,
+        warnings,
         version: manifest.version.clone(),
         manifest,
         tools: parse_tools(&tools_json),
@@ -638,6 +663,8 @@ async fn mcp_list(State(state): S, headers: HeaderMap) -> Result<Json<Vec<McpInf
             owner: claims.username.clone(),
             name,
             visibility,
+            visibility_forced_private: false,
+            warnings: Vec::new(),
             version,
             manifest,
             tools: parse_tools(&tools_json),
@@ -732,6 +759,8 @@ async fn mcp_rename(
         owner: claims.username,
         name: new_name,
         visibility,
+        visibility_forced_private: false,
+        warnings: Vec::new(),
         version,
         manifest,
         tools: parse_tools(&tools_json),
@@ -962,6 +991,8 @@ async fn favorites(State(state): S, headers: HeaderMap) -> Result<Json<serde_jso
             owner,
             name,
             visibility,
+            visibility_forced_private: false,
+            warnings: Vec::new(),
             version,
             manifest,
             tools: parse_tools(&tools_json),
@@ -1250,6 +1281,8 @@ async fn load_mcp(state: &AppState, owner: &str, name: &str) -> Result<(McpInfo,
             owner: owner.to_string(),
             name: name.to_string(),
             visibility,
+            visibility_forced_private: false,
+            warnings: Vec::new(),
             version,
             manifest,
             tools: parse_tools(&tools_json),
